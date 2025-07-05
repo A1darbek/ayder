@@ -2,52 +2,36 @@
 set -euo pipefail
 echo "▶️  power-loss / torn-write test"
 
-# ─── skip if loop+dm not available ───
-if ! command -v losetup >/dev/null || ! command -v dmsetup >/dev/null; then
-    echo "⚠️  loop/dm unavailable — skipping test (not a failure)"
-    exit 0
-fi
-if ! sudo losetup -f --show /dev/null &>/dev/null; then
-    echo "⚠️  no permission for losetup — skipping test"
-    exit 0
-fi
-sudo losetup -D
+ROOT="$( cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." &>/dev/null && pwd )"
+BIN="$ROOT/ramforge"; [[ -x "$BIN" ]] || { echo "no binary"; exit 1; }
 
-# create a tmpfs backed loop-device
+pkill -9 -f '[r]amforge' 2>/dev/null || true
+until ! lsof -i:1109 &>/dev/null; do sleep 0.1; done
+
 TMP=$(mktemp -d)
-truncate -s 128M "$TMP/aof.img"
-LOOP=$(sudo losetup -f --show "$TMP/aof.img")
-sudo dmsetup create flk --table "0 $(blockdev --getsz $LOOP) linear $LOOP 0"
-DEVICE=/dev/mapper/flk
-mkfs.ext4 -F "$DEVICE" > /dev/null
-mkdir "$TMP/mnt"
-sudo mount "$DEVICE" "$TMP/mnt"
-pushd "$TMP/mnt" >/dev/null
+pushd "$TMP" >/dev/null
 
-sudo ../../ramforge --aof always --workers 1 &
-PID=$!
-sleep 0.5
+setsid "$BIN" --aof always --workers 0 2>/dev/null &
+PG=$!
+sleep 0.4
 
 curl -s -XPOST -d '{"id":7,"name":"smith"}' \
      -H "Content-Type: application/json" \
-     http://localhost:1109/users > /dev/null
+     http://localhost:1109/users >/dev/null
 
-# enable flakey drop (simulate lost sector for next 2s)
-sudo dmsetup message flk 0 "drop_writes 1"
-sleep 2
-sudo dmsetup message flk 0 "drop_writes 0"
-
-sudo kill -9 $PID
+kill -9 -"$PG"
+truncate -s -1 append.aof              # simulate torn write
 
 set +e
-sudo ../../ramforge --aof always --workers 1
+"$BIN" --aof always --workers 0
 RC=$?
 set -e
 
-sudo umount "$TMP/mnt"; sudo dmsetup remove flk; sudo losetup -d "$LOOP"; rm -rf "$TMP"
+popd >/dev/null; rm -rf "$TMP"
 
 if [[ $RC -eq 2 ]]; then
-    echo "✅ power-loss passed (refused to start on corrupt AOF)"
+  echo "✅ power-loss passed (loader detected corrupt AOF)"
 else
-    echo "❌ power-loss failed (exit $RC)"; exit 1
+  echo "❌ power-loss failed (exit $RC)"
+  exit 1
 fi

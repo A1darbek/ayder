@@ -1,0 +1,53 @@
+# HELP ramforge_operations_total Total number of operations processed
+# TYPE ramforge_operations_total counter
+ramforge_operations_total 573601
+
+# HELP ramforge_latency_microseconds Operation latency in microseconds
+# TYPE ramforge_latency_microseconds summary
+ramforge_latency_microseconds{quantile="0.95"} 500
+ramforge_latency_microseconds{quantile="0.99"} 2000
+ramforge_latency_microseconds_sum 102399362
+ramforge_latency_microseconds_count 573601
+
+# HELP ramforge_beast_mode_operations Operations under specific latency thresholds
+# TYPE ramforge_beast_mode_operations counter
+ramforge_beast_mode_operations{threshold="1ms"} 565499
+ramforge_beast_mode_operations{threshold="100us"} 138405
+ramforge_beast_mode_operations{threshold="10us"} 4
+ramforge_beast_mode_operations{threshold="1us"} 0
+
+# HELP ramforge_snapshots_total Total snapshots created
+# TYPE ramforge_snapshots_total counter
+ramforge_snapshots_total 573
+
+# HELP ramforge_rotations_total File rotations by reason
+# TYPE ramforge_rotations_total counter
+ramforge_rotations_total{reason="size"} 7
+ramforge_rotations_total{reason="age"} 0
+ramforge_rotations_total{reason="performance"} 0
+ramforge_rotations_total{reason="chaos"} 0
+
+# HELP ramforge_crc_validations_total CRC validations performed
+# TYPE ramforge_crc_validations_total counter
+ramforge_crc_validations_total 0
+
+# HELP ramforge_beast_mode_percentage Percentage of sub-1us operations
+# TYPE ramforge_beast_mode_percentage gauge
+ramforge_beast_mode_percentage 0.00
+
+# HELP zero_pause_snapshots_total Total zero-pause snapshots
+# TYPE zero_pause_snapshots_total counter
+zero_pause_snapshots_total 12
+
+# HELP zero_pause_snapshot_latency_microseconds Snapshot latency
+# TYPE zero_pause_snapshot_latency_microseconds summary
+zero_pause_snapshot_latency_microseconds{quantile="0.99"} 372643
+
+# HELP ramforge_aof_files_total Current AOF segment count
+# TYPE ramforge_aof_files_total gauge
+ramforge_aof_files_total 5
+
+# HELP ramforge_aof_rotations_total Total AOF rotations performed
+# TYPE ramforge_aof_rotations_total counter
+ramforge_aof_rotations_total 7
+

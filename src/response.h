@@ -1,10 +1,11 @@
 #ifndef RESPONSE_H
 #define RESPONSE_H
 
-#define RESPONSE_BUFFER_SIZE 4096
+#define RESPONSE_BUFFER_SIZE 32768
 
 typedef struct {
     char buffer[RESPONSE_BUFFER_SIZE];
+
 } Response;
 
 // Format JSON (or any text) into res->buffer

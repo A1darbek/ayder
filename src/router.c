@@ -153,6 +153,7 @@ int route_request(const char *method,
     TrieNode *child_list = method_roots[mi];
     TrieNode *node = NULL;
     for (int i = 0; i < seg_count; i++) {
+        node = NULL;
         TrieNode *cur = child_list;
         TrieNode *param_match = NULL;
 

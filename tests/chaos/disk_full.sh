@@ -2,44 +2,55 @@
 set -euo pipefail
 echo "▶️  disk-full test"
 
-# ─── locate compiled binary, quote-safe ───
 ROOT="$( cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." &>/dev/null && pwd )"
-BIN="$ROOT/ramforge"
-[[ -x "$BIN" ]] || { echo "❌ ramforge not built"; exit 1; }
+BIN="$ROOT/ramforge"; [[ -x "$BIN" ]] || { echo "no bin"; exit 1; }
 
-# ─── temp 64-MB filesystem ───
+# ─── kill any stray servers and wait for port 1109 to be free ───
+pkill -9 -f '[r]amforge' 2>/dev/null || true
+until ! lsof -i:1109 &>/dev/null; do sleep 0.2; done
+
+# ─── 64-MB ext4 FS with zero root reserve ───
 WORK=$(mktemp -d)
 truncate -s 64M "$WORK/vol.img"
-mkfs.ext4 -F "$WORK/vol.img" > /dev/null
+mkfs.ext4 -F -m 0 "$WORK/vol.img" > /dev/null
 mkdir "$WORK/mnt"
 sudo mount -o loop "$WORK/vol.img" "$WORK/mnt"
 
 pushd "$WORK/mnt" >/dev/null
-sudo mkdir data && cd data
+sudo mkdir data
+sudo chown "$(id -u):$(id -g)" data
+cd data
 
-# ─── start server in its own process-group ───
-setsid sudo "$BIN" --aof always --workers 1 2>/dev/null &
-PGID=$!
-sleep 0.5
+# ─── start server (unprivileged) in its own PG ───
+setsid "$BIN" --aof always --workers 0 2>/dev/null &
+PG=$!          # pg leader
+sleep 0.2
 
-# ─── consume almost all space (dd will stop at ENOSPC) ───
-sudo dd if=/dev/zero of=filler.bin bs=1M count=55 || true
+# wait until /health responds or 5 s timeout
+for _ in {1..50}; do
+  curl -sf http://localhost:1109/health >/dev/null && break || sleep 0.1
+done
 
-# ─── attempt a write through HTTP ───
+# ─── fill disk completely ───
+while dd if=/dev/zero of=filler.bin bs=1M conv=notrunc oflag=append 2>/dev/null; do
+  :
+done
+
 STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
-         -XPOST -d '{"id":2,"name":"trinity"}' \
+         -XPOST -d '{"id":99,"name":"diskfull"}' \
          -H "Content-Type: application/json" \
          http://localhost:1109/users || true)
 
 # ─── cleanup ───
-sudo kill -9 -"$PGID"
-popd >/dev/null              # leave mount
+kill -9 -"$PG" 2>/dev/null || true
+popd >/dev/null
 sudo umount "$WORK/mnt"
 rm -rf "$WORK"
 
-# ─── verdict ───
 if [[ "$STATUS" == "503" || "$STATUS" == "000" ]]; then
-    echo "✅ disk-full passed"
+  echo "✅ disk-full passed"
+  exit 0
 else
-    echo "❌ disk-full failed (got $STATUS)"; exit 1
+  echo "❌ disk-full failed (got $STATUS)"
+  exit 1
 fi

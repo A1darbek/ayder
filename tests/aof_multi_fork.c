@@ -1,6 +1,4 @@
-// compile with:
-//   gcc -pthread -Isrc -o tests/aof_multi_fork tests/aof_multi_fork.c \
-//       src/aof_batch.c src/storage.c src/crc32c.c
+
 #define _GNU_SOURCE
 #include <unistd.h>
 #include <sys/wait.h>

@@ -112,13 +112,25 @@
 		<Unit filename="/mnt/c/Users/amano/Desktop/Romanuly Aidarbek/RAMForge/src/globals.c">
 			<Option target="RAMForge"/>
 		</Unit>
+		<Unit filename="/mnt/c/Users/amano/Desktop/Romanuly Aidarbek/RAMForge/src/globals.h">
+			<Option target="RAMForge"/>
+		</Unit>
 		<Unit filename="/mnt/c/Users/amano/Desktop/Romanuly Aidarbek/RAMForge/src/http_server.c">
 			<Option target="RAMForge"/>
 		</Unit>
 		<Unit filename="/mnt/c/Users/amano/Desktop/Romanuly Aidarbek/RAMForge/src/http_server.h">
 			<Option target="RAMForge"/>
 		</Unit>
+		<Unit filename="/mnt/c/Users/amano/Desktop/Romanuly Aidarbek/RAMForge/src/log.h">
+			<Option target="RAMForge"/>
+		</Unit>
 		<Unit filename="/mnt/c/Users/amano/Desktop/Romanuly Aidarbek/RAMForge/src/main.c">
+			<Option target="RAMForge"/>
+		</Unit>
+		<Unit filename="/mnt/c/Users/amano/Desktop/Romanuly Aidarbek/RAMForge/src/metrics_shared.c">
+			<Option target="RAMForge"/>
+		</Unit>
+		<Unit filename="/mnt/c/Users/amano/Desktop/Romanuly Aidarbek/RAMForge/src/metrics_shared.h">
 			<Option target="RAMForge"/>
 		</Unit>
 		<Unit filename="/mnt/c/Users/amano/Desktop/Romanuly Aidarbek/RAMForge/src/object_pool.c">
@@ -139,6 +151,12 @@
 		<Unit filename="/mnt/c/Users/amano/Desktop/Romanuly Aidarbek/RAMForge/src/ramforge.h">
 			<Option target="RAMForge"/>
 		</Unit>
+		<Unit filename="/mnt/c/Users/amano/Desktop/Romanuly Aidarbek/RAMForge/src/ramforge_rotation_metrics.c">
+			<Option target="RAMForge"/>
+		</Unit>
+		<Unit filename="/mnt/c/Users/amano/Desktop/Romanuly Aidarbek/RAMForge/src/ramforge_rotation_metrics.h">
+			<Option target="RAMForge"/>
+		</Unit>
 		<Unit filename="/mnt/c/Users/amano/Desktop/Romanuly Aidarbek/RAMForge/src/request.c">
 			<Option target="RAMForge"/>
 		</Unit>
@@ -157,6 +175,12 @@
 		<Unit filename="/mnt/c/Users/amano/Desktop/Romanuly Aidarbek/RAMForge/src/router.h">
 			<Option target="RAMForge"/>
 		</Unit>
+		<Unit filename="/mnt/c/Users/amano/Desktop/Romanuly Aidarbek/RAMForge/src/shared_storage.c">
+			<Option target="RAMForge"/>
+		</Unit>
+		<Unit filename="/mnt/c/Users/amano/Desktop/Romanuly Aidarbek/RAMForge/src/shared_storage.h">
+			<Option target="RAMForge"/>
+		</Unit>
 		<Unit filename="/mnt/c/Users/amano/Desktop/Romanuly Aidarbek/RAMForge/src/slab_alloc.c">
 			<Option target="RAMForge"/>
 		</Unit>
@@ -172,16 +196,40 @@
 		<Unit filename="/mnt/c/Users/amano/Desktop/Romanuly Aidarbek/RAMForge/src/user.h">
 			<Option target="RAMForge"/>
 		</Unit>
+		<Unit filename="/mnt/c/Users/amano/Desktop/Romanuly Aidarbek/RAMForge/src/zero_pause_rdb.c">
+			<Option target="RAMForge"/>
+		</Unit>
+		<Unit filename="/mnt/c/Users/amano/Desktop/Romanuly Aidarbek/RAMForge/src/zero_pause_rdb.h">
+			<Option target="RAMForge"/>
+		</Unit>
+		<Unit filename="/mnt/c/Users/amano/Desktop/Romanuly Aidarbek/RAMForge/src/zero_pause_restore.c">
+			<Option target="RAMForge"/>
+		</Unit>
+		<Unit filename="/mnt/c/Users/amano/Desktop/Romanuly Aidarbek/RAMForge/src/zero_pause_restore.h">
+			<Option target="RAMForge"/>
+		</Unit>
+		<Unit filename="/mnt/c/Users/amano/Desktop/Romanuly Aidarbek/RAMForge/tests/aof_live_rewrite.c">
+			<Option target="RAMForge"/>
+		</Unit>
 		<Unit filename="/mnt/c/Users/amano/Desktop/Romanuly Aidarbek/RAMForge/tests/aof_multi_fork.c">
 			<Option target="RAMForge"/>
 		</Unit>
 		<Unit filename="/mnt/c/Users/amano/Desktop/Romanuly Aidarbek/RAMForge/tests/aof_roundtrip.c">
 			<Option target="RAMForge"/>
 		</Unit>
+		<Unit filename="/mnt/c/Users/amano/Desktop/Romanuly Aidarbek/RAMForge/tests/chaos_latency_test.c">
+			<Option target="RAMForge"/>
+		</Unit>
 		<Unit filename="/mnt/c/Users/amano/Desktop/Romanuly Aidarbek/RAMForge/tests/crc32c_test.c">
 			<Option target="RAMForge"/>
 		</Unit>
+		<Unit filename="/mnt/c/Users/amano/Desktop/Romanuly Aidarbek/RAMForge/tests/live_rotation.c">
+			<Option target="RAMForge"/>
+		</Unit>
 		<Unit filename="/mnt/c/Users/amano/Desktop/Romanuly Aidarbek/RAMForge/tests/rdb_corrupt.c">
+			<Option target="RAMForge"/>
+		</Unit>
+		<Unit filename="/mnt/c/Users/amano/Desktop/Romanuly Aidarbek/RAMForge/tests/test_ramforge_suite.c">
 			<Option target="RAMForge"/>
 		</Unit>
 		<Unit filename="/mnt/c/Users/amano/Desktop/Romanuly Aidarbek/RAMForge/CMakeLists.txt">

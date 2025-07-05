@@ -1,5 +1,6 @@
 // src/http_server.c - ULTRA-FAST HTTP Server that makes Axum cry
 // Zero-copy, SIMD-optimized, async I/O beast mode activated! 🚀
+// FIXED: Proper SO_REUSEPORT for multi-worker clustering
 
 #include "http_server.h"
 #include <stdio.h>
@@ -7,10 +8,16 @@
 #include <string.h>
 #include <time.h>
 #include <uv.h>
+#include <sys/socket.h>  // For SO_REUSEPORT
+#include <netinet/in.h>  // For sockopt
+#include <unistd.h>
 #include "http_parser.h"
 #include "object_pool.h"
 #include "router.h"
 #include "slab_alloc.h"
+#include "app.h"
+#include "ramforge_rotation_metrics.h"
+
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // BEAST MODE CONFIGURATION - Tuned for Maximum Performance
@@ -22,7 +29,11 @@
 #define WORKER_THREADS        16            // Background worker threads
 #define TCP_NODELAY           1             // Disable Nagle's algorithm
 #define TCP_KEEPALIVE         1             // Enable TCP keepalive
-#define SO_REUSEPORT         15            // Linux SO_REUSEPORT
+
+// SO_REUSEPORT definition (Linux/BSD)
+#ifndef UV_TCP_REUSEPORT
+#define UV_TCP_REUSEPORT 2
+#endif
 
 // Pre-computed HTTP headers for ultra-fast responses
 static const char RESPONSE_HEADERS_TEMPLATE[] =
@@ -136,8 +147,14 @@ static fast_buffer_t* buffer_create(size_t size) {
 
 static void buffer_release(fast_buffer_t* buf) {
     if (!buf) return;
-    if (--buf->ref_count <= 0) {
-        slab_free(buf->data);
+
+    // Atomic decrement would be better, but simple check for now
+    buf->ref_count--;
+    if (buf->ref_count <= 0) {
+        if (buf->data) {
+            slab_free(buf->data);
+            buf->data = NULL;
+        }
         slab_free(buf);
     }
 }
@@ -233,6 +250,61 @@ static void alloc_cb(uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf) 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Lightning-Fast Response Generation
 // ═══════════════════════════════════════════════════════════════════════════════
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Generic responder (non-JSON payloads, e.g. Prometheus text format)
+// ──────────────────────────────────────────────────────────────────────────────
+static void send_raw(connection_ctx_t *ctx,
+                     const char *content_type,
+                     const char *body,
+                     size_t body_len,
+                     int status_code)
+{
+    fast_buffer_t *buf = ctx->response_buf;
+    buffer_reset(buf);
+
+    const char *status_txt =
+            (status_code == 200) ? "200 OK" :
+            (status_code == 204) ? "204 No Content" :
+            (status_code == 404) ? "404 Not Found" :
+            (status_code == 503) ? "503 Service Unavailable" :
+            "500 Internal Server Error";
+
+    int hdr_len = snprintf(buf->data, buf->capacity,
+                           "HTTP/1.1 %s\r\n"
+                           "Date: %s\r\n"
+                           "Server: RAMForge-Beast/3.0\r\n"
+                           "Content-Type: %s\r\n"
+                           "Content-Length: %zu\r\n"
+                           "Connection: %s\r\n\r\n",
+                           status_txt,
+                           cached_date,
+                           content_type,
+                           body_len,
+                           ctx->keep_alive ? "keep-alive" : "close");
+
+    if (body && body_len) {
+        memcpy(buf->data + hdr_len, body, body_len);
+        buf->len = hdr_len + body_len;
+    } else {
+        buf->len = hdr_len;
+    }
+
+    write_req_t *wr = slab_alloc(sizeof(write_req_t));
+    wr->buffer      = buf;
+    wr->keep_alive  = ctx->keep_alive;
+    wr->request_id  = ctx->request_id;
+    buf->ref_count++;
+
+    uv_buf_t uvb = uv_buf_init(buf->data, buf->len);
+    uv_write((uv_write_t *)wr, (uv_stream_t *)ctx->client, &uvb, 1,
+             (uv_write_cb)write_complete_cb);
+
+    total_bytes_sent += buf->len;
+}
+
+
+
 static void send_response(connection_ctx_t* ctx, const char* json_data, size_t json_len, int status_code) {
     fast_buffer_t* buf = ctx->response_buf;
     buffer_reset(buf);
@@ -291,8 +363,11 @@ static void write_complete_cb(uv_write_t* req, int status) {
         fprintf(stderr, "[HTTP] Write error: %s\n", uv_strerror(status));
     }
 
-    // Release buffer
-    buffer_release(write_req->buffer);
+    // Release buffer safely
+    if (write_req->buffer) {
+        buffer_release(write_req->buffer);
+        write_req->buffer = NULL;
+    }
 
     if (!write_req->keep_alive) {
         // Close connection after response
@@ -314,8 +389,13 @@ static void process_request(connection_ctx_t* ctx) {
 
     // Route the request using our super-fast router
     int result = route_request(ctx->method, ctx->url, ctx->body, response_json);
-
     size_t response_len = strlen(response_json);
+    if (result == 0 && strcmp(ctx->url, "/metrics") == 0) {
+        send_raw(ctx, "text/plain; version=0.0.4",
+                 response_json, response_len, 200);
+        return;               // skip the JSON path below
+    }
+
     int status_code =
             (result == 0)  ? 200 :
             (result == -1) ? 404 :
@@ -324,37 +404,25 @@ static void process_request(connection_ctx_t* ctx) {
             500;
 
     // Handle empty responses (fix for empty brackets issue!)
-    if (response_len == 0 || strcmp(response_json, "[]") == 0 || strcmp(response_json, "{}") == 0) {
-        if (strstr(ctx->url, "/users/") && !strstr(ctx->url, "/users/batch")) {
-            // Single user not found
-            strcpy(response_json, "{\"error\":\"User not found\"}");
-            status_code = 404;
-        } else if (strcmp(ctx->url, "/users") == 0) {
-            // Empty user list should return empty array, not error
-            strcpy(response_json, "[]");
-            status_code = 200;
-        } else {
-            strcpy(response_json, "{\"error\":\"No content\"}");
-            status_code = 204; // No Content
-        }
-        response_len = strlen(response_json);
-    }
-
     send_response(ctx, response_json, response_len, status_code);
 
     // Performance logging for very slow requests (> 1ms)
+
     uint64_t elapsed = get_time_ns() - ctx->start_time_ns;
     if (elapsed > 1000000) { // 1ms threshold
-        printf("[PERF] Slow request: %s %s took %lu μs\n",
+        printf("[PERF] request: %s %s took %lu μs\n",
                ctx->method, ctx->url, elapsed / 1000);
     }
 
+
+    RAMForge_enhanced_operation_record(elapsed / 1000);
     // Reset for next request if keep-alive
     if (ctx->keep_alive) {
         ctx->msg_complete = 0;
         ctx->body_len = 0;
         ctx->url[0] = '\0';
         ctx->request_id++;
+        ctx->start_time_ns = get_time_ns();
         http_parser_init(&ctx->parser, HTTP_REQUEST);
     }
 }
@@ -400,16 +468,33 @@ static void connection_close_cb(uv_handle_t* handle) {
     connection_ctx_t* ctx = (connection_ctx_t*)handle->data;
 
     if (ctx) {
+        // Safely cleanup connection context
         if (ctx->body) {
             slab_free(ctx->body);
+            ctx->body = NULL;
         }
         if (ctx->response_buf) {
             buffer_release(ctx->response_buf);
+            ctx->response_buf = NULL;
         }
-        object_pool_release(connection_pool, ctx);
-        active_connections--;
+
+        // Clear the context before returning to pool
+        memset(ctx, 0, sizeof(connection_ctx_t));
+
+        // Return to pool or free
+        if (connection_pool) {
+            object_pool_release(connection_pool, ctx);
+        } else {
+            slab_free(ctx);
+        }
+
+        // Decrement active connections
+        if (active_connections > 0) {
+            active_connections--;
+        }
     }
 
+    // Always free the handle itself
     slab_free(handle);
 }
 
@@ -420,27 +505,58 @@ static void accept_connection(uv_stream_t* server, int status) {
     }
 
     // Get connection context from pool
-    connection_ctx_t* ctx = (connection_ctx_t*)object_pool_get(connection_pool);
+    connection_ctx_t* ctx = NULL;
+    if (connection_pool) {
+        ctx = (connection_ctx_t*)object_pool_get(connection_pool);
+    }
+
     if (!ctx) {
         ctx = slab_alloc(sizeof(connection_ctx_t));
-        memset(ctx, 0, sizeof(connection_ctx_t));
+        if (!ctx) {
+            fprintf(stderr, "[HTTP] Failed to allocate connection context\n");
+            return;
+        }
+    }
 
-        // Initialize HTTP parser
-        http_parser_init(&ctx->parser, HTTP_REQUEST);
-        http_parser_settings_init(&ctx->settings);
-        ctx->settings.on_url = on_url_cb;
-        ctx->settings.on_body = on_body_cb;
-        ctx->settings.on_message_complete = on_message_complete_cb;
-        ctx->parser.data = ctx;
+    // CRITICAL: Always zero-initialize the context
+    memset(ctx, 0, sizeof(connection_ctx_t));
 
-        // Allocate buffers
-        ctx->body_capacity = 4096;
-        ctx->body = slab_alloc(ctx->body_capacity);
-        ctx->response_buf = buffer_create(MAX_RESPONSE_SIZE);
+    // Initialize HTTP parser
+    http_parser_init(&ctx->parser, HTTP_REQUEST);
+    http_parser_settings_init(&ctx->settings);
+    ctx->settings.on_url = on_url_cb;
+    ctx->settings.on_body = on_body_cb;
+    ctx->settings.on_message_complete = on_message_complete_cb;
+    ctx->parser.data = ctx;
+
+    // Allocate buffers
+    ctx->body_capacity = 4096;
+    ctx->body = slab_alloc(ctx->body_capacity);
+    if (!ctx->body) {
+        fprintf(stderr, "[HTTP] Failed to allocate body buffer\n");
+        slab_free(ctx);
+        return;
+    }
+    ctx->body[0] = '\0';
+
+    ctx->response_buf = buffer_create(MAX_RESPONSE_SIZE);
+    if (!ctx->response_buf) {
+        fprintf(stderr, "[HTTP] Failed to allocate response buffer\n");
+        slab_free(ctx->body);
+        slab_free(ctx);
+        return;
     }
 
     // Create client socket
     uv_tcp_t* client = slab_alloc(sizeof(uv_tcp_t));
+    if (!client) {
+        fprintf(stderr, "[HTTP] Failed to allocate client socket\n");
+        slab_free(ctx->body);
+        buffer_release(ctx->response_buf);
+        slab_free(ctx);
+        return;
+    }
+
     uv_tcp_init(main_loop, client);
 
     // Enable TCP optimizations
@@ -450,6 +566,7 @@ static void accept_connection(uv_stream_t* server, int status) {
     ctx->client = client;
     ctx->start_time_ns = get_time_ns();
     ctx->keep_alive = 1; // Default to keep-alive
+    ctx->request_id = 1;
     client->data = ctx;
 
     if (uv_accept(server, (uv_stream_t*)client) == 0) {
@@ -461,31 +578,30 @@ static void accept_connection(uv_stream_t* server, int status) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// CRITICAL FIX: Manual SO_REUSEPORT Configuration
+// ═══════════════════════════════════════════════════════════════════════════════
+//static int enable_reuseport(uv_tcp_t* handle) {
+//    int fd;
+//    int result = uv_fileno((uv_handle_t*)handle, &fd);
+//    if (result < 0) {
+//        fprintf(stderr, "Failed to get file descriptor: %s\n", uv_strerror(result));
+//        return -1;
+//    }
+//
+//    int enable = 1;
+//    if (setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &enable, sizeof(enable)) < 0) {
+//        perror("setsockopt SO_REUSEPORT failed");
+//        return -1;
+//    }
+//
+//    printf("✓ SO_REUSEPORT enabled on socket fd=%d\n", fd);
+//    return 0;
+//}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // Performance Statistics Timer
 // ═══════════════════════════════════════════════════════════════════════════════
 static uv_timer_t stats_timer;
-
-//static void print_stats(uv_timer_t* timer) {
-//    (void)timer;
-//
-//    static uint64_t last_requests = 0;
-//    static uint64_t last_bytes_sent = 0;
-//    static uint64_t last_bytes_received = 0;
-//
-//    uint64_t req_diff = total_requests - last_requests;
-//    uint64_t sent_diff = total_bytes_sent - last_bytes_sent;
-//    uint64_t recv_diff = total_bytes_received - last_bytes_received;
-//
-//    printf("[STATS] RPS: %lu, Active: %lu, Sent: %.2f MB/s, Recv: %.2f MB/s\n",
-//           req_diff / 5, // 5-second intervals
-//           active_connections,
-//           (double)sent_diff / (1024 * 1024 * 5),
-//           (double)recv_diff / (1024 * 1024 * 5));
-//
-//    last_requests = total_requests;
-//    last_bytes_sent = total_bytes_sent;
-//    last_bytes_received = total_bytes_received;
-//}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Public API - Initialize the Beast
@@ -512,29 +628,32 @@ void http_server_init(App* app, int port) {
     update_date_cache(&date_timer); // Initial update
     uv_timer_start(&date_timer, update_date_cache, 1000, 1000);
 
-
     // Create TCP server with maximum performance settings
     uv_tcp_t* server = slab_alloc(sizeof(uv_tcp_t));
     uv_tcp_init(main_loop, server);
+
+
 
     // Bind to all interfaces
     struct sockaddr_in addr;
     uv_ip4_addr("0.0.0.0", port, &addr);
 
+    // Simple bind (SO_REUSEPORT already enabled above)
     int bind_result = uv_tcp_bind(server, (const struct sockaddr*)&addr, UV_TCP_REUSEPORT);
     if (bind_result != 0) {
-        fprintf(stderr, "Bind failed: %s\n", uv_strerror(bind_result));
+        fprintf(stderr, "❌ Bind failed: %s\n", uv_strerror(bind_result));
         exit(1);
     }
 
     // Start listening with large backlog for high-traffic scenarios
     int listen_result = uv_listen((uv_stream_t*)server, 8192, accept_connection);
     if (listen_result != 0) {
-        fprintf(stderr, "Listen failed: %s\n", uv_strerror(listen_result));
+        fprintf(stderr, "❌ Listen failed: %s\n", uv_strerror(listen_result));
         exit(1);
     }
 
-    printf("🚀 RAMForge Beast Mode HTTP Server is LIVE on port %d!\n", port);
+    printf("🚀 RAMForge Beast Mode HTTP Server is LIVE on port %d! (PID: %d)\n", port, getpid());
+
     // Run the event loop
     uv_run(main_loop, UV_RUN_DEFAULT);
 
@@ -545,17 +664,8 @@ void http_server_init(App* app, int port) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Additional Performance Helpers
-// ═══════════════════════════════════════════════════════════════════════════════
-
-// Get current performance stats (for monitoring)
-void http_server_get_stats(uint64_t* requests, uint64_t* connections, uint64_t* bytes_sent) {
-    if (requests) *requests = total_requests;
-    if (connections) *connections = active_connections;
-    if (bytes_sent) *bytes_sent = total_bytes_sent;
-}
-
 // Graceful shutdown
+// ═══════════════════════════════════════════════════════════════════════════════
 void http_server_shutdown(void) {
     printf("🛑 Shutting down RAMForge Beast Mode HTTP Server...\n");
     uv_timer_stop(&date_timer);
