@@ -92,7 +92,7 @@ curl -X POST 'localhost:1109/broker/topics/events/produce' \
 ```bash
 # Dependencies: libuv 1.51+, openssl, zlib, liburing
 make clean && make
-./ayder --port 1109 --workers 12
+./ayder --port 1109
 ```
 
 ### Docker Compose Stack
@@ -595,3 +595,4 @@ Errors follow a consistent format:
 
 
 [Your license here]
+
