@@ -25,4 +25,5 @@ int zp_restore_handler(Request *req, Response *res);
 int zp_restore_status_handler(Request *req, Response *res);
 int zp_restore_sync_handler(Request *req, Response *res);
 
+
 #endif //RAMFORGE_ZERO_PAUSE_RESTORE_H

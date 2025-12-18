@@ -22,6 +22,14 @@ static void router_post_wrap(struct App *self,
     register_route("POST", path, h);
 }
 
+static void router_delete_wrap(struct App *self,
+                             const char *path,
+                             RouteHandler h)
+{
+    (void)self;
+    register_route("DELETE", path, h);
+}
+
 /* stub (HTTP server lives in cluster.c) */
 static void app_start_http(struct App *self, int port)
 {
@@ -48,6 +56,7 @@ App *app_create(Storage *storage)
     app->storage  = storage;
     app->get      = router_get_wrap;
     app->post     = router_post_wrap;
+    app->delete   = router_delete_wrap;
     app->start    = app_start_http;
     app->shutdown = app_shutdown_wrap;
 

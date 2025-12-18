@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <limits.h>
+#include <stdio.h>
 
 // Check for SIMD support and include appropriate headers
 #ifdef __AVX2__
@@ -163,6 +164,7 @@ typedef enum {
     JSON_NULL,
     JSON_BOOL,
     JSON_INT,
+    JSON_DOUBLE,
     JSON_STRING,
     JSON_OBJECT,
     JSON_ARRAY
@@ -171,7 +173,8 @@ typedef enum {
 typedef struct json_value {
     json_type_t      type;
     union {
-        int          i;
+        int64_t      i;
+        double       d;
         int          b;  // boolean
         string_view_t s;  // string (zero-copy)
         struct {
@@ -210,19 +213,33 @@ static inline void skip_whitespace(json_parser_t* p) {
 static inline int parse_string(json_parser_t* p, string_view_t* out) {
     if (p->ptr >= p->end || *p->ptr != '"') return 0;
     p->ptr++;  // skip opening quote
+    const char *start = p->ptr;
+    const char *scan = p->ptr;
 
-    const char* start = p->ptr;
-    const char* quote = simd_find_char(p->ptr, '"', p->end - p->ptr);
+    while (scan < p->end) {
+        const char *q = simd_find_char(scan, '"', (size_t) (p->end - scan));
+        if (!q) {
+            p->error_pos = (size_t) (p->ptr - p->input);
+            return 0;
+        }
 
-    if (!quote) {
-        p->error_pos = p->ptr - p->input;
-        return 0;
+        // Count preceding backslashes to determine if this quote is escaped.
+        const char *b = q - 1;
+        int slashes = 0;
+        while (b >= start && *b == '\\') {
+            ++slashes;
+            --b;
+        }
+        if ((slashes & 1) == 0) {  // even = unescaped
+            out->ptr = start;
+            out->len = (size_t) (q - start);
+            p->ptr = q + 1;  // skip closing quote
+            return 1;
+        }
+        scan = q + 1; // keep searching
     }
-
-    out->ptr = start;
-    out->len = quote - start;
-    p->ptr = quote + 1;  // skip closing quote
-    return 1;
+    p->error_pos = (size_t) (p->ptr - p->input);
+    return 0;
 }
 
 // Forward declaration
@@ -394,20 +411,29 @@ static int parse_value(json_parser_t* p, json_value_t* out) {
         // Number - find end of number
         const char* start = p->ptr;
         if (c == '-') p->ptr++;
-        while (p->ptr < p->end && *p->ptr >= '0' && *p->ptr <= '9') {
+
+        // Check if it's a floating-point number
+        char* dot_pos = strchr(p->ptr, '.');
+        while (p->ptr < p->end && (*p->ptr >= '0' && *p->ptr <= '9' || *p->ptr == '.' || *p->ptr == 'e' || *p->ptr == 'E' || *p->ptr == '+' || *p->ptr == '-')) {
             p->ptr++;
         }
 
         string_view_t num_str = {start, p->ptr - start};
-        int value;
-        if (!fast_parse_int(num_str, &value)) {
-            p->error_pos = start - p->input;
-            return 0;
+        if (dot_pos) {
+            double value;
+            if (sscanf(num_str.ptr, "%lf", &value) == 1) {
+                out->type = JSON_DOUBLE;
+                out->as.d = value;
+                return 1;
+            }
+        } else {
+            int value;
+            if (fast_parse_int(num_str, &value)) {
+                out->type = JSON_INT;
+                out->as.i = value;
+                return 1;
+            }
         }
-
-        out->type = JSON_INT;
-        out->as.i = value;
-        return 1;
     } else if (strncmp(p->ptr, "true", 4) == 0) {
         p->ptr += 4;
         out->type = JSON_BOOL;
@@ -449,26 +475,32 @@ static inline json_value_t* json_parse(const char* input, size_t len) {
     return result;
 }
 
-static inline void json_free(json_value_t* val) {
+static inline void json_deinit(json_value_t* val) {
     if (!val) return;
 
-    if (val->type == JSON_OBJECT) {
-        for (size_t i = 0; i < val->as.object.count; i++) {
-            json_free(&val->as.object.pairs[i].value);
-        }
-        if (val->as.object.pairs) {
-            slab_free(val->as.object.pairs);
-        }
-    } else if (val->type == JSON_ARRAY) {
-        for (size_t i = 0; i < val->as.array.count; i++) {
-            json_free(&val->as.array.items[i]);
-        }
-        if (val->as.array.items) {
-            slab_free(val->as.array.items);
-        }
-    }
+    switch (val->type) {
+        case JSON_OBJECT:
+            for (size_t i = 0; i < val->as.object.count; ++i) {
+                json_deinit(&val->as.object.pairs[i].value);   // <- was json_free(...)
+            }
+            if (val->as.object.pairs) slab_free(val->as.object.pairs);
+            break;
 
-    slab_free(val);
+        case JSON_ARRAY:
+            for (size_t i = 0; i < val->as.array.count; ++i) {
+                json_deinit(&val->as.array.items[i]);          // <- was json_free(...)
+            }
+            if (val->as.array.items) slab_free(val->as.array.items);
+            break;
+
+        default: /* JSON_STRING/INT/BOOL/NULL: no owning heap */ break;
+    }
+}
+
+static inline void json_free(json_value_t* val) {
+    if (!val) return;
+    json_deinit(val);
+    slab_free(val);   // only the root (or things individually slab_alloc’d)
 }
 
 // Get object field by key
@@ -574,33 +606,6 @@ static inline size_t serialize_user_fast(char* out, int id, const char* name) {
     *p++ = '"';
     *p++ = '}';
 
-    return p - out;
-}
-
-// Array serialization with pre-allocation
-static inline size_t serialize_user_array_fast(char* out, json_value_t** users, size_t count) {
-    char* p = out;
-    *p++ = '[';
-
-    for (size_t i = 0; i < count; i++) {
-        if (i > 0) *p++ = ',';
-
-        json_value_t* id_val = json_get_field(users[i], "id");
-        json_value_t* name_val = json_get_field(users[i], "name");
-
-        if (id_val && name_val && id_val->type == JSON_INT && name_val->type == JSON_STRING) {
-            // Extract name as null-terminated string for now
-            char name_buf[256];
-            size_t name_len = name_val->as.s.len;
-            if (name_len < sizeof(name_buf)) {
-                memcpy(name_buf, name_val->as.s.ptr, name_len);
-                name_buf[name_len] = '\0';
-                p += serialize_user_fast(p, id_val->as.i, name_buf);
-            }
-        }
-    }
-
-    *p++ = ']';
     return p - out;
 }
 

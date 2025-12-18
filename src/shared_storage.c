@@ -75,8 +75,6 @@ SharedStorage *shared_storage_init(void) {
     }
     pthread_mutexattr_destroy(&mattr);
 
-    printf("✓ Optimized shared storage initialized (%u entries, %d shards)\n",
-           MAX_SHARED_ENTRIES, SHARD_COUNT);
     return ss;
 }
 
@@ -236,35 +234,24 @@ int shared_storage_get(SharedStorage *ss, int key, void *out, size_t out_sz) {
     return 0;
 }
 
-void shared_storage_stats(SharedStorage *ss) {
-    if (!ss) return;
+/* ---------------------------------------------------------------------------
+ * Simple lock-free full scan – good enough for snapshot.  Caller must ensure
+ * no slot is freed while we read it (RW-lock already held or single-thread).
+ * ------------------------------------------------------------------------ */
+void shared_storage_iterate(SharedStorage *ss,
+                            void (*cb)(int, const void *, size_t, void *),
+                                void *ud) {
+    if (!ss || !cb) return;
 
-    uint64_t reads = atomic_load(&ss->read_ops);
-    uint64_t writes = atomic_load(&ss->write_ops);
-    uint64_t collisions = atomic_load(&ss->collisions);
-    uint32_t size = atomic_load(&ss->size);
-    uint32_t capacity = atomic_load(&ss->capacity);
-
-    printf("\n=== SHARED STORAGE STATS ===\n");
-    printf("Entries: %u / %u (%.1f%% full)\n",
-           size, capacity, (float)size / capacity * 100);
-    printf("Read ops: %lu\n", reads);
-    printf("Write ops: %lu\n", writes);
-    printf("Collisions: %lu\n", collisions);
-    printf("Load factor: %.3f\n", (float)size / capacity);
-
-    // Shard utilization
-    uint32_t used_shards = 0;
-    uint32_t max_shard_load = 0;
-    for (int i = 0; i < SHARD_COUNT; i++) {
-        uint32_t load = atomic_load(&ss->shards[i].load_factor);
-        if (load > 0) used_shards++;
-        if (load > max_shard_load) max_shard_load = load;
+    for (uint32_t i = 0; i < MAX_SHARED_ENTRIES; ++i) {
+        int k = atomic_load(&ss->entries[i].key);
+        uint32_t sz = atomic_load(&ss->entries[i].size);
+        if (k && sz)
+            cb(k, ss->entries[i].data, sz, ud);
     }
-    printf("Active shards: %u / %d\n", used_shards, SHARD_COUNT);
-    printf("Max shard load: %u\n", max_shard_load);
-    printf("============================\n\n");
 }
+
+
 
 void shared_storage_destroy(SharedStorage *ss) {
     if (!ss) return;
@@ -275,4 +262,59 @@ void shared_storage_destroy(SharedStorage *ss) {
 
     munmap(ss, sizeof(SharedStorage));
     shm_unlink(SHARED_STORAGE_NAME);
+}
+
+
+uint64_t shared_storage_atomic_inc_u64(SharedStorage *ss, int key) {
+    return shared_storage_atomic_add_u64(ss, key, 1);
+}
+
+uint64_t shared_storage_atomic_add_u64(SharedStorage *ss, int key, uint64_t delta) {
+    if (!ss || key == 0) return 0;
+
+    uint32_t h = hash_key_fast(key);
+    uint32_t shard_idx = h & (SHARD_COUNT - 1);
+    Shard *shard = &ss->shards[shard_idx];
+
+    pthread_mutex_lock(&shard->lock);
+
+    uint32_t capacity = atomic_load(&ss->capacity);
+    uint32_t idx = h % capacity;
+    uint32_t start_idx = idx;
+    uint32_t distance = 0;
+    uint32_t max_distance = capacity / 4;
+
+    while (distance < max_distance) {
+        int existing_key = atomic_load(&ss->entries[idx].key);
+
+        if (existing_key == key) {
+            // Found - increment the value
+            uint64_t *val_ptr = (uint64_t *)ss->entries[idx].data;
+            uint64_t old_val = *val_ptr;
+            *val_ptr = old_val + delta;
+            atomic_fetch_add(&ss->entries[idx].version, 1);
+            pthread_mutex_unlock(&shard->lock);
+            return old_val;
+        } else if (existing_key == 0) {
+            // Empty slot - initialize
+            atomic_store(&ss->entries[idx].key, key);
+            atomic_store(&ss->entries[idx].size, sizeof(uint64_t));
+            uint64_t *val_ptr = (uint64_t *)ss->entries[idx].data;
+            *val_ptr = delta;
+            atomic_fetch_add(&ss->entries[idx].version, 1);
+            atomic_fetch_add(&ss->size, 1);
+            atomic_fetch_add(&shard->load_factor, 1);
+            pthread_mutex_unlock(&shard->lock);
+            return 0;
+        }
+
+        idx = (idx + 1) % capacity;
+        distance++;
+
+        if (idx == start_idx) break;
+    }
+
+    pthread_mutex_unlock(&shard->lock);
+    fprintf(stderr, "shared_storage_atomic_add_u64: no slot for key %d\n", key);
+    return 0;
 }

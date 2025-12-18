@@ -2,17 +2,28 @@ version: "3.8"
 services:
   ramforge:
     build: .
-    container_name: ramforge
+    container_name: ayder
     shm_size: 2g
     ports:
       - "1109:1109"
-    restart: unless-stopped
+    ipc: shareable
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      # token "demo" has low RPS to make 429 spike trivial in demo
+      - RF_BEARER_TOKENS='dev@55555555555555:11111111111111111:111111111111111111111'
+    restart: "no"
 
   prometheus:
     image: prom/prometheus:latest
     container_name: prometheus
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./alerts.yml:/etc/prometheus/alerts.yml:ro
       - prometheus-data:/prometheus
     ports:
       - "9090:9090"

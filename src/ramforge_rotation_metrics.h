@@ -37,6 +37,10 @@ typedef struct {
     _Atomic uint64_t rdb_size_total_mb;
     _Atomic uint64_t aof_files_total;
     _Atomic uint64_t aof_size_total_mb;
+    _Atomic uint64_t aof_generation;
+    _Atomic uint64_t aof_switches;
+    _Atomic uint64_t write_failures;
+    _Atomic uint64_t successful_writes;
     _Atomic uint64_t disk_space_freed_mb;
     _Atomic uint64_t beast_mode_ops;
     _Atomic uint64_t sub_1ms_operations;
@@ -47,8 +51,12 @@ typedef struct {
     _Atomic uint64_t crc_failures;
     _Atomic uint64_t recovery_attempts;
     _Atomic uint64_t recovery_successes;
+    _Atomic uint64_t zp_restores;                  /* successful restores     */
+    _Atomic uint64_t zp_restore_failures;          /* failed restores        */
+    _Atomic uint64_t zp_restore_us;                /* cumulative µs          */
+    _Atomic uint64_t zp_restore_last_success_unix; /* Unix ts of last success*/
+    _Atomic uint64_t zp_restore_inflight;          /* 0|1 gauge              */
 } RAMForgeMetrics;
-
 static void metrics_buf_init(metrics_buffer_t* buf, char* buffer, size_t cap) {
     buf->buffer = buffer;
     buf->capacity = cap;
@@ -56,7 +64,9 @@ static void metrics_buf_init(metrics_buffer_t* buf, char* buffer, size_t cap) {
     if (cap > 0) buf->buffer[0] = '\0';
 }
 void ZeroPauseRDB_metrics_inc(uint64_t usec);
-
+void ZeroPauseRDB_restore_metrics_inc(uint64_t usec, int ok);
+void RAMForge_force_rotation(void);
+void RAMForge_record_crc_validation(int success);
 static int metrics_buf_printf(metrics_buffer_t* buf, const char* fmt, ...) {
     if (!buf || buf->length >= buf->capacity)
         return 0;
@@ -72,10 +82,10 @@ static int metrics_buf_printf(metrics_buffer_t* buf, const char* fmt, ...) {
     }
     return written;
 }
-
-
 void RAMForge_export_prometheus_metrics_buffer(char* buffer, size_t capacity);
-void RAMForge_enhanced_operation_record(uint64_t latency_us);
 void RAMForge_record_recovery_attempt(int success);
+
+
+/* broker exposes latest produced offset for lag computation */
 
 #endif //RAMFORGE_RAMFORGE_ROTATION_METRICS_H

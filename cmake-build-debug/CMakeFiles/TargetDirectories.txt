@@ -1,3 +1,0 @@
-/mnt/c/Users/amano/Desktop/Romanuly Aidarbek/RAMForge/cmake-build-debug/CMakeFiles/RAMForge.dir
-/mnt/c/Users/amano/Desktop/Romanuly Aidarbek/RAMForge/cmake-build-debug/CMakeFiles/edit_cache.dir
-/mnt/c/Users/amano/Desktop/Romanuly Aidarbek/RAMForge/cmake-build-debug/CMakeFiles/rebuild_cache.dir

@@ -1,4 +1,4 @@
-C:\Windows\system32\wsl.exe --distribution kali-linux --exec /bin/bash -c "export CMAKE_COLOR_DIAGNOSTICS=ON && export CLION_IDE=TRUE && export JETBRAINS_IDE=TRUE && cd '/mnt/c/Users/amano/Desktop/Romanuly Aidarbek/RAMForge/cmake-build-debug' && /usr/bin/cmake -DCMAKE_BUILD_TYPE=Debug -G 'CodeBlocks - Unix Makefiles' -S '/mnt/c/Users/amano/Desktop/Romanuly Aidarbek/RAMForge' -B '/mnt/c/Users/amano/Desktop/Romanuly Aidarbek/RAMForge/cmake-build-debug'"
+C:\Windows\system32\wsl.exe --distribution kali-linux --exec /bin/bash -c "export CMAKE_COLOR_DIAGNOSTICS=ON && export CLION_IDE=TRUE && export JETBRAINS_IDE=TRUE && cd /home/ayderbek/project/ayder/cmake-build-debug && /usr/bin/cmake -DCMAKE_BUILD_TYPE=Debug -G 'CodeBlocks - Unix Makefiles' -S /home/ayderbek/project/ayder -B /home/ayderbek/project/ayder/cmake-build-debug"
 CMake Deprecation Warning:
   Support for "Extra Generators" like
 
@@ -8,6 +8,16 @@ CMake Deprecation Warning:
   use the cmake-file-api(7) to view CMake-generated project build trees.
 
 
--- Configuring done (0.1s)
--- Generating done (0.2s)
--- Build files have been written to: /mnt/c/Users/amano/Desktop/Romanuly Aidarbek/RAMForge/cmake-build-debug
+-- The C compiler identification is GNU 14.2.0
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+CMake Error at CMakeLists.txt:6 (add_executable):
+  The target name "src/main.c" is reserved or not valid for certain CMake
+  features, such as generator expressions, and may result in undefined
+  behavior.
+
+
+-- Configuring incomplete, errors occurred!

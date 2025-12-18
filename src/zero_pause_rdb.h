@@ -25,10 +25,11 @@ void ZeroPauseRDB_init(const char *rdb_path, Storage *storage,
                        size_t max_keys, unsigned snapshot_interval_sec);
 
 void ZeroPauseRDB_mark_dirty(int key_id, const void *old_data, size_t old_size);
-void ZeroPauseRDB_snapshot(void);
+uint64_t  ZeroPauseRDB_snapshot(void);
 void ZeroPauseRDB_stats(ZeroPauseStats *stats);
 void ZeroPauseRDB_shutdown(void);
 int ZeroPauseRDB_snapshot_wait(void);
+int ZeroPauseRDB_snapshot_status(uint64_t *gen, int *active);
 
 // Chaos testing API
 void ZeroPauseRDB_chaos_test(int enable);

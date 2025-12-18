@@ -57,10 +57,10 @@ RM = /usr/bin/cmake -E rm -f
 EQUALS = =
 
 # The top-level source directory on which CMake was run.
-CMAKE_SOURCE_DIR = "/mnt/c/Users/amano/Desktop/Romanuly Aidarbek/RAMForge"
+CMAKE_SOURCE_DIR = /home/ayderbek/project/RAMForge
 
 # The top-level build directory on which CMake was run.
-CMAKE_BINARY_DIR = "/mnt/c/Users/amano/Desktop/Romanuly Aidarbek/RAMForge/cmake-build-debug"
+CMAKE_BINARY_DIR = /home/ayderbek/project/RAMForge/cmake-build-debug
 
 #=============================================================================
 # Targets provided globally by CMake.
@@ -87,9 +87,9 @@ rebuild_cache/fast: rebuild_cache
 
 # The main all target
 all: cmake_check_build_system
-	$(CMAKE_COMMAND) -E cmake_progress_start "/mnt/c/Users/amano/Desktop/Romanuly Aidarbek/RAMForge/cmake-build-debug/CMakeFiles" "/mnt/c/Users/amano/Desktop/Romanuly Aidarbek/RAMForge/cmake-build-debug//CMakeFiles/progress.marks"
+	$(CMAKE_COMMAND) -E cmake_progress_start /home/ayderbek/project/RAMForge/cmake-build-debug/CMakeFiles /home/ayderbek/project/RAMForge/cmake-build-debug//CMakeFiles/progress.marks
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 all
-	$(CMAKE_COMMAND) -E cmake_progress_start "/mnt/c/Users/amano/Desktop/Romanuly Aidarbek/RAMForge/cmake-build-debug/CMakeFiles" 0
+	$(CMAKE_COMMAND) -E cmake_progress_start /home/ayderbek/project/RAMForge/cmake-build-debug/CMakeFiles 0
 .PHONY : all
 
 # The main clean target
@@ -369,29 +369,29 @@ src/object_pool.c.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/RAMForge.dir/build.make CMakeFiles/RAMForge.dir/src/object_pool.c.s
 .PHONY : src/object_pool.c.s
 
-src/persistence.o: src/persistence.c.o
-.PHONY : src/persistence.o
+src/persistence_zp.o: src/persistence_zp.c.o
+.PHONY : src/persistence_zp.o
 
 # target to build an object file
-src/persistence.c.o:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/RAMForge.dir/build.make CMakeFiles/RAMForge.dir/src/persistence.c.o
-.PHONY : src/persistence.c.o
+src/persistence_zp.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/RAMForge.dir/build.make CMakeFiles/RAMForge.dir/src/persistence_zp.c.o
+.PHONY : src/persistence_zp.c.o
 
-src/persistence.i: src/persistence.c.i
-.PHONY : src/persistence.i
+src/persistence_zp.i: src/persistence_zp.c.i
+.PHONY : src/persistence_zp.i
 
 # target to preprocess a source file
-src/persistence.c.i:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/RAMForge.dir/build.make CMakeFiles/RAMForge.dir/src/persistence.c.i
-.PHONY : src/persistence.c.i
+src/persistence_zp.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/RAMForge.dir/build.make CMakeFiles/RAMForge.dir/src/persistence_zp.c.i
+.PHONY : src/persistence_zp.c.i
 
-src/persistence.s: src/persistence.c.s
-.PHONY : src/persistence.s
+src/persistence_zp.s: src/persistence_zp.c.s
+.PHONY : src/persistence_zp.s
 
 # target to generate assembly for a file
-src/persistence.c.s:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/RAMForge.dir/build.make CMakeFiles/RAMForge.dir/src/persistence.c.s
-.PHONY : src/persistence.c.s
+src/persistence_zp.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/RAMForge.dir/build.make CMakeFiles/RAMForge.dir/src/persistence_zp.c.s
+.PHONY : src/persistence_zp.c.s
 
 src/ramforge.o: src/ramforge.c.o
 .PHONY : src/ramforge.o
@@ -489,6 +489,30 @@ src/response.c.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/RAMForge.dir/build.make CMakeFiles/RAMForge.dir/src/response.c.s
 .PHONY : src/response.c.s
 
+src/rf_broker.o: src/rf_broker.c.o
+.PHONY : src/rf_broker.o
+
+# target to build an object file
+src/rf_broker.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/RAMForge.dir/build.make CMakeFiles/RAMForge.dir/src/rf_broker.c.o
+.PHONY : src/rf_broker.c.o
+
+src/rf_broker.i: src/rf_broker.c.i
+.PHONY : src/rf_broker.i
+
+# target to preprocess a source file
+src/rf_broker.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/RAMForge.dir/build.make CMakeFiles/RAMForge.dir/src/rf_broker.c.i
+.PHONY : src/rf_broker.c.i
+
+src/rf_broker.s: src/rf_broker.c.s
+.PHONY : src/rf_broker.s
+
+# target to generate assembly for a file
+src/rf_broker.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/RAMForge.dir/build.make CMakeFiles/RAMForge.dir/src/rf_broker.c.s
+.PHONY : src/rf_broker.c.s
+
 src/router.o: src/router.c.o
 .PHONY : src/router.o
 
@@ -584,6 +608,30 @@ src/storage.s: src/storage.c.s
 src/storage.c.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/RAMForge.dir/build.make CMakeFiles/RAMForge.dir/src/storage.c.s
 .PHONY : src/storage.c.s
+
+src/storage_thread_safeguard.o: src/storage_thread_safeguard.c.o
+.PHONY : src/storage_thread_safeguard.o
+
+# target to build an object file
+src/storage_thread_safeguard.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/RAMForge.dir/build.make CMakeFiles/RAMForge.dir/src/storage_thread_safeguard.c.o
+.PHONY : src/storage_thread_safeguard.c.o
+
+src/storage_thread_safeguard.i: src/storage_thread_safeguard.c.i
+.PHONY : src/storage_thread_safeguard.i
+
+# target to preprocess a source file
+src/storage_thread_safeguard.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/RAMForge.dir/build.make CMakeFiles/RAMForge.dir/src/storage_thread_safeguard.c.i
+.PHONY : src/storage_thread_safeguard.c.i
+
+src/storage_thread_safeguard.s: src/storage_thread_safeguard.c.s
+.PHONY : src/storage_thread_safeguard.s
+
+# target to generate assembly for a file
+src/storage_thread_safeguard.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/RAMForge.dir/build.make CMakeFiles/RAMForge.dir/src/storage_thread_safeguard.c.s
+.PHONY : src/storage_thread_safeguard.c.s
 
 src/zero_pause_rdb.o: src/zero_pause_rdb.c.o
 .PHONY : src/zero_pause_rdb.o
@@ -864,9 +912,9 @@ help:
 	@echo "... src/object_pool.o"
 	@echo "... src/object_pool.i"
 	@echo "... src/object_pool.s"
-	@echo "... src/persistence.o"
-	@echo "... src/persistence.i"
-	@echo "... src/persistence.s"
+	@echo "... src/persistence_zp.o"
+	@echo "... src/persistence_zp.i"
+	@echo "... src/persistence_zp.s"
 	@echo "... src/ramforge.o"
 	@echo "... src/ramforge.i"
 	@echo "... src/ramforge.s"
@@ -879,6 +927,9 @@ help:
 	@echo "... src/response.o"
 	@echo "... src/response.i"
 	@echo "... src/response.s"
+	@echo "... src/rf_broker.o"
+	@echo "... src/rf_broker.i"
+	@echo "... src/rf_broker.s"
 	@echo "... src/router.o"
 	@echo "... src/router.i"
 	@echo "... src/router.s"
@@ -891,6 +942,9 @@ help:
 	@echo "... src/storage.o"
 	@echo "... src/storage.i"
 	@echo "... src/storage.s"
+	@echo "... src/storage_thread_safeguard.o"
+	@echo "... src/storage_thread_safeguard.i"
+	@echo "... src/storage_thread_safeguard.s"
 	@echo "... src/zero_pause_rdb.o"
 	@echo "... src/zero_pause_rdb.i"
 	@echo "... src/zero_pause_rdb.s"

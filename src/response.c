@@ -3,10 +3,11 @@
 #include <stdarg.h>
 #include <stdio.h>
 
-// No heap here—writes directly into the Response’s fixed buffer.
-void response_json(Response* res, const char* fmt, ...) {
-    va_list args;
-    va_start(args, fmt);
-    vsnprintf(res->buffer, RESPONSE_BUFFER_SIZE, fmt, args);
-    va_end(args);
+void response_json(Response *res, const char *fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    int n = vsnprintf(res->buffer, RESPONSE_BUFFER_SIZE, fmt, ap);
+    va_end(ap);
+    if (n < 0) res->buffer[0] = '\0';
+    else if (n >= (int)RESPONSE_BUFFER_SIZE)
+        res->buffer[RESPONSE_BUFFER_SIZE-1] = '\0';
 }

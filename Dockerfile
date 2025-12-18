@@ -11,7 +11,7 @@ RUN apt-get update -qq && \
     apt-get install -y --no-install-recommends \
         build-essential curl ca-certificates \
         autotools-dev automake libtool pkg-config \
-        dmsetup util-linux zlib1g-dev libhttp-parser-dev && \
+        dmsetup util-linux zlib1g-dev liburing-dev libcurl4-openssl-dev libssl-dev && \
     rm -rf /var/lib/apt/lists/*
 
 # ---- Build & install libuv 1.51 ----
@@ -20,16 +20,29 @@ RUN curl -fsSL https://dist.libuv.org/dist/v${LIBUV_VERSION}/libuv-v${LIBUV_VERS
       -o /tmp/libuv.tar.gz && \
     tar -xzf /tmp/libuv.tar.gz -C /tmp && \
     cd /tmp/libuv-v${LIBUV_VERSION} && \
-    sh autogen.sh && ./configure && make -j$(nproc) && make install && \
+    sh autogen.sh && ./configure && make -j"$(nproc)" && make install && \
     ldconfig && \
     rm -rf /tmp/libuv*
 
 # ---- Compile RamForge ----
 WORKDIR /app
-COPY ./src ./src
+
+# Always ensure picohttpparser exists; overlay later if repo has it
+RUN mkdir -p deps/picohttpparser && \
+    curl -fsSL https://raw.githubusercontent.com/h2o/picohttpparser/master/picohttpparser.c \
+      -o deps/picohttpparser/picohttpparser.c && \
+    curl -fsSL https://raw.githubusercontent.com/h2o/picohttpparser/master/picohttpparser.h \
+      -o deps/picohttpparser/picohttpparser.h
+
+RUN mkdir -p /data
+
+# Copy build files in a cache-friendly order
 COPY Makefile .
+COPY deps/picohttpparser ./deps/picohttpparser
+COPY src ./src
 COPY entrypoint.sh .
 RUN chmod +x entrypoint.sh
+
 RUN make clean && make
 
 #####################################################################
@@ -40,7 +53,7 @@ ARG DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update -qq && \
     apt-get install -y --no-install-recommends \
-        dmsetup util-linux zlib1g libhttp-parser2.9 && \
+        dmsetup util-linux zlib1g liburing2 && \
     rm -rf /var/lib/apt/lists/*
 
 # copy our glibc-compatible libuv
@@ -49,10 +62,10 @@ RUN ldconfig                                  # refresh linker cache
 
 # copy binary + entrypoint
 WORKDIR /app
-COPY --from=build /app/ramforge      ./ramforge
+COPY --from=build /app/ayder      ./ayder
 COPY --from=build /app/entrypoint.sh ./entrypoint.sh
 RUN chmod +x ./entrypoint.sh
 
 EXPOSE 1109
 ENTRYPOINT ["./entrypoint.sh"]
-CMD ["./ramforge"]
+CMD ["./ayder"]

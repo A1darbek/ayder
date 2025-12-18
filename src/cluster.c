@@ -1,5 +1,6 @@
 // cluster.c – FIXED forks, monitors and (optionally) restarts worker processes
 #define _GNU_SOURCE
+#include <uv.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -12,12 +13,13 @@
 #include "cluster.h"
 #include "slab_alloc.h"
 #include "storage.h"
-#include "persistence.h"
 #include "app.h"
 #include "app_routes.h"
-#include "zero_pause_rdb.h"
 #include "metrics_shared.h"
 #include "globals.h"
+#include "persistence_zp.h"
+#include "rf_broker.h"
+#include "ramforge_ha_integration.h"
 
 /* configuration exported by main.c */
 extern unsigned g_aof_flush_ms;
@@ -28,16 +30,16 @@ extern void RAMForge_configure_rotation_policy(size_t max_rdb_mb, time_t max_age
 extern RAMForgeMetrics *g_metrics_ptr;   /* declared, not defined */
 void init_shared_metrics(void);          /* just the prototype */
 
-/* parent-only state */
+static pid_t manager_pid = -1;  /* parent-only state */
 static volatile int  cluster_shutdown = 0;
 static pid_t        *worker_pids      = NULL;
 static int           worker_count     = 0;
 static int           single_process_mode = 0;
 
+static volatile sig_atomic_t shut_once = 0;
 
 /* ────────── CLI / ENV helpers ────────── */
- int detect_worker_target(int argc, char **argv)
-{
+int detect_worker_target(int argc, char **argv) {
     for (int i = 1; i < argc; i++)
         if (!strcmp(argv[i],"--workers") && i+1<argc)
             return atoi(argv[i+1]);
@@ -49,11 +51,25 @@ static int           single_process_mode = 0;
     return cores < 1 ? 1 : cores;
 }
 
+static void ignore_sigpipe(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = SIG_IGN;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGPIPE, &sa, NULL);
+}
+
 /* ────────── parent signal handler ────────── */
-static void cluster_signal_handler(int sig)
-{
+static void cluster_signal_handler(int sig) {
+    /* Guard: only the cluster manager should run this */
+    if (getpid() != manager_pid) return;
+
+    /* Prevent re-entrancy */
+    if (shut_once) return;
+    shut_once = 1;
     printf("🛑 Cluster manager caught signal %d – shutting down workers …\n", sig);
     cluster_shutdown = 1;
+    if (!worker_pids || worker_count <= 0) return;
     for (int i=0;i<worker_count;i++)
         if (worker_pids[i] > 0) {
             printf("📤 SIGTERM → worker %d (PID %d)\n", i, worker_pids[i]);
@@ -62,23 +78,40 @@ static void cluster_signal_handler(int sig)
 }
 
 /* ────────── Single process signal handler ────────── */
-static void single_process_signal_handler(int sig)
-{
+static void single_process_signal_handler(int sig) {
     printf("🛑 Single process mode caught signal %d – shutting down gracefully …\n", sig);
     cluster_shutdown = 1;
 }
 
 /* ────────── CPU pin helper (worker) ────────── */
-static void setup_cpu_affinity(int wid)
-{
-    if (single_process_mode) return; // Skip CPU pinning in single process mode
+static void setup_cpu_affinity(int wid) {
+    if (single_process_mode) return;
 
-    cpu_set_t set; CPU_ZERO(&set); CPU_SET(wid, &set);
-    if (sched_setaffinity(0,sizeof set,&set))
+    int ncpu = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpu <= 0) return;
+
+    int ded_wid = -1;
+    const char *ded = getenv("RF_HA_DEDICATED_WORKER");
+    if (ded && *ded) ded_wid = atoi(ded);
+
+    int cpu = 0;
+
+    if (ncpu == 1) {
+        cpu = 0;
+    } else if (wid == ded_wid) {
+        cpu = 0; // HA/OS core
+    } else {
+        // pack data workers onto 1..ncpu-1
+        int slot = wid;
+        if (ded_wid >= 0 && wid > ded_wid) slot--;   // close the “gap” after removing dedicated worker
+        cpu = 1 + (slot % (ncpu - 1));
+    }
+
+    cpu_set_t set; CPU_ZERO(&set); CPU_SET(cpu, &set);
+    if (sched_setaffinity(0, sizeof set, &set))
         perror("sched_setaffinity");
-    else
-        printf("⚙ Worker %d pinned to CPU core %d\n", wid, wid);
 }
+
 
 /* ────────── worker bootstrap ────────── */
 static App* init_worker_systems(int wid) {
@@ -99,42 +132,36 @@ static App* init_worker_systems(int wid) {
             printf("✓ Shared storage attached (1M entries available)\n");
         }
     }
-    /* 3. ROTATION / METRICS ENGINE – do this **once** ---------- */
-    if (wid == 0) {                       // make sure we call it only once
-        /* strip the “.rdb” extension – the API expects just the basename */
-        RAMForge_rotation_init("./dump", "./append.aof");
-        /* optional: customise policy for prod */
-        RAMForge_configure_rotation_policy(
-                512 /* MB */,     /* max RDB size  */
-                24  /* hours */,  /* max age       */
-                10  /* keep N files */,
-                0   /* chaos OFF in prod       */
-        );
-
-        /* 🆕  zero-pause RDB */
-        ZeroPauseRDB_init("./zp_dump.rdb",
-                          &storage,          /* LOCAL storage ref */
-                          200000,            /* max keys */
-                          10);               /* snapshot interval seconds */
-    }
-
     const char *aof  = "./append.aof";
-    const char *dump = "./dump.rdb";
 
     if (single_process_mode) {
         printf("Single process mode using AOF: %s\n", aof);
-    } else if (wid == 0) {
-        printf("Using shared AOF: %s (all workers)\n", aof);
     }
 
+    rf_broker_init(/*ring_per_partition*/ 0, /*default_partitions*/ 8);
     // Initialize persistence based on AOF mode
     int aof_enabled = (g_aof_mode > 0) ? 1 : 0;
     if (aof_enabled) {
+
+        /* Enhanced AOF flush settings for io_uring */
+        unsigned enhanced_flush_ms = g_aof_flush_ms;
+
+        /* Optimize flush interval for io_uring batching */
+        if (enhanced_flush_ms > 0 && enhanced_flush_ms < 5) {
+            enhanced_flush_ms = 5; /* Minimum 5ms for effective batching */
+        }
+
         // IMPORTANT: Pass LOCAL storage to persistence (for AOF recovery)
         // but your HTTP handlers will use shared storage for live data
-        Persistence_init(dump, aof, &storage, 60, g_aof_flush_ms);
+        Persistence_zp_init( aof, &storage, enhanced_flush_ms);
+
+        /* start in-memory cross-worker promoter */
+        rf_bus_start_promoter();
         if (single_process_mode || wid == 0) {
-            printf("✓ AOF persistence enabled (flush_ms=%u)\n", g_aof_flush_ms);
+            printf("✓ AOF persistence enabled (flush_ms=%u)\n", enhanced_flush_ms);
+            printf("   Ring capacity: 128K entries\n");
+            printf("   Buffer pool: 2048 aligned buffers\n");
+            printf("   Batch size: 256 operations\n");
         }
     } else {
         if (single_process_mode || wid == 0) {
@@ -149,26 +176,17 @@ static App* init_worker_systems(int wid) {
         return NULL;
     }
 
-    register_application_routes(app);
+    register_application_routes(app, wid == 0 /*control-plane?*/);
 
-    if (single_process_mode) {
-        printf("✓ Routes registered (single process mode)\n");
-    } else {
-        printf("✓ Routes registered (worker %d)\n", wid);
-    }
 
     return app;
 }
 
-static void run_worker(int wid, int port)
-{
-    if (single_process_mode) {
-        printf("🏃 Single process mode starting on port %d\n", port);
-    } else {
-        printf("🏃 Worker %d starting on port %d\n", wid, port);
-    }
+static void run_worker(int wid, int port) {
+    ignore_sigpipe();
 
     setup_cpu_affinity(wid);
+    { char buf[16]; snprintf(buf, sizeof buf, "%d", wid); setenv("RF_WORKER_ID", buf, 1); }
 
     App *app = init_worker_systems(wid);
     if (!app) exit(1);
@@ -180,30 +198,53 @@ static void run_worker(int wid, int port)
         sigaction(SIGINT, &sa, NULL);
         sigaction(SIGTERM, &sa, NULL);
     } else {
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = 0;
         sa.sa_handler = SIG_DFL;
         sigaction(SIGTERM, &sa, NULL);
+        sigaction(SIGINT, &sa, NULL);
+        sigaction(SIGHUP, &sa, NULL);
     }
 
-    if (single_process_mode) {
-        printf("🚀 Single process ready – starting HTTP server …\n");
+    /* Initialize HA in ALL workers:
+    - worker 0: full HA (raft + net + thread)
+    - workers >0: agent-only (read HA state from shmem; forward writes)
+     */
+    int ha_dedicated = 0;
+    const char *ded = getenv("RF_HA_DEDICATED_WORKER");
+    if (ded && *ded) ha_dedicated = (atoi(ded) == wid);
+
+    const char *ha_en = getenv("RF_HA_ENABLED");
+    if (ha_en && ha_en[0] == '1') {
+        if (wid > 0) setenv("RF_HA_AGENT_ONLY", "1", 1);
+        printf("🔧 Worker %d initializing HA (%s)...\n", wid, (wid == 0 ? "leader-runtime" : "agent-only"));
+        if (RAMForge_HA_init() != 0) {
+            fprintf(stderr, "⚠️  Worker %d HA init failed - continuing without HA\n", wid);
+        }
+    }
+
+    if (!ha_dedicated) {
+        app->start(app, port);   // participates in SO_REUSEPORT
     } else {
-        printf("🚀 Worker %d ready – starting HTTP server …\n", wid);
+        fprintf(stderr, "🧠 Worker %d is HA-dedicated: not listening on data port %d\n", wid, port);
+        for (;;) pause();        // keep process alive; HA threads keep running
     }
-
-    app->start(app, port);                /* blocks until exit */
 
     /* graceful path (rare) */
     if (app->shutdown) app->shutdown();
 
+    /* stop rocket follower; join to flush cleanly */
+
     // Clean up slab allocator
+    rf_broker_shutdown();
     slab_destroy();
+    RAMForge_HA_shutdown();
 
     exit(0);
 }
 
 /* ────────── parent wait-helper ────────── */
-static void wait_for_workers(void)
-{
+static void wait_for_workers(void) {
     int left = worker_count;
     while (left > 0) {
         int st; pid_t pid = wait(&st);
@@ -221,15 +262,26 @@ static void wait_for_workers(void)
 
 /* ────────── PUBLIC API ────────── */
 
-int start_cluster_with_args(int port, int argc, char **argv)
-{
+int start_cluster_with_args(int port, int argc, char **argv) {
+    ignore_sigpipe();
     worker_count = detect_worker_target(argc, argv);
+
+    /* shared promotion bus (64MB heap, 8192 descriptors) */
+    size_t bus_heap = 512ULL * 1024ULL * 1024ULL;   // 512MB default
+    size_t bus_desc = 1ULL << 20;                   // 1,048,576 default
+
+    const char *e;
+    if ((e = getenv("RF_BUS_HEAP_MB")) && *e) bus_heap = (size_t)strtoull(e, NULL, 10) * 1024ULL * 1024ULL;
+    if ((e = getenv("RF_BUS_DESC")) && *e)    bus_desc = (size_t)strtoull(e, NULL, 10);
+
+    rf_bus_init_pre_fork(bus_heap, bus_desc);
 
     /* FIXED - if caller requests 0 workers, run a single worker in-process */
     if (worker_count == 0) {
         printf("🚀 Single-process mode (no cluster manager)\n");
         single_process_mode = 1;
-        run_worker(0, port);          /* run_worker never returns */
+        run_worker(0, port);
+        /* run_worker never returns */
         return 0;                     /* not reached, but keeps compiler happy */
     }
 
@@ -240,8 +292,10 @@ int start_cluster_with_args(int port, int argc, char **argv)
         return -1;
     }
 
-    printf("🚀 Starting RamForge cluster with %d worker%s on port %d\n",
+    printf("🚀 Starting Ayder with %d worker%s on port %d\n",
            worker_count, worker_count==1?"":"s", port);
+
+    manager_pid = getpid();
 
     struct sigaction sa={0}; sa.sa_handler=cluster_signal_handler;
     sigaction(SIGINT,&sa,NULL); sigaction(SIGTERM,&sa,NULL);
@@ -259,19 +313,21 @@ int start_cluster_with_args(int port, int argc, char **argv)
             return -1;
         }
         if(pid==0) {
+            ignore_sigpipe();
             // Child process
             free(worker_pids); // Child doesn't need this
+            worker_pids  = NULL;
+            worker_count = 0;
             run_worker(i,port);
         }
         worker_pids[i]=pid;
-        printf("✓ Worker %d started (PID %d)\n",i,pid);
 
         // Small delay between forks to avoid thundering herd
         usleep(10000); // 10ms
     }
 
-    printf("\n🌟 All workers live – monitoring … (Ctrl-C to stop)\n\n");
 
+    printf("\n🌟 All workers live – monitoring … (Ctrl-C to stop)\n\n");
     /* monitor loop */
     while(!cluster_shutdown){
         int st; pid_t dead=waitpid(-1,&st,WNOHANG);

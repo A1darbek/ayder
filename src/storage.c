@@ -1,9 +1,10 @@
 // storage.c
 #include "storage.h"
-#include "zero_pause_rdb.h"
+#include "storage_thread_safeguard.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdatomic.h>
 
 /// Simple 32-bit integer mix for hashing
 static inline uint32_t mix32(uint32_t x) {
@@ -29,6 +30,7 @@ void storage_init(Storage *st) {
 /// Free all data blocks and arrays.
 void storage_destroy(Storage *st) {
     if (st == NULL) return;
+    atomic_thread_fence(memory_order_seq_cst);   /* let writer threads finish */
 
     // Free all occupied buckets
     for (size_t i = 0; i < st->capacity; i++) {
@@ -118,19 +120,11 @@ void storage_save(Storage *st, int id, const void *data, size_t size) {
             st->val_sizes[idx] = new_sz;
             st->size++;
 
-            /* Tell zero-pause we created/over-wrote this key.
-               old_data == NULL because it didn’t exist before.          */
-            ZeroPauseRDB_mark_dirty(new_key, NULL, 0);
             return;
         }
 
         // Check if this is the same key (update case)
         if (st->keys[idx] == new_key) {
-            /* pre-image goes to zero-pause before we overwrite */
-            ZeroPauseRDB_mark_dirty(new_key,
-                                    st->values[idx],
-                                    st->val_sizes[idx]);
-
             free(st->values[idx]);
             st->values[idx] = new_val;
             st->val_sizes[idx] = new_sz;
@@ -184,35 +178,6 @@ int storage_get(Storage *st, int id, void *out, size_t out_sz) {
     }
     return 0;
 }
-
-/// Remove entry and mark deleted.
-void storage_remove(Storage *st, int id) {
-    if (st == NULL) return;
-
-    uint32_t hash = mix32((uint32_t)id);
-    size_t  mask = st->capacity - 1;
-    size_t  idx  = hash & mask;
-
-    for (size_t dist = 0; dist < st->capacity; dist++) {
-        if (st->flags[idx] == BUCKET_EMPTY) {
-            return;  // not found
-        }
-        if (st->flags[idx] == BUCKET_OCCUPIED && st->keys[idx] == id) {
-            /* hand old value to zero-pause BEFORE freeing               */
-            ZeroPauseRDB_mark_dirty(id,
-                                    st->values[idx],
-                                    st->val_sizes[idx]);
-
-            free(st->values[idx]);
-            st->values[idx] = NULL;
-            st->flags[idx] = BUCKET_DELETED;
-            st->size--;
-            return;
-        }
-        idx = (idx + 1) & mask;
-    }
-}
-
 void storage_iterate(Storage *st, void (*fn)(int, const void *, size_t, void *), void *udata) {
     if (st == NULL || fn == NULL) return;
 

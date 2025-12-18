@@ -22,4 +22,9 @@ int route_request(const char* method,
                    const char* body,
                    char* response_buffer);
 
+int route_request_len(const char *method,
+                      const char *path,
+                      const char *body, size_t body_len,
+                      char *response_buffer);
+
 #endif // ROUTER_H

@@ -7,6 +7,7 @@
 #include "slab_alloc.h"
 #include "ramforge_rotation_metrics.h"
 #include "log.h"
+#include "globals.h"
 #include <uv.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,6 +17,7 @@
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <inttypes.h>  // Added for PRIu64
+#include <libgen.h>
 
 
 // Bitmap for tracking dirty pages during snapshot
@@ -166,6 +168,22 @@ static void inject_chaos_latency(void) {
     }
 }
 
+static SnapshotEntry* snapshot_table_lookup(SnapshotTable *st, int key_id, uint64_t min_gen) {
+    if (!st || !st->buckets) return NULL;
+
+    size_t bucket = ((unsigned) key_id) % st->bucket_count;
+    SnapshotEntry *entry = st->buckets[bucket];
+
+    // Linear search in bucket (typically 1-3 entries due to good hash distribution)
+    while (entry) {
+        if (entry->key_id == key_id && entry->generation >= min_gen) {
+            return entry;
+        }
+        entry = entry->next;
+    }
+    return NULL;
+}
+
 static void snapshot_writer_iter_cb(int id, const void *data, size_t size, void *ud) {
     SnapshotContext *ctx = (SnapshotContext *) ud;
 
@@ -173,37 +191,76 @@ static void snapshot_writer_iter_cb(int id, const void *data, size_t size, void 
 
     // Check if this key was modified during snapshot
     if (bitmap_test_and_clear(&g_dirty_bitmap, id)) {
-        // Key was modified, use the COW copy from snapshot table
-        // (Implementation would look up in snapshot table)
-        return;
+        // Key was modified during snapshot - look for COW copy
+        SnapshotEntry *cow_entry = snapshot_table_lookup(&g_snapshot_table,
+                                                         id, ctx->snapshot_gen);
+
+        if (cow_entry && cow_entry->data_copy && cow_entry->data_size > 0) {
+            // Write COW data to RDB file
+            fwrite(&id, sizeof(id), 1, ctx->rdb_file);
+            fwrite(&cow_entry->data_size, sizeof(cow_entry->data_size), 1, ctx->rdb_file);
+            fwrite(cow_entry->data_copy, cow_entry->data_size, 1, ctx->rdb_file);
+
+            // Update CRC with COW data
+            ctx->crc = crc32c(ctx->crc, &id, sizeof(id));
+            ctx->crc = crc32c(ctx->crc, &cow_entry->data_size, sizeof(cow_entry->data_size));
+            ctx->crc = crc32c(ctx->crc, cow_entry->data_copy, cow_entry->data_size);
+
+            ctx->entries_written++;
+            return;
+        } else {
+            // COW entry missing/invalid - write current data with debug info
+            LOGD("COW fallback for key %d (gen %" PRIu64 "), using current data\n",
+                 id, ctx->snapshot_gen);
+            // Fall through to write_current_data
+        }
     }
 
-    // Write to RDB file
-    fwrite(&id, sizeof(id), 1, ctx->rdb_file);
-    fwrite(&size, sizeof(size), 1, ctx->rdb_file);
-    fwrite(data, size, 1, ctx->rdb_file);
+    write_current_data:
+    // Write current data to RDB file (key wasn't modified or COW fallback)
+    if (data && size > 0) {
+        fwrite(&id, sizeof(id), 1, ctx->rdb_file);
+        fwrite(&size, sizeof(size), 1, ctx->rdb_file);
+        fwrite(data, size, 1, ctx->rdb_file);
 
-    // Update CRC
-    ctx->crc = crc32c(ctx->crc, &id, sizeof(id));
-    ctx->crc = crc32c(ctx->crc, &size, sizeof(size));
-    ctx->crc = crc32c(ctx->crc, data, size);
+        // Update CRC
+        ctx->crc = crc32c(ctx->crc, &id, sizeof(id));
+        ctx->crc = crc32c(ctx->crc, &size, sizeof(size));
+        ctx->crc = crc32c(ctx->crc, data, size);
 
-    ctx->entries_written++;
+        ctx->entries_written++;
+    }
+}
+
+static void cleanup_snapshot_table(SnapshotTable *st, uint64_t completed_gen) {
+    if (!st || !st->buckets) return;
+
+    for (size_t i = 0; i < st->bucket_count; i++) {
+        SnapshotEntry **prev = &st->buckets[i];
+        SnapshotEntry *curr = st->buckets[i];
+
+        while (curr) {
+            if (curr->generation <= completed_gen) {
+                // Remove and free this entry
+                *prev = curr->next;
+                slab_free(curr->data_copy);
+                slab_free(curr);
+                atomic_fetch_sub(&st->entry_count, 1);
+                curr = *prev;
+            } else {
+                prev = &curr->next;
+                curr = curr->next;
+            }
+        }
+    }
 }
 
 static void snapshot_writer_thread(void *arg) {
-    /* ------------------------------------------------------------------
-     * Flush bitmap: keys that were dirty *before* the snapshot should be
-     * captured, so we clear all bits right now.  Any write that happens
-     * during the snapshot will set the bit again and be handled via COW.
-     * ------------------------------------------------------------------ */
-    for (size_t i = 0; i < g_dirty_bitmap.num_words; ++i)
-        __atomic_store_n(&g_dirty_bitmap.words[i], 0, __ATOMIC_RELAXED);
     SnapshotContext *ctx = (SnapshotContext *) arg;
-    uint64_t t0 = now_us();              /* <-- start timer */
+    uint64_t t0 = now_us();
 
     LOGD("Starting zero-pause RDB snapshot generation %" PRIu64 "\n",
-           ctx->snapshot_gen);
+         ctx->snapshot_gen);
 
     char tmp_path[512];
     snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%" PRIu64,
@@ -220,16 +277,28 @@ static void snapshot_writer_thread(void *arg) {
     ctx->entries_written = 0;
 
     // Write RDB header
-    uint64_t magic = 0x52414D460001ULL; // 'RAMF'0001 in hex, safe and readable
+    uint64_t magic = 0x52414D460001ULL;
     fwrite(&magic, sizeof(magic), 1, ctx->rdb_file);
     fwrite(&ctx->snapshot_gen, sizeof(ctx->snapshot_gen), 1, ctx->rdb_file);
 
-    // Iterate through storage and write entries
-    storage_iterate(ctx->storage, snapshot_writer_iter_cb, ctx);
+    // ⚡ MOVE THE BITMAP FLUSH HERE - right before iteration
+    // This ensures we capture the dirty state at snapshot start time
+    memset((void*)g_dirty_bitmap.words, 0,
+           g_dirty_bitmap.num_words * sizeof(uint64_t));
 
-    // Write CRC footer
-    uint64_t crc64 = ctx->crc;
-    fwrite(&crc64, sizeof crc64, 1, ctx->rdb_file);
+    if (g_shared_storage)
+        shared_storage_iterate(g_shared_storage,
+                               snapshot_writer_iter_cb, ctx);
+    else
+        storage_iterate(ctx->storage,
+                        snapshot_writer_iter_cb, ctx);
+
+    // Flush and purge COW entries after snapshot iteration completes
+    cleanup_snapshot_table(&g_snapshot_table, ctx->snapshot_gen);
+
+    // Write CRC32C footer (fixed to match algorithm)
+    uint32_t final_crc = ctx->crc;
+    fwrite(&final_crc, sizeof(final_crc), 1, ctx->rdb_file);
 
     // Atomic file replacement
     fflush(ctx->rdb_file);
@@ -238,12 +307,24 @@ static void snapshot_writer_thread(void *arg) {
 
     rename(tmp_path, g_rdb_path);
 
-    uint64_t dur = now_us() - t0;
-    ZeroPauseRDB_metrics_inc(dur);       /* <-- bump counter + latency */
+    /* fsync the parent directory to persist the rename */
+    {
+        char dirbuf[512];
+        strncpy(dirbuf, g_rdb_path, sizeof(dirbuf) - 1);
+        dirbuf[sizeof(dirbuf) - 1] = '\0';
+        char *dir = dirname(dirbuf);
+        int dfd = open(dir ? dir : ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (dfd >= 0) {
+            fsync(dfd);
+            close(dfd);
+        }
+    }
 
+    uint64_t dur = now_us() - t0;
+    ZeroPauseRDB_metrics_inc(dur);
 
     LOGD("Completed zero-pause snapshot: %" PRIu64 " entries, CRC: %08x\n",
-           (uint64_t) ctx->entries_written, ctx->crc);
+         (uint64_t) ctx->entries_written, ctx->crc);
 
     atomic_store(&ctx->active, 0);
 }
@@ -294,15 +375,21 @@ void ZeroPauseRDB_mark_dirty(int key_id, const void *old_data, size_t old_size) 
 }
 
 // Trigger zero-pause snapshot
-void ZeroPauseRDB_snapshot(void) {
-    if (atomic_load(&g_snapshot_ctx.active)) {
-        printf("Snapshot already in progress, skipping\n");
-        return;
-    }
+uint64_t ZeroPauseRDB_snapshot(void) {
+    if (atomic_load(&g_snapshot_ctx.active))
+        return g_snapshot_ctx.snapshot_gen;      /* already running */
 
-    // Mark snapshot as active
+    /* ----------------------------------------------------------------
+* 1. Bump the global generation **before** anyone takes the bitmap
+*    snapshot.  The returned value is what we write into the file
+*    header and what restores will later report.
+* ---------------------------------------------------------------- */
+    uint64_t new_gen = __atomic_add_fetch(&g_dirty_bitmap.generation,
+                                          +1, __ATOMIC_RELAXED);
+
+    /* 2. Mark snapshot active and remember that generation locally     */
     atomic_store(&g_snapshot_ctx.active, 1);
-    g_snapshot_ctx.snapshot_gen = atomic_load(&g_dirty_bitmap.generation);
+    g_snapshot_ctx.snapshot_gen = new_gen;
 
     // Start background writer thread
     uv_thread_create(&g_snapshot_ctx.writer_thread,
@@ -310,7 +397,19 @@ void ZeroPauseRDB_snapshot(void) {
 
     LOGD("Zero-pause snapshot triggered (generation %" PRIu64 ")\n",
            g_snapshot_ctx.snapshot_gen);
+    return g_snapshot_ctx.snapshot_gen;      /* <-- new */
+
 }
+
+int ZeroPauseRDB_snapshot_status(uint64_t *gen, int *active)
+{
+    if (!gen || !active) return -1;
+    *gen    = g_snapshot_ctx.snapshot_gen;
+    *active = atomic_load(&g_snapshot_ctx.active);
+    return 0;
+}
+
+
 
 // Chaos testing: inject random latency spikes
 void ZeroPauseRDB_chaos_test(int enable) {

@@ -15,6 +15,4 @@ void init_shared_metrics(void) {
         fprintf(stderr, "❌ Failed to initialize shared metrics for test\n");
         exit(1);
     }
-
-    printf("✅ Test metrics initialized at %p\n", (void*)g_metrics_ptr);
 }

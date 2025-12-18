@@ -6,3 +6,7 @@ scrape_configs:
     metrics_path: /metrics
     static_configs:
       - targets: ['ramforge:1109']
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+

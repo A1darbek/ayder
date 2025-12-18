@@ -1,0 +1,50 @@
+groups:
+  - name: ramforge_critical
+    interval: 30s
+    rules:
+      - alert: HighErrorRate
+        expr: rate(http_responses_total{class="5xx"}[5m]) / rate(http_responses_total[5m]) > 0.01
+        for: 5m
+        labels: { severity: warning }
+        annotations: { summary: "5xx error rate > 1%" }
+
+      - alert: RateLimitSpike
+        expr: increase(http_responses_total{class="429"}[1m]) > 100
+        for: 2m
+        labels: { severity: warning }
+        annotations: { summary: "Client hitting rate limits" }
+
+      - alert: DiskSpaceCritical
+        expr: ramforge_fs_usage_ratio{fs="aof"} > 0.80
+        for: 5m
+        labels: { severity: critical }
+        annotations: { summary: "Disk usage > 80%" }
+
+      - alert: InodeExhaustion
+        expr: ramforge_fs_inodes_usage_ratio > 0.90
+        for: 5m
+        labels: { severity: critical }
+        annotations: { summary: "Inode usage > 90%" }
+
+      - alert: ChecksumFailure
+        expr: increase(ramforge_aof_checksum_failures_total[5m]) > 0
+        labels: { severity: critical }
+        annotations: { summary: "AOF checksum failure - PAGE ON-CALL" }
+
+      - alert: SlowFsync
+        expr: histogram_quantile(0.99, rate(ramforge_fsync_duration_seconds_bucket[5m])) > 0.100
+        for: 10m
+        labels: { severity: warning }
+        annotations: { summary: "P99 fsync > 100ms" }
+
+      - alert: HighQueueDepth
+        expr: ramforge_aof_sealed_queue_depth > 1000
+        for: 5m
+        labels: { severity: warning }
+        annotations: { summary: "Sealed queue backing up" }
+
+      - alert: ConsumerLagging
+        expr: ramforge_consumer_lag_messages > 10000
+        for: 5m
+        labels: { severity: warning }
+        annotations: { summary: "Consumer falling behind" }

@@ -42,18 +42,11 @@ void* object_pool_get(object_pool_t* pool) {
 }
 
 void object_pool_release(object_pool_t* pool, void* item) {
-    if (pool->count >= pool->capacity) {
-        int new_capacity = pool->capacity * 2;
-        void** new_items = realloc(pool->items, sizeof(void*) * new_capacity);
-        if (!new_items) {
-            if (pool->dtor)
-                pool->dtor(item);
-            else
-                free(item);
-            return;
-        }
-        pool->items = new_items;
-        pool->capacity = new_capacity;
+    if (pool->count < pool->capacity) {
+        pool->items[pool->count++] = item;   /* fast path */
+        return;
     }
-    pool->items[pool->count++] = item;
+
+    /* pool full → just destroy the object, keep latency predictable */
+    if (pool->dtor) pool->dtor(item); else free(item);
 }

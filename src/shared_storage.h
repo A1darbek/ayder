@@ -14,6 +14,11 @@
 #define CACHE_LINE_SIZE 64
 #define MAX_DATA_SIZE 256
 
+#ifndef RF_SHM_DEFAULT
+#define RF_SHM_DEFAULT "/ramforge_shared"
+#endif
+
+
 // Align structures to cache lines to prevent false sharing
 typedef struct __attribute__((aligned(CACHE_LINE_SIZE))) {
     atomic_int key;
@@ -44,11 +49,22 @@ typedef struct {
 
 // Function declarations
 SharedStorage* shared_storage_init(void);
+uint64_t shared_storage_atomic_inc_u64(SharedStorage *ss, int key);
+uint64_t shared_storage_atomic_add_u64(SharedStorage *ss, int key, uint64_t delta);
 SharedStorage* shared_storage_attach(void);
+SharedStorage *shared_storage_init_named(const char *name);     // create or fail if exists
+SharedStorage *shared_storage_attach_named(const char *name);   // attach to existing
 int shared_storage_set(SharedStorage *ss, int key, const void *data, size_t size);
 int shared_storage_get(SharedStorage *ss, int key, void *out, size_t out_size);
 int shared_storage_get_fast(SharedStorage *ss, int key, void *out, size_t out_size);
 void shared_storage_destroy(SharedStorage *ss);
 void shared_storage_stats(SharedStorage *ss);
+/* New – iterate over every occupied slot (no order guaranteed) */
+void shared_storage_iterate(SharedStorage *ss,
+                            void (*cb)(int, const void *, size_t, void *),
+                            void *udata);
+
+// PUBLIC API
+
 
 #endif
