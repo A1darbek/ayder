@@ -68,9 +68,9 @@ All writes are durable and replicated to 2/3 nodes before acknowledgment.
 
 ```bash
 # Clone and run with Docker Compose (includes Prometheus + Grafana)
-git clone https://github.com/yourusername/ayder.git
+git clone https://github.com/A1darbek/ayder.git
 cd ayder
-docker compose up -d
+docker compose up -d --build
 
 # Or build and run standalone
 docker build -t ayder .
@@ -592,5 +592,6 @@ Errors follow a consistent format:
 ---
 
 ## License
+
 
 [Your license here]
