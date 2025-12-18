@@ -464,10 +464,10 @@ curl 'localhost:8001/broker/consume/test/g1/0?offset=0&limit=10' \
 
 ```bash
 # Default port is 1109
-./ayder --port 1109 --workers 12
+./ayder --port 1109
 
 # Or specify custom port
-./ayder --port 7001 --workers 12
+./ayder --port 7001
 ```
 
 ### HA Cluster (3/5/7 nodes)
@@ -505,7 +505,7 @@ export RF_HA_TLS=1
 export RF_HA_TLS_CA=./certs/ca.crt
 export RF_HA_TLS_CERT=./certs/node1.crt
 export RF_HA_TLS_KEY=./certs/node1.key
-./ayder --port 7001 --workers 12
+./ayder --port 7001
 
 # Node 2
 export RF_HA_ENABLED=1
@@ -518,7 +518,7 @@ export RF_HA_TLS=1
 export RF_HA_TLS_CA=./certs/ca.crt
 export RF_HA_TLS_CERT=./certs/node2.crt
 export RF_HA_TLS_KEY=./certs/node2.key
-./ayder --port 8001 --workers 12
+./ayder --port 8001
 
 # Node 3 (same pattern, port 9001)
 ```
@@ -595,4 +595,5 @@ Errors follow a consistent format:
 
 
 [Your license here]
+
 
