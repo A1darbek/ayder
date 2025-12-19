@@ -593,7 +593,7 @@ Errors follow a consistent format:
 
 ## License
 
+Apache 2.0 license 
 
-[Your license here]
 
 
