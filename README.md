@@ -25,6 +25,7 @@ curl 'localhost:1109/broker/consume/orders/mygroup/0?encoding=b64' \
 | **Durability** | ✅ Replicated log | ⚠️ Async replication, no quorum | ✅ Raft consensus (sync-majority) |
 | **Operations** | ZooKeeper/KRaft + JVM tuning | Single node or Redis Cluster | Single binary, zero dependencies |
 | **Latency (replicated)** | 10-50ms P99 | N/A (async only) | 3.3ms P99 |
+| **Recovery time** | 2+ hours (unclean shutdown) | Minutes | **40-50 seconds** |
 | **First message** | ~30 min setup | ~5 min setup | ~60 seconds |
 
 **Kafka** is battle-tested but operationally heavy. JVM tuning, partition rebalancing, and config sprawl add up.
@@ -48,7 +49,9 @@ curl 'localhost:1109/broker/consume/orders/mygroup/0?encoding=b64' \
 
 ## Performance
 
-Benchmarked on DigitalOcean (8 vCPU AMD, 3-node Raft cluster, sync-majority writes):
+Benchmarked with **wrk2** (coordinated omission corrected) on real network — not loopback.
+
+Setup: DigitalOcean 8 vCPU AMD, 3-node Raft cluster, sync-majority writes, 64B payload:
 
 | Metric | Value |
 |--------|-------|
@@ -59,6 +62,42 @@ Benchmarked on DigitalOcean (8 vCPU AMD, 3-node Raft cluster, sync-majority writ
 | Server-side P99.999 | 1.2 ms |
 
 All writes are durable and replicated to 2/3 nodes before acknowledgment.
+
+**Server-side timing breakdown at P99.999:**
+```
+Handler time:    1.2ms
+Queue wait:      0.5ms
+HTTP parse:      0.4ms
+```
+
+Client sees 180ms tail at P99.999, but the broker itself stays under 2ms. The gap is network/kernel scheduling — HTTP is not the bottleneck.
+
+---
+
+## Recovery Time
+
+Kafka in 2025 is like starting a car with a hand crank. It works, but why are we still doing this?
+
+| Scenario | Kafka | Ayder |
+|----------|-------|-------|
+| **Cluster restart (unclean)** | 2+ hours (reported in production) | **40-50 seconds** |
+| **Broker sync after failure** | 181 minutes for 1TB data | Auto catch-up in seconds |
+| **50+ broker rolling restart** | 2+ hours (2 min per broker) | N/A — single binary |
+
+**Tested crash recovery:**
+
+```bash
+# 3-node cluster with 8 million offsets
+1. SIGKILL a follower mid-write
+2. Leader continues, follower misses offsets
+3. Restart follower
+4. Follower replays local AOF → asks leader for missing offsets
+5. Leader streams missing data → follower catches up
+6. Cluster fully healthy in 40-50 seconds
+7. Zero data loss
+```
+
+No manual intervention. No partition reassignment. No ISR drama.
 
 ---
 
@@ -92,7 +131,7 @@ curl -X POST 'localhost:1109/broker/topics/events/produce' \
 ```bash
 # Dependencies: libuv 1.51+, openssl, zlib, liburing
 make clean && make
-./ayder --port 1109
+./ayder --port 1109 --workers 12
 ```
 
 ### Docker Compose Stack
@@ -464,10 +503,10 @@ curl 'localhost:8001/broker/consume/test/g1/0?offset=0&limit=10' \
 
 ```bash
 # Default port is 1109
-./ayder --port 1109
+./ayder --port 1109 --workers 12
 
 # Or specify custom port
-./ayder --port 7001
+./ayder --port 7001 --workers 12
 ```
 
 ### HA Cluster (3/5/7 nodes)
@@ -505,7 +544,7 @@ export RF_HA_TLS=1
 export RF_HA_TLS_CA=./certs/ca.crt
 export RF_HA_TLS_CERT=./certs/node1.crt
 export RF_HA_TLS_KEY=./certs/node1.key
-./ayder --port 7001
+./ayder --port 7001 --workers 12
 
 # Node 2
 export RF_HA_ENABLED=1
@@ -518,7 +557,7 @@ export RF_HA_TLS=1
 export RF_HA_TLS_CA=./certs/ca.crt
 export RF_HA_TLS_CERT=./certs/node2.crt
 export RF_HA_TLS_KEY=./certs/node2.key
-./ayder --port 8001
+./ayder --port 8001 --workers 12
 
 # Node 3 (same pattern, port 9001)
 ```
@@ -593,7 +632,4 @@ Errors follow a consistent format:
 
 ## License
 
-Apache 2.0 license 
-
-
-
+MIT
