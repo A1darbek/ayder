@@ -405,7 +405,7 @@ Response:
 
 ---
 
-## Streaming Queries (Experimental)
+## Streaming Queries
 
 ### Query
 
@@ -633,4 +633,5 @@ Errors follow a consistent format:
 ## License
 
 MIT
+
 
