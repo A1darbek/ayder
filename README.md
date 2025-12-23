@@ -24,7 +24,7 @@ curl 'localhost:1109/broker/consume/orders/mygroup/0?encoding=b64' \
 | **Protocol** | Binary (requires thick client) | RESP | HTTP (curl works) |
 | **Durability** | ✅ Replicated log | ⚠️ Async replication, no quorum | ✅ Raft consensus (sync-majority) |
 | **Operations** | ZooKeeper/KRaft + JVM tuning | Single node or Redis Cluster | Single binary, zero dependencies |
-| **Latency (replicated)** | 10-50ms P99 | N/A (async only) | 3.3ms P99 |
+| **Latency (P99)** | 10-50ms | N/A (async only) | 3.5ms |
 | **Recovery time** | 2+ hours (unclean shutdown) | Minutes | **40-50 seconds** |
 | **First message** | ~30 min setup | ~5 min setup | ~60 seconds |
 
@@ -32,7 +32,7 @@ curl 'localhost:1109/broker/consume/orders/mygroup/0?encoding=b64' \
 
 **Redis Streams** is simple and fast, but replication is async-only — no majority quorum, no strong durability guarantees.
 
-**Ayder** sits in the middle: Kafka-grade durability (Raft sync-majority) with Redis-like simplicity (single binary, HTTP API).
+**Ayder** sits in the middle: Kafka-grade durability (Raft sync-majority) with Redis-like simplicity (single binary, HTTP API). Think of it as what Nginx did to Apache — same pattern applied to event streaming.
 
 ---
 
@@ -43,34 +43,75 @@ curl 'localhost:1109/broker/consume/orders/mygroup/0?encoding=b64' \
 - **Durability** via sealed append-only files (AOF) + crash recovery
 - **HA replication** with Raft consensus (3 / 5 / 7 node clusters)
 - **KV store** with CAS and TTL
-- **Streaming queries** with filters, aggregations, and windowed joins
+- **Stream processing** with filters, aggregations, and windowed joins (including cross-format Avro+Protobuf joins)
 
 ---
 
 ## Performance
 
-Benchmarked with **wrk2** (coordinated omission corrected) on real network — not loopback.
+All benchmarks use **wrk2** (coordinated omission corrected) — not wrk. Numbers are real, not marketing.
 
-Setup: DigitalOcean 8 vCPU AMD, 3-node Raft cluster, sync-majority writes, 64B payload:
+### Production Benchmark: 3-Node Cluster (Real Network)
 
-| Metric | Value |
-|--------|-------|
-| Throughput | 50,000 msg/s sustained |
-| P50 latency | 1.58 ms |
-| P99 latency | 3.35 ms |
-| P99.9 latency | 8.62 ms |
-| Server-side P99.999 | 1.2 ms |
+**Setup:**
+- 3-node Raft cluster on DigitalOcean (8 vCPU AMD)
+- Sync-majority writes (2/3 nodes confirm before ACK)
+- 64B payload, 50K req/s sustained
+- Separate machines, real network (not loopback)
 
-All writes are durable and replicated to 2/3 nodes before acknowledgment.
+| Metric | Client-side | Server-side |
+|--------|-------------|-------------|
+| **Throughput** | 49,871 msg/s | — |
+| **P50** | 1.60ms | — |
+| **P99** | 3.46ms | — |
+| **P99.9** | 12.94ms | — |
+| **P99.999** | 154.49ms | **1.22ms** |
 
-**Server-side timing breakdown at P99.999:**
+**Server-side breakdown at P99.999:**
 ```
-Handler time:    1.2ms
-Queue wait:      0.5ms
-HTTP parse:      0.4ms
+Handler:     1.22ms
+Queue wait:  0.47ms
+HTTP parse:  0.41ms
 ```
 
-Client sees 180ms tail at P99.999, but the broker itself stays under 2ms. The gap is network/kernel scheduling — HTTP is not the bottleneck.
+The 154ms client-side tail is network/kernel scheduling — the broker itself stays under 2ms even at P99.999. **HTTP is not the bottleneck.**
+
+### Single-Node Benchmarks
+
+| Setup | P99 | P99.9 | P99.99 | P99.999 | Max |
+|-------|-----|-------|--------|---------|-----|
+| **Real NIC (10.114.0.2)** | 3.31ms | 7.81ms | 16.27ms | 23.14ms | 26.83ms |
+| **Loopback (127.0.0.1)** | 5.79ms | 18.70ms | 40.35ms | 57.53ms | 63.42ms |
+
+*Loopback is slower because client and server contend for CPU on same machine.*
+
+<details>
+<summary>Full wrk2 output (3-node cluster)</summary>
+
+```
+Running 1m test @ http://10.114.0.2:9001
+  12 threads and 400 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     1.72ms    1.19ms 216.19ms   96.39%
+    Req/Sec     4.35k     1.17k    7.89k    79.58%
+  Latency Distribution (HdrHistogram - Recorded Latency)
+ 50.000%    1.60ms
+ 75.000%    2.03ms
+ 90.000%    2.52ms
+ 99.000%    3.46ms
+ 99.900%   12.94ms
+ 99.990%   31.76ms
+ 99.999%  154.49ms
+100.000%  216.32ms
+
+  2991950 requests in 1.00m, 1.80GB read
+Requests/sec:  49871.12
+
+SERVER  server_us p99.999=1219us (1.219ms)
+SERVER  queue_us p99.999=473us (0.473ms)
+SERVER  recv_parse_us p99.999=411us (0.411ms)
+```
+</details>
 
 ---
 
@@ -212,10 +253,10 @@ Use `timeout_ms` to wait for sync confirmation.
 ### Health and Metrics
 
 ```bash
-GET  /health      → {"ok":true}
-GET  /ready       → {"ready":true}
-GET  /metrics     → Prometheus format
-GET  /metrics_ha  → HA cluster metrics
+GET  /health      # → {"ok":true}
+GET  /ready       # → {"ready":true}
+GET  /metrics     # → Prometheus format
+GET  /metrics_ha  # → HA cluster metrics
 ```
 
 ### Topic Management
@@ -405,7 +446,9 @@ Response:
 
 ---
 
-## Streaming Queries
+## Stream Processing
+
+Built-in stream processing — no separate service required.
 
 ### Query
 
@@ -414,9 +457,10 @@ POST /broker/query
 ```
 
 Consume JSON objects from a topic/partition with:
-- Row filtering
-- `group_by` with aggregations
+- Row filtering (eq, ne, lt, gt, in, contains)
+- `group_by` with aggregations (count, sum, avg, min, max)
 - Field projection
+- Tumbling windows
 
 ### Join
 
@@ -426,9 +470,10 @@ POST /broker/join
 
 Windowed join between two sources:
 - Join types: inner / left / right / full
+- Composite keys
 - Window size and allowed lateness
 - Optional `dedupe_once`
-- Field projection
+- Cross-format support (Avro + Protobuf in same join)
 
 ---
 
@@ -620,7 +665,8 @@ Errors follow a consistent format:
 ✅ HTTP-native event log with partitions and offsets  
 ✅ Fast writes with cursor-based consumption  
 ✅ Durable with crash recovery  
-✅ Horizontally scalable with Raft replication
+✅ Horizontally scalable with Raft replication  
+✅ Built-in stream processing with cross-format joins
 
 ## What Ayder Is Not (Yet)
 
@@ -633,5 +679,3 @@ Errors follow a consistent format:
 ## License
 
 MIT
-
-
