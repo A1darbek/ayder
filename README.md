@@ -76,14 +76,16 @@ HTTP parse:  0.41ms
 
 The 154ms client-side tail is network/kernel scheduling — the broker itself stays under 2ms even at P99.999. **HTTP is not the bottleneck.**
 
-### Single-Node Benchmarks
+### Benchmark with wrk2 on Leader's Machine
 
-| Setup | P99 | P99.9 | P99.99 | P99.999 | Max |
-|-------|-----|-------|--------|---------|-----|
+Same 3-node cluster setup, but with wrk2 running on the same machine as the leader (benchmarking from localhost):
+
+| Target | P99 | P99.9 | P99.99 | P99.999 | Max |
+|--------|-----|-------|--------|---------|-----|
 | **Real NIC (10.114.0.2)** | 3.31ms | 7.81ms | 16.27ms | 23.14ms | 26.83ms |
 | **Loopback (127.0.0.1)** | 5.79ms | 18.70ms | 40.35ms | 57.53ms | 63.42ms |
 
-*Loopback is slower because client and server contend for CPU on same machine.*
+*Note: When benchmarking from localhost, the client (wrk2) and server contend for CPU/memory on the same machine, which affects latency. The real NIC results show better performance because the network stack handles scheduling differently than loopback.*
 
 <details>
 <summary>Full wrk2 output (3-node cluster)</summary>
