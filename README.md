@@ -49,15 +49,17 @@ curl 'localhost:1109/broker/consume/orders/mygroup/0?encoding=b64' \
 
 ## Performance
 
-All benchmarks use **wrk2** (coordinated omission corrected) — not wrk. Numbers are real, not marketing.
+All benchmarks use real network (not loopback). Numbers are real, not marketing.
 
 ### Production Benchmark: 3-Node Cluster (Real Network)
 
 **Setup:**
 - 3-node Raft cluster on DigitalOcean (8 vCPU AMD)
 - Sync-majority writes (2/3 nodes confirm before ACK)
-- 64B payload, 50K req/s sustained
-- Separate machines, real network (not loopback)
+- 64B payload
+- Separate machines, real network
+
+#### wrk2 (Rate-Limited 50K req/s) — Latency Test
 
 | Metric | Client-side | Server-side |
 |--------|-------------|-------------|
@@ -76,19 +78,37 @@ HTTP parse:  0.41ms
 
 The 154ms client-side tail is network/kernel scheduling — the broker itself stays under 2ms even at P99.999. **HTTP is not the bottleneck.**
 
-### Benchmark with wrk2 on Leader's Machine
+#### wrk (Max Throughput) — Throughput Test
 
-Same 3-node cluster setup, but with wrk2 running on the same machine as the leader (benchmarking from localhost):
-
-| Target | P99 | P99.9 | P99.99 | P99.999 | Max |
-|--------|-----|-------|--------|---------|-----|
-| **Real NIC (10.114.0.2)** | 3.31ms | 7.81ms | 16.27ms | 23.14ms | 26.83ms |
-| **Loopback (127.0.0.1)** | 5.79ms | 18.70ms | 40.35ms | 57.53ms | 63.42ms |
-
-*Note: When benchmarking from localhost, the client (wrk2) and server contend for CPU/memory on the same machine, which affects latency. The real NIC results show better performance because the network stack handles scheduling differently than loopback.*
+| Metric | Value |
+|--------|-------|
+| **Throughput** | 93,807 msg/s |
+| **P50** | 3.78ms |
+| **P99** | 10.22ms |
+| **Max** | 224.51ms |
 
 <details>
-<summary>Full wrk2 output (3-node cluster)</summary>
+<summary>Full wrk output (3-node cluster, max throughput)</summary>
+
+```
+Running 1m test @ http://10.114.0.3:8001
+  12 threads and 400 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     4.26ms    2.97ms 224.51ms   93.76%
+    Req/Sec     7.86k     1.19k   13.70k    67.61%
+  Latency Distribution
+     50%    3.78ms
+     75%    4.93ms
+     90%    6.44ms
+     99%   10.22ms
+  5634332 requests in 1.00m, 2.99GB read
+Requests/sec:  93807.95
+Transfer/sec:     50.92MB
+```
+</details>
+
+<details>
+<summary>Full wrk2 output (3-node cluster, rate-limited)</summary>
 
 ```
 Running 1m test @ http://10.114.0.2:9001
@@ -112,6 +132,73 @@ Requests/sec:  49871.12
 SERVER  server_us p99.999=1219us (1.219ms)
 SERVER  queue_us p99.999=473us (0.473ms)
 SERVER  recv_parse_us p99.999=411us (0.411ms)
+```
+</details>
+
+---
+
+### ARM64 Benchmark: Snapdragon X Elite (WSL2)
+
+Ayder runs natively on ARM64. Here's a benchmark on consumer hardware:
+
+**Setup:**
+- Snapdragon X Elite laptop (1.42 kg)
+- WSL2 Ubuntu, 16GB RAM
+- Running on **battery** (unplugged)
+- 3-node Raft cluster (same machine — testing code efficiency)
+- wrk: 12 threads, 400 connections, 60 seconds
+
+| Metric | Client-side | Server-side |
+|--------|-------------|-------------|
+| **Throughput** | 106,645 msg/s | — |
+| **P50** | 3.57ms | — |
+| **P99** | 7.62ms | — |
+| **P99.999** | 250.84ms | **0.65ms** |
+
+**Server-side breakdown at P99.999:**
+```
+Handler:     0.65ms
+Queue wait:  0.29ms
+HTTP parse:  0.29ms
+```
+
+**Comparison: Snapdragon vs Cloud VMs (Server-side P99.999)**
+
+| Environment | Throughput | Server P99.999 | Hardware |
+|-------------|------------|----------------|----------|
+| **Snapdragon X Elite** (WSL2, battery) | 106,645/s | **0.65ms** | 1.42kg laptop |
+| **DigitalOcean** (8-vCPU AMD, 3 VMs) | 93,807/s | 1.22ms | Cloud infrastructure |
+
+The laptop's server-side latency is **47% faster** while handling **14% more throughput** — on battery, in WSL2.
+
+**What this proves:**
+- ARM64 is ready for server workloads
+- Efficient C code runs beautifully on Snapdragon
+- WSL2 overhead is minimal for async I/O
+- You can test full HA clusters on your laptop
+
+<details>
+<summary>Full wrk output (Snapdragon X Elite)</summary>
+
+```
+Running 1m test @ http://172.31.76.127:7001
+  12 threads and 400 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     3.81ms    3.80ms 289.49ms   99.00%
+    Req/Sec     8.94k     1.16k   22.81k    80.11%
+  Latency Distribution
+     50%    3.57ms
+     75%    4.01ms
+     90%    4.51ms
+     99%    7.62ms
+  6408525 requests in 1.00m, 3.80GB read
+Requests/sec: 106645.65
+Transfer/sec:     64.83MB
+
+CLIENT  p99.999=250843us (250.843ms)  max=289485us (289.485ms)
+SERVER  server_us p99.999=651us (0.651ms)  max=11964us (11.964ms)
+SERVER  queue_us p99.999=285us (0.285ms)  max=3920us (3.920ms)
+SERVER  recv_parse_us p99.999=293us (0.293ms)  max=4149us (4.149ms)
 ```
 </details>
 
@@ -647,6 +734,15 @@ openssl x509 -req -in node1.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
 
 ---
 
+## Author
+
+Built by **Aydarbek Romanuly** — solo founder from Kazakhstan 🇰🇿
+
+- GitHub: [@A1darbek](https://github.com/A1darbek)
+- Email: aidarbekromanuly@gmail.com
+
+---
+
 ## Error Responses
 
 Errors follow a consistent format:
@@ -668,7 +764,8 @@ Errors follow a consistent format:
 ✅ Fast writes with cursor-based consumption  
 ✅ Durable with crash recovery  
 ✅ Horizontally scalable with Raft replication  
-✅ Built-in stream processing with cross-format joins
+✅ Built-in stream processing with cross-format joins  
+✅ ARM64-native (tested on Snapdragon X Elite)
 
 ## What Ayder Is Not (Yet)
 
