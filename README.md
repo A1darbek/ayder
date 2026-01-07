@@ -19,6 +19,13 @@ curl 'localhost:1109/broker/consume/orders/mygroup/0?encoding=b64' \
 
 ## Why Ayder?
 
+### Benchmark headline (3-node Raft, real network, sync-majority writes)
+- Sustained: **~50K msg/s** (wrk2 @ 50K req/s)
+- Client P99: **3.46ms**
+- Server P99.999: **1.22ms** (handler only)
+- Recovery after SIGKILL: **40–50s** (8M offsets)
+
+
 | | Kafka | Redis Streams | Ayder |
 |---|-------|---------------|-------|
 | **Protocol** | Binary (requires thick client) | RESP | HTTP (curl works) |
@@ -778,3 +785,4 @@ Errors follow a consistent format:
 ## License
 
 MIT
+
