@@ -80,6 +80,7 @@ static inline uint64_t now_us(void) {
     return (uint64_t)ts.tv_sec * 1000000ULL + ts.tv_nsec / 1000;
 }
 
+
 static uint32_t reserve_heap(size_t sz){
     if (sz == 0) return 0;
 
@@ -399,6 +400,21 @@ static inline int offset_skey(uint32_t topic_id, int partition) {
     return -(int)(combined | 0x40000000);  // Ensure negative and non-zero
 }
 
+static inline void seed_shared_next_offset(uint32_t topic_id, int part, uint64_t want_next) {
+    if (!g_shared_storage) return;
+
+    int skey = offset_skey(topic_id, part);
+
+    // Fetch current atomically (and usually also "creates" the counter if missing)
+    uint64_t cur = shared_storage_atomic_add_u64(g_shared_storage, skey, 0);
+
+    if (cur < want_next) {
+        // Bump by the difference (may overshoot under races, which is OK; backwards is not)
+        (void)shared_storage_atomic_add_u64(g_shared_storage, skey, want_next - cur);
+    }
+}
+
+
 static inline uint64_t alloc_offset_shared(rf_topic_t *t, rf_partition_t *p, int partition) {
     if (g_shared_storage) {
         int skey = offset_skey(t->id, partition);
@@ -461,18 +477,21 @@ uint32_t rf_topic_id(const char *name) {
 }
 
 static rf_topic_t* find_topic_lockfree(const char *name, uint32_t id) {
+    size_t nlen = strlen(name);
     uint32_t hash_idx = id & (TOPIC_HASH_SIZE - 1);
-    // Linear probing in hash table
+
     for (int probe = 0; probe < 8; probe++) {
         uint32_t idx = (hash_idx + probe) & (TOPIC_HASH_SIZE - 1);
         rf_topic_t *t = atomic_load_explicit(&g_topic_hash[idx], memory_order_acquire);
-        if (t && t->id == id && simd_strcmp(t->name, name, strlen(name)) == 0) {
-            return t;
+        if (t && t->id == id) {
+            size_t tlen = strnlen(t->name, RF_MAX_TOPIC_LEN);
+            if (tlen == nlen && simd_strcmp(t->name, name, nlen) == 0) return t;
         }
-        if (!t) break; // Empty slot, topic doesn't exist
+        if (!t) break;
     }
     return NULL;
 }
+
 
 static inline void atomic_max_u64(_Atomic uint64_t *dst, uint64_t val) {
     uint64_t cur = atomic_load_explicit(dst, memory_order_acquire);
@@ -857,6 +876,7 @@ static inline void replay_one_msg_rec(const aof_msg_rec_t *r, const uint8_t *kv)
     atomic_fetch_add_explicit(&p->live_bytes, (uint64_t)total_size, memory_order_relaxed);
 
     uint64_t want = r->offset + 1;
+    seed_shared_next_offset(r->topic_id, r->partition, want);
     for (uint64_t cur = atomic_load_explicit(&p->next_offset, memory_order_acquire);
          want > cur && !atomic_compare_exchange_weak_explicit(&p->next_offset, &cur, want, memory_order_acq_rel, memory_order_acquire); ) {}
     for (uint64_t cur = atomic_load_explicit(&p->write_head, memory_order_acquire);
@@ -892,6 +912,7 @@ int rf_produce_sealed(const char *topic, int partition,
     uint64_t slot_idx = offset & p->capacity_mask;
     rf_msg_slot_t *slot = &ring[slot_idx];
     /* ring is addressed by offset; write_head trails logical "next free" */
+    atomic_max_u64(&p->next_offset, offset + 1);
     atomic_max_u64(&p->write_head, offset + 1);
 
     size_t total_size = key_len + val_len;
@@ -1189,8 +1210,9 @@ static void rf_broker_replay_aof_batch(uint32_t rec_id, const void *data, size_t
         }
 
         // Publish metadata (release stores)
+        uint64_t ts_norm = r->ts_us ? r->ts_us : now_us();
         atomic_store_explicit(&slot->offset, r->offset, memory_order_release);
-        atomic_store_explicit(&slot->ts_us, r->ts_us, memory_order_release);
+        atomic_store_explicit(&slot->ts_us, ts_norm, memory_order_release);
         atomic_store_explicit(&slot->key_len, r->key_len, memory_order_release);
         atomic_store_explicit(&slot->val_len, r->val_len, memory_order_release);
         atomic_store_explicit(&slot->partition, r->partition, memory_order_release);
@@ -1200,6 +1222,7 @@ static void rf_broker_replay_aof_batch(uint32_t rec_id, const void *data, size_t
 
         // Bring next_offset/write_head up to at least (offset+1)
         uint64_t want = r->offset + 1;
+        seed_shared_next_offset(r->topic_id, r->partition, want);
         // monotonic max for next_offset
         for (uint64_t cur = atomic_load_explicit(&p->next_offset, memory_order_acquire);
              want > cur && !atomic_compare_exchange_weak_explicit(&p->next_offset, &cur, want, memory_order_acq_rel, memory_order_acquire); ) {}
@@ -1370,6 +1393,7 @@ void rf_broker_replay_aof(uint32_t rec_id, const void *data, size_t sz) {
         atomic_fetch_add_explicit(&p->live_bytes, (uint64_t)total_size, memory_order_relaxed);
 
         uint64_t want = r->offset + 1;
+        seed_shared_next_offset(r->topic_id, r->partition, want);
         for (uint64_t cur = atomic_load_explicit(&p->next_offset, memory_order_acquire);
              want > cur && !atomic_compare_exchange_weak_explicit(&p->next_offset, &cur, want, memory_order_acq_rel, memory_order_acquire); ) {}
         for (uint64_t cur = atomic_load_explicit(&p->write_head, memory_order_acquire);
@@ -1601,6 +1625,7 @@ int rf_produce_batch_sealed(const char *topic, int partition,
         aof_write_ptr += total_size;
     }
 
+    atomic_max_u64(&p->next_offset, offset_start + count);
     atomic_max_u64(&p->write_head, offset_start + count);
 
     /* SEALED APPEND: Write to AOF with zero-loss guarantee */
@@ -1681,6 +1706,7 @@ int rf_produce_sealed_idemp(const char *topic, int partition,
     atomic_store_explicit(&slot->partition, partition, memory_order_release);
     atomic_store_explicit(&slot->flags, (total <= sizeof(slot->inline_data)) ? 1 : 3, memory_order_release);
 
+    atomic_max_u64(&p->next_offset, offset + 1);
     atomic_max_u64(&p->write_head, offset + 1);
 
     /* ---- NEW: size accounting + opportunistic size sweep (match non-idemp path) ---- */
@@ -1798,6 +1824,7 @@ int rf_produce_batch_sealed_idemp(const char *topic, int partition, const rf_msg
         w += tot;
     }
 
+    atomic_max_u64(&p->next_offset, off0 + count);
     atomic_max_u64(&p->write_head, off0 + count);
     memcpy(w, &fp64, sizeof fp64);
     uint64_t bid = AOF_append_sealed(AOF_REC_BROKER_MSG_BATCH_IDEMP, buf, total_aof);
