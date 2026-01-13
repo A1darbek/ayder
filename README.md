@@ -9,7 +9,7 @@ https://www.youtube.com/watch?v=c-n0X5t-A9Y
 
 ```bash
 # Produce
-curl -X POST 'localhost:1109/broker/topics/orders/produce' \
+curl -X POST 'localhost:1109/broker/topics/orders/produce?partition=0' \
   -H 'Authorization: Bearer dev' \
   -d '{"item":"widget"}'
 
@@ -261,7 +261,7 @@ curl -X POST localhost:1109/broker/topics \
   -H 'Content-Type: application/json' \
   -d '{"name":"events","partitions":4}'
 
-curl -X POST 'localhost:1109/broker/topics/events/produce' \
+curl -X POST 'localhost:1109/broker/topics/events/produce?partition=0' \
   -H 'Authorization: Bearer dev' \
   -d 'hello world'
 ```
@@ -615,7 +615,7 @@ node2 (8001) = FOLLOWER
 node3 (9001) = FOLLOWER
 
 # Write to leader
-curl -X POST 'localhost:7001/broker/topics/test/produce' \
+curl -X POST 'localhost:7001/broker/topics/test/produce?partition=0' \
   -H 'Authorization: Bearer dev' -d 'msg-0'
 # → offset 0
 
@@ -623,11 +623,11 @@ curl -X POST 'localhost:7001/broker/topics/test/produce' \
 kill -9 $(pgrep -f "port 8001")
 
 # Write while node2 is down
-curl -X POST 'localhost:7001/broker/topics/test/produce' \
+curl -X POST 'localhost:7001/broker/topics/test/produce?partition=0' \
   -H 'Authorization: Bearer dev' -d 'msg-1'
 # → offset 1
 
-curl -X POST 'localhost:7001/broker/topics/test/produce' \
+curl -X POST 'localhost:7001/broker/topics/test/produce?partition=0' \
   -H 'Authorization: Bearer dev' -d 'msg-2'
 # → offset 2
 
@@ -788,5 +788,6 @@ Errors follow a consistent format:
 ## License
 
 MIT
+
 
 
