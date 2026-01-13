@@ -4,6 +4,9 @@
 
 A single-binary event streaming system where `curl` is your client. No JVM, no ZooKeeper, no thick client libraries.
 
+▶️ **1-minute demo: SIGKILL → restart → data still there**
+https://www.youtube.com/watch?v=c-n0X5t-A9Y
+
 ```bash
 # Produce
 curl -X POST 'localhost:1109/broker/topics/orders/produce' \
@@ -785,4 +788,5 @@ Errors follow a consistent format:
 ## License
 
 MIT
+
 
