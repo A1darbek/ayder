@@ -2,18 +2,18 @@
 
 **HTTP-native durable event log / message bus — written in C**
 
-A single-binary event streaming system where `curl` is your client. No JVM, no ZooKeeper, no thick client libraries.
+Single binary. HTTP API. `curl` works as a client. No JVM, no ZooKeeper, no client libraries to start sending events.
 
 ▶️ **1-minute demo: SIGKILL → restart → data still there**
 https://www.youtube.com/watch?v=c-n0X5t-A9Y
 
 ```bash
-# Produce
+# Produce (raw bytes in body)
 curl -X POST 'localhost:1109/broker/topics/orders/produce?partition=0' \
   -H 'Authorization: Bearer dev' \
   -d '{"item":"widget"}'
 
-# Consume
+# Consume (base64 for binary-safe payloads)
 curl 'localhost:1109/broker/consume/orders/mygroup/0?encoding=b64' \
   -H 'Authorization: Bearer dev'
 ```
@@ -22,20 +22,19 @@ curl 'localhost:1109/broker/consume/orders/mygroup/0?encoding=b64' \
 
 ## Why Ayder?
 
-### Benchmark headline (3-node Raft, real network, sync-majority writes)
-- Sustained: **~50K msg/s** (wrk2 @ 50K req/s)
-- Client P99: **3.46ms**
-- Server P99.999: **1.22ms** (handler only)
-- Recovery after SIGKILL: **40–50s** (8M offsets)
+### Benchmarks (3-node Raft, sync-majority, real network)
+- **wrk2 (rate limited 50K req/s):** 49,871 msg/s, **client p99 3.46ms**
+- **server timing (handler only):** **p99.999 1.22ms** (`server_us`, see output below)
+- **unclean recovery (SIGKILL):** follower catch-up + healthy cluster in **~40–50s** (~8M offsets)
 
 
 | | Kafka | Redis Streams | Ayder |
 |---|-------|---------------|-------|
 | **Protocol** | Binary (requires thick client) | RESP | HTTP (curl works) |
-| **Durability** | ✅ Replicated log | ⚠️ Async replication, no quorum | ✅ Raft consensus (sync-majority) |
+| **Durability** | ✅ Replicated log | ⚠️ Replication depends on Redis topology; quorum semantics differ from a consensus log | ✅ Raft consensus (sync-majority) |
 | **Operations** | ZooKeeper/KRaft + JVM tuning | Single node or Redis Cluster | Single binary, zero dependencies |
 | **Latency (P99)** | 10-50ms | N/A (async only) | 3.5ms |
-| **Recovery time** | 2+ hours (unclean shutdown) | Minutes | **40-50 seconds** |
+| **Recovery time** | Can be long in large clusters (unclean shutdown; reports vary) | Minutes | **40-50 seconds** |
 | **First message** | ~30 min setup | ~5 min setup | ~60 seconds |
 
 **Kafka** is battle-tested but operationally heavy. JVM tuning, partition rebalancing, and config sprawl add up.
@@ -59,7 +58,8 @@ curl 'localhost:1109/broker/consume/orders/mygroup/0?encoding=b64' \
 
 ## Performance
 
-All benchmarks use real network (not loopback). Numbers are real, not marketing.
+All benchmarks below are run over real network (not loopback). Commands and full outputs are included.
+
 
 ### Production Benchmark: 3-Node Cluster (Real Network)
 
@@ -216,7 +216,8 @@ SERVER  recv_parse_us p99.999=293us (0.293ms)  max=4149us (4.149ms)
 
 ## Recovery Time
 
-Kafka in 2025 is like starting a car with a hand crank. It works, but why are we still doing this?
+Recovery time is an area where operational complexity shows up quickly in practice.
+
 
 | Scenario | Kafka | Ayder |
 |----------|-------|-------|
@@ -344,6 +345,13 @@ Ayder acknowledges writes in two modes:
 | **Rocket** | Zero | `false` | In-memory fast path, not persisted |
 
 Use `timeout_ms` to wait for sync confirmation.
+
+## Interop / standards (direction)
+
+I’d like Ayder’s consume API to converge toward something that works well with generic tooling.
+One reference I’m looking at is Feed API (https://github.com/vippsas/feedapi-spec).
+If you’ve implemented similar “log over HTTP” protocols in production, I’d love pointers.
+
 
 ---
 
@@ -788,6 +796,7 @@ Errors follow a consistent format:
 ## License
 
 MIT
+
 
 
 
