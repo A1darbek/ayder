@@ -16,6 +16,9 @@ curl -X POST 'localhost:1109/broker/topics/orders/produce?partition=0' \
 # Consume (base64 for binary-safe payloads)
 curl 'localhost:1109/broker/consume/orders/mygroup/0?encoding=b64' \
   -H 'Authorization: Bearer dev'
+
+Looking for 2–3 design partners to try Ayder in real workloads.
+30-minute setup, white-glove onboarding. See Discussions or email me.
 ```
 
 ---
@@ -796,6 +799,7 @@ Errors follow a consistent format:
 ## License
 
 MIT
+
 
 
 
