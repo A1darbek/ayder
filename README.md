@@ -349,11 +349,6 @@ Ayder acknowledges writes in two modes:
 
 Use `timeout_ms` to wait for sync confirmation.
 
-## Interop / standards (direction)
-
-I’d like Ayder’s consume API to converge toward something that works well with generic tooling.
-One reference I’m looking at is Feed API (https://github.com/vippsas/feedapi-spec).
-If you’ve implemented similar “log over HTTP” protocols in production, I’d love pointers.
 
 
 ---
