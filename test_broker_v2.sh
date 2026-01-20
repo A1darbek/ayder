@@ -1484,22 +1484,22 @@ rf_wait_up_23() {
 }
 
 rf_hard_restart_23() {
-  local RAMFORGE_BIN_LOCAL
-  RAMFORGE_BIN_LOCAL="${RAMFORGE_BIN:-$(readlink -f /proc/$(pgrep -xo ramforge 2>/dev/null)/exe 2>/dev/null || echo ./ramforge)}"
+  local AYDER_BIN_LOCAL
+  AYDER_BIN_LOCAL="${AYDER_BIN:-$(readlink -f /proc/$(pgrep -xo ayder 2>/dev/null)/exe 2>/dev/null || echo ./ayder)}"
   local LOG_FILE_LOCAL="${LOG_FILE:-./rf_crash_23.log}"
-  local OLD_PID; OLD_PID="$(pgrep -xo ramforge 2>/dev/null || true)"
+  local OLD_PID; OLD_PID="$(pgrep -xo ayder 2>/dev/null || true)"
 
   say "   killing broker (SIGKILL)"
-  pkill -9 ramforge 2>/dev/null || true
+  pkill -9 ayder 2>/dev/null || true
   sleep_ms 200
 
-  say "   restarting: ${RAMFORGE_BIN_LOCAL} --port ${PORT}"
+  say "   restarting: ${AYDER_BIN_LOCAL} --port ${PORT}"
   env RF_BEARER_TOKENS="${RF_BEARER_TOKENS}" \
-      "${RAMFORGE_BIN_LOCAL}" --port "${PORT}" >"${LOG_FILE_LOCAL}" 2>&1 &
+      "${AYDER_BIN_LOCAL}" --port "${PORT}" >"${LOG_FILE_LOCAL}" 2>&1 &
 
   rf_wait_up_23
 
-  local NEW_PID; NEW_PID="$(pgrep -xo ramforge 2>/dev/null || true)"
+  local NEW_PID; NEW_PID="$(pgrep -xo ayder 2>/dev/null || true)"
   if [ -z "$NEW_PID" ] || [ "$NEW_PID" = "$OLD_PID" ]; then
     echo "  health after restart ← ${out:-<none>}"
     fail "restart verification failed (PID unchanged or missing)"
@@ -1593,6 +1593,96 @@ echo "$r_view" | jq -e '
 ' >/dev/null || fail "resume offset mismatch after restart"
 
 ok "Crash durability + idempotency across restart OK"
+
+# ---------------------------------------------------------------------------------------
+# 24) Broker TTL via /broker/retention survives SIGKILL restart (deterministic)
+# ---------------------------------------------------------------------------------------
+say "24) broker TTL (/broker/retention) survives restart (deterministic)"
+
+# Wait until sealed last_synced_batch_id advances beyond a baseline (durability barrier)
+wait_sealed_advance() { # baseline_id [timeout_ms]
+  local base="$1"
+  local tmo="${2:-2000}"
+  local intv=25
+  local attempts=$(( tmo / intv )); [ $attempts -lt 1 ] && attempts=1
+  local last="$base"
+  for ((i=0;i<attempts;i++)); do
+    local st
+    st=$(curl -sS "${BASE}/admin/sealed/status" "${hdr_auth[@]}" || true)
+    last=$(echo "$st" | jq -r '.last_synced_batch_id // 0' 2>/dev/null || echo 0)
+    if [ "${last:-0}" -gt "${base:-0}" ]; then
+      echo "$st"
+      return 0
+    fi
+    sleep_ms "$intv"
+  done
+  echo "{\"ok\":false,\"error\":\"sealed_not_advanced\",\"base\":${base},\"last\":${last}}"
+  return 1
+}
+
+TTL_TOPIC="ttl_restart_$(date +%s)"
+PART=0
+TTL_MS="${TTL_MS:-300}"
+
+# Create single-partition topic
+ct=$(curl -sS -X POST "${BASE}/broker/topics" "${hdr_auth[@]}" \
+  -H 'Content-Type: application/json' \
+  --data-binary "$(jq -nc --arg name "$TTL_TOPIC" --argjson p 1 '{name:$name,partitions:$p}')")
+echo "  topic create ← $ct"
+echo "$ct" | jq -e 'select(.ok==true)' >/dev/null || fail "ttl topic create failed"
+
+# Baseline sealed sync id (durability barrier for the TTL record)
+st0=$(curl -sS "${BASE}/admin/sealed/status" "${hdr_auth[@]}")
+BASE_ID=$(echo "$st0" | jq -r '.last_synced_batch_id // 0')
+echo "  sealed baseline ← $st0"
+
+# Set broker TTL using your real endpoint
+ttl_payload=$(jq -nc --arg t "$TTL_TOPIC" --argjson p "$PART" --argjson ttl "$TTL_MS" \
+  '{topic:$t, partition:$p, ttl_ms:$ttl}')
+ttl_resp=$(curl -sS -X POST "${BASE}/broker/retention" "${hdr_auth[@]}" \
+  -H 'Content-Type: application/json' --data-binary "$ttl_payload")
+echo "  set TTL ← $ttl_resp"
+echo "$ttl_resp" | jq -e 'select(.ok==true)' >/dev/null \
+  || fail "setting TTL failed (ok!=true)"
+
+# IMPORTANT: ttl_applied may be false due to worker routing; do not assert it.
+ok "TTL request accepted (ttl_applied may be false in multi-worker)"
+
+# Ensure the TTL record is actually fsynced to the sealed AOF before we SIGKILL
+st1=$(wait_sealed_advance "$BASE_ID" 2500) || { echo "  sealed wait ← $st1"; fail "TTL record not fsynced before restart"; }
+echo "  sealed advanced ← $st1"
+ok "TTL record fsynced"
+
+# Produce one durable message
+prod=$(curl -sS -X POST \
+  "${BASE}/broker/topics/${TTL_TOPIC}/produce?partition=${PART}&durable=1&idempotency_key=ttl.one" \
+  "${hdr_auth[@]}" -H 'Content-Type: application/json' \
+  --data-binary "$(jq -nc --arg m "hello" '{msg:$m}')")
+echo "  produce ← $prod"
+echo "$prod" | jq -e 'select(.ok==true)' >/dev/null || fail "ttl produce failed"
+
+# Ensure it becomes visible from offset=0 (race-free)
+probe=$(await_count_ge "$TTL_TOPIC" "g_probe_${TTL_TOPIC}" "$PART" 1 "$((POLL_TIMEOUT_MS*2))" "$POLL_INTERVAL_MS" 0) \
+  || { echo "  probe ← $probe"; fail "ttl msg not visible"; }
+echo "  probe ← $(echo "$probe" | jq -c '{count,next_offset, offsets:(.messages|map(.offset))}')"
+ok "ttl msg visible pre-restart"
+
+# Crash + restart
+rf_hard_restart_23
+
+# Wait beyond TTL (with slack)
+sleep_ms "$(( TTL_MS + 450 ))"
+
+# Consume from offset=0 with a fresh group; expired message should be skipped (count=0),
+# and next_offset should advance past it (>=1).
+TTL_GROUP2="g_ttl_after_${TTL_TOPIC}_$(date +%s%N)"
+after=$(curl -sS "${BASE}/broker/consume/${TTL_TOPIC}/${TTL_GROUP2}/${PART}?encoding=b64&limit=10&offset=0" "${hdr_auth[@]}")
+echo "  post-restart consume ← $(echo "$after" | jq -c '{count,next_offset, offsets:(.messages|map(.offset))}')"
+
+echo "$after" | jq -e '(.count==0) and ((.next_offset // 0) >= 1)' >/dev/null \
+  || fail "expected expired message after restart (count==0 and next_offset>=1)"
+
+ok "broker TTL survives restart (expired message is skipped)"
 
 
 say "BROKER  SMOKE TEST: ALL GREEN ✅"
