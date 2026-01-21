@@ -23,6 +23,34 @@ Looking for 2–3 design partners to try Ayder in real workloads.
 30-minute setup, white-glove onboarding. See Discussions or email me.
 ---
 
+Jepsen-style Smoke Test (reproducible)
+
+Ayder ships with a Jepsen-style failure test script you can run locally:
+
+Script: ./test_broker_v2.sh
+
+Faults: SIGKILL during writes, restart loops, optional network delay/jitter (tc netem), partitions
+
+Checks (invariants):
+
+no loss (no gaps / missing sequence)
+
+no duplicates when using idempotency_key
+
+per-partition order preserved
+
+offsets monotonic across restarts and commits
+
+Run it
+chmod +x test_broker_v2.sh
+./test_broker_v2.sh
+
+If everything is working correctly, you’ll see:
+
+BROKER SMOKE TEST: ALL GREEN ✅
+
+If it fails, please paste the summary + logs in an Issue — reproducible correctness bugs are the top priority.
+
 ## Why Ayder?
 
 ### Benchmarks (3-node Raft, sync-majority, real network)
@@ -33,11 +61,11 @@ Looking for 2–3 design partners to try Ayder in real workloads.
 
 | | Kafka | Redis Streams | Ayder |
 |---|-------|---------------|-------|
-| **Protocol** | Binary (requires thick client) | RESP | HTTP (curl works) |
-| **Durability** | ✅ Replicated log | ⚠️ Replication depends on Redis topology; quorum semantics differ from a consensus log | ✅ Raft consensus (sync-majority) |
+| **Protocol** | Kafka binary protocol (client library) | RESP | HTTP (curl works) |
+| **Durability** | Replicated log | Replication depends on Redis topology; quorum semantics differ from a consensus log | Raft consensus (sync-majority) |
 | **Operations** | ZooKeeper/KRaft + JVM tuning | Single node or Redis Cluster | Single binary, zero dependencies |
-| **Latency (P99)** | 10-50ms | N/A (async only) | 3.5ms |
-| **Recovery time** | Can be long in large clusters (unclean shutdown; reports vary) | Minutes | **40-50 seconds** |
+| **Latency (P99)** | often 10–50ms (varies by setup) | n/a (depends on topology) | 3.46ms (wrk2 @ 50K req/s) |
+| **Recovery time** | can be long at scale (reports vary) | Minutes | ~40–50s (measured) |
 | **First message** | ~30 min setup | ~5 min setup | ~60 seconds |
 
 **Kafka** is battle-tested but operationally heavy. JVM tuning, partition rebalancing, and config sprawl add up.
@@ -794,6 +822,7 @@ Errors follow a consistent format:
 ## License
 
 MIT
+
 
 
 
