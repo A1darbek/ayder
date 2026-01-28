@@ -18,6 +18,7 @@
 #include <sched.h>
 #include <stddef.h>   // max_align_t
 #include <stdalign.h> // _Alignof
+#include <stdbool.h>
 
 // SIMD support detection
 #ifdef __AVX2__
@@ -137,6 +138,22 @@ static inline void rf_invalidate_slot(rf_partition_t *p, rf_msg_slot_t *slot) {
     /* make the slot unmistakably "not for this logical offset" */
     atomic_store_explicit(&slot->offset, UINT64_MAX, memory_order_release);
     if (b) atomic_fetch_sub_explicit(&p->live_bytes, b, memory_order_relaxed);
+}
+
+static inline int rf_slot_ready_for_offset(const rf_msg_slot_t *slot, uint64_t off) {
+    uint16_t f = atomic_load_explicit((_Atomic uint16_t *) &slot->flags, memory_order_acquire);
+    if (!(f & 1)) return 0;
+    uint64_t so = atomic_load_explicit((_Atomic uint64_t *) &slot->offset, memory_order_acquire);
+    return so == off;
+}
+
+/* avoid leaking blobs / double-counting live_bytes when overwriting slots */
+static inline void rf_slot_evict_if_needed(rf_partition_t *p, rf_msg_slot_t *slot, uint64_t new_off) {
+    uint16_t f = atomic_load_explicit(&slot->flags, memory_order_acquire);
+    if (!(f & 1)) return;
+    uint64_t so = atomic_load_explicit(&slot->offset, memory_order_acquire);
+    if (so == new_off) return;
+    rf_invalidate_slot(p, slot);
 }
 
 static inline void rf_size_sweep_if_over(rf_partition_t *p, uint64_t now) {
@@ -895,6 +912,13 @@ static inline void replay_one_msg_rec(const aof_msg_rec_t *r, const uint8_t *kv)
     uint64_t slot_idx = (r->offset) & p->capacity_mask;
     rf_msg_slot_t *slot = &ring[slot_idx];
 
+    uint64_t want = r->offset + 1;
+    seed_shared_next_offset(r->topic_id, r->partition, want);
+    atomic_max_u64(&p->next_offset, want);
+    atomic_max_u64(&p->write_head, want);
+    if (rf_slot_ready_for_offset(slot, r->offset)) return;
+    rf_slot_evict_if_needed(p, slot, r->offset);
+
     if (total_size <= sizeof(slot->inline_data)) {
         memcpy(slot->inline_data, kv, total_size);
         slot->blob = slot->inline_data;
@@ -919,12 +943,6 @@ static inline void replay_one_msg_rec(const aof_msg_rec_t *r, const uint8_t *kv)
     /* size accounting on replay */
     atomic_fetch_add_explicit(&p->live_bytes, (uint64_t)total_size, memory_order_relaxed);
 
-    uint64_t want = r->offset + 1;
-    seed_shared_next_offset(r->topic_id, r->partition, want);
-    for (uint64_t cur = atomic_load_explicit(&p->next_offset, memory_order_acquire);
-         want > cur && !atomic_compare_exchange_weak_explicit(&p->next_offset, &cur, want, memory_order_acq_rel, memory_order_acquire); ) {}
-    for (uint64_t cur = atomic_load_explicit(&p->write_head, memory_order_acquire);
-         want > cur && !atomic_compare_exchange_weak_explicit(&p->write_head, &cur, want, memory_order_acq_rel, memory_order_acquire); ) {}
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -955,6 +973,7 @@ int rf_produce_sealed(const char *topic, int partition,
     uint64_t offset = alloc_offset_shared(t, p, partition);
     uint64_t slot_idx = offset & p->capacity_mask;
     rf_msg_slot_t *slot = &ring[slot_idx];
+    rf_slot_evict_if_needed(p, slot, offset);
     /* ring is addressed by offset; write_head trails logical "next free" */
     atomic_max_u64(&p->next_offset, offset + 1);
     atomic_max_u64(&p->write_head, offset + 1);
@@ -1027,6 +1046,9 @@ int rf_produce_sealed(const char *topic, int partition,
     } else {
         /* original sealed (durable) path */
         out_bid = AOF_append_sealed(AOF_REC_BROKER_MSG, sealed_buffer, aof_size);
+
+
+        (void)rf_bus_publish(AOF_REC_BROKER_MSG, sealed_buffer, (uint32_t)aof_size);
     }
 
     if (RAMForge_HA_is_enabled()) {
@@ -1241,6 +1263,16 @@ static void rf_broker_replay_aof_batch(uint32_t rec_id, const void *data, size_t
         uint64_t slot_idx = (r->offset) & p->capacity_mask;
         rf_msg_slot_t *slot = &ring[slot_idx];
 
+        uint64_t want = r->offset + 1;
+        seed_shared_next_offset(r->topic_id, r->partition, want);
+        atomic_max_u64(&p->next_offset, want);
+        atomic_max_u64(&p->write_head, want);
+        if (rf_slot_ready_for_offset(slot, r->offset)) {
+            ptr += record_size;
+            continue;
+        }
+        rf_slot_evict_if_needed(p, slot, r->offset);
+
         if (total_size <= sizeof(slot->inline_data)) {
             memcpy(slot->inline_data, kv, total_size);
             slot->blob = slot->inline_data;
@@ -1262,16 +1294,6 @@ static void rf_broker_replay_aof_batch(uint32_t rec_id, const void *data, size_t
         atomic_store_explicit(&slot->flags, (total_size <= sizeof(slot->inline_data)) ? 1 : 3, memory_order_release);
 
         atomic_fetch_add_explicit(&p->live_bytes, (uint64_t)total_size, memory_order_relaxed);
-
-        // Bring next_offset/write_head up to at least (offset+1)
-        uint64_t want = r->offset + 1;
-        seed_shared_next_offset(r->topic_id, r->partition, want);
-        // monotonic max for next_offset
-        for (uint64_t cur = atomic_load_explicit(&p->next_offset, memory_order_acquire);
-             want > cur && !atomic_compare_exchange_weak_explicit(&p->next_offset, &cur, want, memory_order_acq_rel, memory_order_acquire); ) {}
-        // write_head should track next free logical offset as well
-        for (uint64_t cur = atomic_load_explicit(&p->write_head, memory_order_acquire);
-             want > cur && !atomic_compare_exchange_weak_explicit(&p->write_head, &cur, want, memory_order_acq_rel, memory_order_acquire); ) {}
 
         ptr += record_size;
     }
@@ -1416,6 +1438,13 @@ void rf_broker_replay_aof(uint32_t rec_id, const void *data, size_t sz) {
         uint64_t slot_idx = (r->offset) & p->capacity_mask; // <-- change
         rf_msg_slot_t *slot = &ring[slot_idx];
 
+        uint64_t want = r->offset + 1;
+        seed_shared_next_offset(r->topic_id, r->partition, want);
+        atomic_max_u64(&p->next_offset, want);
+        atomic_max_u64(&p->write_head, want);
+        if (rf_slot_ready_for_offset(slot, r->offset)) return;
+        rf_slot_evict_if_needed(p, slot, r->offset);
+
         if (total_size <= sizeof(slot->inline_data)) {
             memcpy(slot->inline_data, kv, total_size);
             slot->blob = slot->inline_data;
@@ -1437,12 +1466,7 @@ void rf_broker_replay_aof(uint32_t rec_id, const void *data, size_t sz) {
 
         atomic_fetch_add_explicit(&p->live_bytes, (uint64_t)total_size, memory_order_relaxed);
 
-        uint64_t want = r->offset + 1;
-        seed_shared_next_offset(r->topic_id, r->partition, want);
-        for (uint64_t cur = atomic_load_explicit(&p->next_offset, memory_order_acquire);
-             want > cur && !atomic_compare_exchange_weak_explicit(&p->next_offset, &cur, want, memory_order_acq_rel, memory_order_acquire); ) {}
-        for (uint64_t cur = atomic_load_explicit(&p->write_head, memory_order_acquire);
-             want > cur && !atomic_compare_exchange_weak_explicit(&p->write_head, &cur, want, memory_order_acq_rel, memory_order_acquire); ) {}
+        /* tails already bumped above */
         return;
     }
 
@@ -1616,6 +1640,7 @@ int rf_produce_batch_sealed(const char *topic, int partition,
         uint64_t msg_offset = offset_start + i;
         uint64_t slot_idx = msg_offset & p->capacity_mask;
         rf_msg_slot_t *slot = &ring[slot_idx];
+        rf_slot_evict_if_needed(p, slot, msg_offset);
         const rf_msg_view_t *msg = &messages[i];
 
         size_t total_size = msg->key_len + msg->val_len;
@@ -1685,6 +1710,8 @@ int rf_produce_batch_sealed(const char *topic, int partition,
     {
         /* default durable path (unchanged) */
         uint64_t aof_batch_id = AOF_append_sealed(AOF_REC_BROKER_MSG_BATCH, sealed_batch_buffer, total_aof_size);
+
+        (void)rf_bus_publish(AOF_REC_BROKER_MSG_BATCH, sealed_batch_buffer, (uint32_t)total_aof_size);
         if (batch_id) *batch_id = aof_batch_id;
     }
 
@@ -1728,6 +1755,7 @@ int rf_produce_sealed_idemp(const char *topic, int partition,
     uint64_t slot_idx = offset & p->capacity_mask;
 
     rf_msg_slot_t *slot = &ring[slot_idx];
+    rf_slot_evict_if_needed(p, slot, offset);
 
     size_t total = key_len + val_len;
     uint64_t ts_wall = wall_us_raw();
@@ -1778,6 +1806,8 @@ int rf_produce_sealed_idemp(const char *topic, int partition,
 
     uint64_t bid = AOF_append_sealed(AOF_REC_BROKER_MSG_IDEMP, buf, aof_sz);
 
+    (void)rf_bus_publish(AOF_REC_BROKER_MSG_IDEMP, buf, (uint32_t)aof_sz);
+
     if (RAMForge_HA_is_enabled()) {
         RAMForge_HA_replicate_write(AOF_REC_BROKER_MSG_IDEMP, buf, aof_sz);
     }
@@ -1826,6 +1856,7 @@ int rf_produce_batch_sealed_idemp(const char *topic, int partition, const rf_msg
         uint64_t o        = off0 + i;
         uint64_t slot_idx = o & p->capacity_mask;
         rf_msg_slot_t *slot = &ring[slot_idx];
+        rf_slot_evict_if_needed(p, slot, o);
         const rf_msg_view_t *m = &messages[i];
         size_t tot = m->key_len + m->val_len;
         if (tot <= sizeof(slot->inline_data)) {
@@ -1872,6 +1903,8 @@ int rf_produce_batch_sealed_idemp(const char *topic, int partition, const rf_msg
     atomic_max_u64(&p->write_head, off0 + count);
     memcpy(w, &fp64, sizeof fp64);
     uint64_t bid = AOF_append_sealed(AOF_REC_BROKER_MSG_BATCH_IDEMP, buf, total_aof);
+
+    (void)rf_bus_publish(AOF_REC_BROKER_MSG_BATCH_IDEMP, buf, (uint32_t)total_aof);
     if (RAMForge_HA_is_enabled()) {
         RAMForge_HA_replicate_write(AOF_REC_BROKER_MSG_BATCH_IDEMP, buf, total_aof);
     }
