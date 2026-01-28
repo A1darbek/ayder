@@ -23,14 +23,28 @@
 #include "rf_broker.h"
 #include <stdatomic.h>
 
+#ifndef cpu_relax
+#if defined(__aarch64__)
+    // For ARM64: use the 'yield' instruction
+    #define cpu_relax() asm volatile("yield" ::: "memory")
+#elif defined(__x86_64__)
+    // For x86: use the 'pause' instruction
+    #define cpu_relax() asm volatile("pause" ::: "memory")
+#else
+    // Fallback: standard compiler barrier
+    #define cpu_relax() asm volatile("" ::: "memory")
+#endif
+#endif
+
+
 #define SEALED_BATCH_SIZE 256
 #define SEALED_BUFFER_SIZE (8 * 1024 * 1024)  /* 8MB sealed buffer */
 #define MAX_PENDING_SEALS 32
 
 #define SEALED_RING_SIZE 8192          /* Larger ring buffer */
-#define SEALED_BATCH_GROUP_SIZE 64     /* Batch more operations */
+#define SEALED_BATCH_GROUP_SIZE 512     /* Batch more operations */
 #define SEALED_MMAP_SIZE (64 * 1024 * 1024)  /* 64MB memory mapped */
-#define MAX_SEALED_BATCHES 256         /* More concurrent batches */
+#define MAX_SEALED_BATCHES 4096         /* More concurrent batches */
 
 
 typedef struct {
@@ -68,6 +82,7 @@ typedef struct {
 
     _Atomic bool gc_active;         /* pause appends/sync during sealed GC */
     pthread_mutex_t gc_lock;
+
 } sealed_aof_t;
 
 static sealed_aof_t g_opt_sealed = {0};
@@ -363,14 +378,6 @@ void AOF_sealed_test_set_delay_us(int us) { atomic_store(&g_test_delay_us, us > 
 static void *sealed_sync_thread(void *arg) {
     (void)arg;
 
-    /* Pre-allocate aligned write buffer for O_DIRECT */
-    size_t write_buffer_size = SEALED_BATCH_GROUP_SIZE * 4096; /* 4KB per batch max */
-    void *write_buffer = aligned_alloc(512, write_buffer_size);
-    if (!write_buffer) {
-        perror("Failed to allocate sync write buffer");
-        return NULL;
-    }
-
     struct iovec iovecs[SEALED_BATCH_GROUP_SIZE];
     sealed_batch_slot_t *ready_slots[SEALED_BATCH_GROUP_SIZE];
 
@@ -380,112 +387,60 @@ static void *sealed_sync_thread(void *arg) {
             nanosleep(&ts, NULL);
             continue;
         }
-        /* Collect ready batches - lock-free */
+
+        uint64_t head = atomic_load_explicit(&g_opt_sealed.slot_head, memory_order_acquire);
+        uint64_t tail = atomic_load_explicit(&g_opt_sealed.slot_tail, memory_order_acquire);
+
         size_t ready_count = 0;
-        uint64_t tail = atomic_load(&g_opt_sealed.slot_tail);
-        uint64_t head = atomic_load(&g_opt_sealed.slot_head);
 
-        /* Scan for ready slots */
-        for (uint64_t i = 0; i < MAX_SEALED_BATCHES && ready_count < SEALED_BATCH_GROUP_SIZE; i++) {
-            sealed_batch_slot_t *slot = &g_opt_sealed.slots[i];
+        while (tail < head && ready_count < SEALED_BATCH_GROUP_SIZE) {
+            sealed_batch_slot_t *slot = &g_opt_sealed.slots[tail % MAX_SEALED_BATCHES];
 
-            if (atomic_load(&slot->state) == 2) { /* Ready */
-                ready_slots[ready_count] = slot;
+            if (atomic_load_explicit(&slot->state, memory_order_acquire) != 2) break; // not ready yet
 
-                /* Prepare iovec for vectored write */
-                iovecs[ready_count].iov_base = (char*)g_opt_sealed.mmap_buffer + slot->offset_in_mmap;
-                iovecs[ready_count].iov_len = slot->size;
-                ready_count++;
-            }
+            ready_slots[ready_count] = slot;
+            iovecs[ready_count].iov_base = (char*)g_opt_sealed.mmap_buffer + slot->offset_in_mmap;
+            iovecs[ready_count].iov_len  = slot->size;
+            ready_count++;
+            tail++;
         }
 
         if (ready_count == 0) {
-            /* No ready batches - short sleep */
-            struct timespec ts = {0, 100000}; /* 100μs */
+            struct timespec ts = {0, 100000};
             nanosleep(&ts, NULL);
             continue;
         }
 
         uint64_t sync_start = now_us();
-
-        /* Vectored write - single system call for all batches */
         ssize_t written = writev(g_opt_sealed.fd, iovecs, (int)ready_count);
-
-        if (written > 0) {
-            /* Single fsync for entire group */
-
-            if (atomic_load(&g_test_hold) == 1) {
-                // Block here deterministically until test releases, unless shutting down
-                while (!atomic_load(&g_test_release) && !atomic_load(&g_opt_sealed.shutdown)) {
-                    struct timespec ts = {0, 5*1000*1000}; // 5ms
-                    nanosleep(&ts, NULL);
-                }
-            }
-// Optional tiny delay to widen pre-fsync window on very fast machines
-            int delay_us = atomic_load(&g_test_delay_us);
-            if (delay_us > 0) usleep((useconds_t)delay_us);
-
-            if (fsync(g_opt_sealed.fd) == 0) {
-                uint64_t sync_duration = now_us() - sync_start;
-                atomic_fetch_add(&g_opt_sealed.total_sync_time_us, sync_duration);
-                atomic_fetch_add(&g_opt_sealed.batches_written, ready_count);
-
-                uint64_t max_id = 0;
-                for (size_t i = 0; i < ready_count; i++) {
-                    if (ready_slots[i]->batch_id > max_id) max_id = ready_slots[i]->batch_id;
-                }
-                uint64_t cur;
-                do { cur = atomic_load(&g_opt_sealed.last_synced_batch_id);
-                } while (max_id > cur &&
-                         !atomic_compare_exchange_weak(&g_opt_sealed.last_synced_batch_id, &cur, max_id));
-
-                if (atomic_load(&running)) {
-                    for (size_t i = 0; i < ready_count; i++) {
-                        char *base = (char*)g_opt_sealed.mmap_buffer + ready_slots[i]->offset_in_mmap;
-
-                        uint32_t magic = *(uint32_t*)(base + 0);
-                        if (magic != 0x5EA1ED02) continue;
-
-                        uint32_t sz = *(uint32_t*)(base + 20);
-                        uint32_t id = *(uint32_t*)(base + 24);
-                        void *payload = base + 32;
-
-                        /* single-record promotion; batches (e.g. AOF_REC_BROKER_MSG_BATCH) are fine */
-                        AOF_append((int)id, payload, sz);
-                    }
-                }
-
-
-                /* Mark all slots as synced and free them */
-                for (size_t i = 0; i < ready_count; i++) {
-                    atomic_store(&ready_slots[i]->state, 0); /* Free */
-                }
-
-                /* Update tail */
-                atomic_store(&g_opt_sealed.sync_tail,
-                             atomic_load(&g_opt_sealed.sync_tail) + ready_count);
-
-                uint64_t nowu = now_us();
-                for (size_t i = 0; i < ready_count; i++) {
-                    double dsec = (double)(nowu - ready_slots[i]->timestamp) / 1e6; // since append
-                    hist_obs(g_seal_hist, seal_bucket_le, HN, dsec, &g_seal_count, &g_seal_sum_s);
-                }
-
-                double fs_s = ((double)sync_duration) / 1e6;
-                hist_obs(g_fsync_hist, fsync_bucket_le, HN, fs_s, &g_fsync_count, &g_fsync_sum_s);
-            } else {
-                /* Sync failed - mark slots for retry */
-                perror("Group fsync failed");
-                for (size_t i = 0; i < ready_count; i++) {
-                    atomic_store(&ready_slots[i]->state, 2); /* Keep ready */
-                }
-            }
-        } else {
-            perror("Vectored write failed");
+        if (written <= 0) {
+            perror("sealed writev failed");
+            continue;
         }
+
+        if (fsync(g_opt_sealed.fd) != 0) {
+            perror("sealed fsync failed");
+            continue;
+        }
+
+        // Update last_synced_batch_id IN ORDER (tail is monotonic)
+        uint64_t max_id = ready_slots[ready_count - 1]->batch_id;
+        atomic_store_explicit(&g_opt_sealed.last_synced_batch_id, max_id, memory_order_release);
+
+        // Mark slots free
+        for (size_t i = 0; i < ready_count; i++) {
+            atomic_store_explicit(&ready_slots[i]->state, 0, memory_order_release);
+        }
+
+        // Advance FIFO tail by the number flushed
+        atomic_store_explicit(&g_opt_sealed.slot_tail,
+                              atomic_load_explicit(&g_opt_sealed.slot_tail, memory_order_relaxed) + ready_count,
+                              memory_order_release);
+
+        double fs_s = ((double)(now_us() - sync_start)) / 1e6;
+        hist_obs(g_fsync_hist, fsync_bucket_le, HN, fs_s, &g_fsync_count, &g_fsync_sum_s);
     }
 
-    free(write_buffer);
     return NULL;
 }
 
@@ -563,46 +518,49 @@ int AOF_sealed_init(const char *path) {
     return 0;
 }
 
+static inline void sealed_wait_space(void) {
+    while (1) {
+        uint64_t h = atomic_load_explicit(&g_opt_sealed.slot_head, memory_order_acquire);
+        uint64_t t = atomic_load_explicit(&g_opt_sealed.slot_tail, memory_order_acquire);
+        if (h - t < MAX_SEALED_BATCHES) return;
+        struct timespec ts = {0, 100000}; // 100µs
+        nanosleep(&ts, NULL);
+    }
+}
+
 /* Sealed append function for AOF */
 uint64_t AOF_append_sealed(int id, const void *data, size_t sz) {
-    if (atomic_load(&g_opt_sealed.shutdown)) {
-        return 0;
-    }
+    if (atomic_load(&g_opt_sealed.shutdown)) return 0;
 
-    /* Pause while GC compacts the sealed file */
     while (atomic_load(&g_opt_sealed.gc_active)) {
-        struct timespec ts = {0, 100000}; /* 100µs */
+        struct timespec ts = {0, 100000};
         nanosleep(&ts, NULL);
     }
 
-    uint64_t batch_id = rf_fetch_add_u64_relaxed(&g_opt_sealed.next_batch_id, 1);
+    sealed_wait_space();
 
+    uint64_t batch_id = rf_fetch_add_u64_relaxed(&g_opt_sealed.next_batch_id, 1);
     uint64_t timestamp = now_us();
 
-    /* Calculate sealed record size */
-    size_t header_size = 32; /* Fixed header size */
-    size_t total_size = header_size + sz + 4; // AIDAR IT WAS + size_t total_size = header_size + sz + 8;
-    size_t aligned_size = (total_size + 511) & ~511; /* 512-byte align for O_DIRECT */
-
-    /* Reserve space in memory mapped buffer - lock-free */
-//    uint64_t write_offset = rf_fetch_add_u64_relaxed(&g_opt_sealed.write_head, aligned_size);
-//    uint32_t mmap_offset = (uint32_t)(write_offset % g_opt_sealed.mmap_size);
+    size_t total_size   = 32 + sz + 4;
+    size_t aligned_size = (total_size + 511) & ~((size_t)511);
 
     uint32_t mmap_offset = sealed_reserve_contiguous(aligned_size);
 
-    /* Get free slot - lock-free */
-    uint64_t slot_idx = atomic_fetch_add(&g_opt_sealed.slot_head, 1) % MAX_SEALED_BATCHES;
-    sealed_batch_slot_t *slot = &g_opt_sealed.slots[slot_idx];
+    uint64_t seq = atomic_fetch_add_explicit(&g_opt_sealed.slot_head, 1, memory_order_acq_rel);
+    sealed_batch_slot_t *slot = &g_opt_sealed.slots[seq % MAX_SEALED_BATCHES];
 
-    /* Write directly to memory mapped buffer */
+    // claim slot
+    int expect = 0;
+    while (!atomic_compare_exchange_weak_explicit(&slot->state, &expect, 1,
+                                                  memory_order_acq_rel, memory_order_relaxed)) {
+        expect = 0;
+        cpu_relax();
+    }
+
     char *write_ptr = (char*)g_opt_sealed.mmap_buffer + mmap_offset;
 
-    /* Header write - use memcpy for potentially unaligned stores */
-    uint32_t magic = 0x5EA1ED02;
-    uint32_t sz32 = (uint32_t)sz;
-    uint32_t id32 = (uint32_t)id;
-    uint32_t reserved = 0;
-
+    uint32_t magic = 0x5EA1ED02, sz32 = (uint32_t)sz, id32 = (uint32_t)id, reserved = 0;
     memcpy(write_ptr + 0,  &magic,     4);
     memcpy(write_ptr + 4,  &batch_id,  8);
     memcpy(write_ptr + 12, &timestamp, 8);
@@ -610,37 +568,36 @@ uint64_t AOF_append_sealed(int id, const void *data, size_t sz) {
     memcpy(write_ptr + 24, &id32,      4);
     memcpy(write_ptr + 28, &reserved,  4);
 
+    memcpy(write_ptr + 32, data, sz);
 
-    /* Copy data */
-    memcpy(write_ptr + header_size, data, sz);
+    uint32_t crc = crc32c(0, write_ptr, (unsigned)(32 + sz));
+    memcpy(write_ptr + 32 + sz, &crc, 4);
 
-//    /* Fast CRC64 calculation */
-//    uint32_t crc = crc32c(0,write_ptr, header_size + sz);
-//    *(uint32_t*)(write_ptr + header_size + sz) = crc;
-
-/* Fast CRC32C calculation over [header | payload] */
-    uint32_t crc = crc32c(0, write_ptr, (unsigned)(header_size + sz));
-    memcpy(write_ptr + header_size + sz, &crc, 4);
-
-    /* Zero-pad for O_DIRECT alignment */
     if (aligned_size > total_size) {
-//        memset(write_ptr + total_size, 0, aligned_size - total_size);
-        memset(write_ptr + total_size, 0, (size_t)(aligned_size - total_size));
+        memset(write_ptr + total_size, 0, aligned_size - total_size);
     }
 
-    /* Mark slot ready for sync */
     slot->batch_id = batch_id;
     slot->size = (uint32_t)aligned_size;
     slot->offset_in_mmap = mmap_offset;
     slot->timestamp = timestamp;
 
-    /* Memory barrier before state change */
     atomic_thread_fence(memory_order_release);
-    atomic_store(&slot->state, 2); /* Ready for sync */
+    atomic_store_explicit(&slot->state, 2, memory_order_release); // ready
 
     return batch_id;
 }
 
+
+int AOF_sealed_wait(uint64_t batch_id) {
+    while (!atomic_load(&g_opt_sealed.shutdown)) {
+        uint64_t last = atomic_load_explicit(&g_opt_sealed.last_synced_batch_id, memory_order_acquire);
+        if (last >= batch_id) return 0;
+        struct timespec ts = {0, 100000}; // 100µs
+        nanosleep(&ts, NULL);
+    }
+    return -1;
+}
 
 static inline uint32_t rd32(const void *p){ uint32_t v; memcpy(&v,p,4); return v; }
 static inline uint64_t rd64(const void *p){ uint64_t v; memcpy(&v,p,8); return v; }
