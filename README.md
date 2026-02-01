@@ -342,7 +342,7 @@ curl -X POST 'localhost:1109/broker/topics/events/produce?partition=0' \
   -d 'hello world'
 
 # Consume messages (binary-safe with base64)
-curl 'localhost:1109/broker/consume/events/mygroup/0?limit=10&encoding=b64' \
+curl 'localhost:1109/broker/consume/events/mygroup/0?offset=0' \
   -H 'Authorization: Bearer dev'
 
 # Commit offset
@@ -822,6 +822,7 @@ Errors follow a consistent format:
 ## License
 
 MIT
+
 
 
 
