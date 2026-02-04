@@ -301,7 +301,88 @@ curl -X POST 'localhost:1109/broker/topics/events/produce?partition=0' \
 ### From Source
 
 ```bash
-# Dependencies: libuv 1.51+, openssl, zlib, liburing
+# Dependencies:
+# - libuv (>= 1.51 recommended)
+# - libevent
+# - libcurl
+# - openssl (libssl + libcrypto)
+# - zlib
+# - liburing (Linux)
+# - pthreads + standard Linux headers
+
+### Ubuntu/Debian deps
+```bash
+sudo apt-get update
+sudo apt-get install -y build-essential pkg-config \
+  libuv1-dev libevent-dev libcurl4-openssl-dev libssl-dev zlib1g-dev liburing-dev
+
+…and for Alpine/musl:
+
+```md
+### Alpine (musl) deps
+```bash
+apk add --no-cache build-base linux-headers pkgconf \
+  libuv-dev libevent-dev curl-dev openssl-dev zlib-dev liburing-dev
+
+---
+
+```md
+## musl / Alpine Support
+
+Ayder supports **glibc and musl** (e.g. Alpine).  
+If you're running in containers, be aware Ayder uses **POSIX shared memory** (`/dev/shm`) for SharedStorage.
+
+### /dev/shm sizing (important)
+
+If `/dev/shm` is too small for the configured SharedStorage capacity, Ayder will exit with a clear message instead of crashing.
+
+You can control the capacity with:
+
+- `RF_SHARED_ENTRIES` (power-of-2 recommended)
+
+Examples:
+
+```bash
+# Works on small shm
+docker run --rm -it --shm-size=64m -e RF_SHARED_ENTRIES=131072 ayder:musl
+
+# Larger table (needs larger shm)
+docker run --rm -it --shm-size=256m -e RF_SHARED_ENTRIES=262144 ayder:musl
+
+# Intentionally too big (will fail gracefully with a helpful error)
+docker run --rm -it --shm-size=64m -e RF_SHARED_ENTRIES=2097152 ayder:musl
+
+If RF_SHARED_ENTRIES is not set, Ayder will auto-pick a capacity that fits the current /dev/shm.
+
+
+This directly answers the “Bus error” report and shows how to avoid it.
+
+---
+
+If you keep `Dockerfile.musl` in the repo, add:
+
+```md
+### Docker (Alpine/musl)
+
+```bash
+docker build -f Dockerfile.musl -t ayder:musl .
+
+# Default (auto-picks SharedStorage size to fit /dev/shm)
+docker run --rm -it --shm-size=64m -p 1109:1109 ayder:musl
+
+
+---
+
+## 4) Optional: add a tiny “Build flags” note (fixes warnings complaints)
+
+Under “From Source” add:
+
+```md
+Tip: if you want a stricter build during development:
+```bash
+make clean && make CFLAGS="-O2 -g -Wall -Wextra -Wshadow -Werror"
+
+
 make clean && make
 ./ayder --port 1109
 ```
@@ -822,6 +903,7 @@ Errors follow a consistent format:
 ## License
 
 MIT
+
 
 
 
