@@ -2,7 +2,7 @@
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
-#include <bits/pthreadtypes.h>
+#include <pthread.h>
 
 #define RF_MAX_TOPIC_LEN     64
 #define RF_MAX_GROUP_LEN     64
@@ -281,3 +281,4 @@ int rf_set_ttl_ms(const char *topic, int partition, uint64_t ttl_ms);
 int rf_set_ttl_ms_all(uint64_t ttl_ms);
 int rf_set_max_bytes_all(uint64_t max_bytes);
 int rf_set_max_bytes(const char *topic, int part, uint64_t max_bytes);
+
