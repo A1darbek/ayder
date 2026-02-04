@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 #####################################################################
-# 1️⃣  BUILD STAGE – tool-chain + libuv 1.51 from source + RamForge
+# 1️⃣  BUILD STAGE – tool-chain + libuv 1.51 from source + ayder
 #####################################################################
 FROM ubuntu:22.04 AS build
 ARG DEBIAN_FRONTEND=noninteractive
@@ -24,8 +24,9 @@ RUN curl -fsSL https://dist.libuv.org/dist/v${LIBUV_VERSION}/libuv-v${LIBUV_VERS
     ldconfig && \
     rm -rf /tmp/libuv*
 
-# ---- Compile RamForge ----
+# ---- Compile ayder ----
 WORKDIR /app
+
 
 # Always ensure picohttpparser exists; overlay later if repo has it
 RUN mkdir -p deps/picohttpparser && \
@@ -49,6 +50,8 @@ RUN make clean && make
 # 2️⃣  RUNTIME STAGE – minimal libs + freshly-built libuv
 #####################################################################
 FROM ubuntu:22.04 AS runtime
+RUN mkdir -p /data
+
 ARG DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update -qq && \
@@ -68,4 +71,4 @@ RUN chmod +x ./entrypoint.sh
 
 EXPOSE 1109
 ENTRYPOINT ["./entrypoint.sh"]
-CMD ["./ayder"]
+CMD ["./ayder", "--workers", "1"]
