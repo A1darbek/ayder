@@ -16,40 +16,42 @@ curl -X POST 'localhost:1109/broker/topics/orders/produce?partition=0' \
 # Consume (base64 for binary-safe payloads)
 curl 'localhost:1109/broker/consume/orders/mygroup/0?encoding=b64' \
   -H 'Authorization: Bearer dev'
-
-
 ```
+
 Looking for 2–3 design partners to try Ayder in real workloads.
 30-minute setup, white-glove onboarding. See Discussions or email me.
+
 ---
 
-Jepsen-style Smoke Test (reproducible)
+## Jepsen-style Smoke Test (reproducible)
 
 Ayder ships with a Jepsen-style failure test script you can run locally:
 
-Script: ./test_broker_v2.sh
+**Script:** `./test_broker_v2.sh`
 
-Faults: SIGKILL during writes, restart loops, optional network delay/jitter (tc netem), partitions
+**Faults:** SIGKILL during writes, restart loops, optional network delay/jitter (tc netem), partitions
 
-Checks (invariants):
+**Checks (invariants):**
+- no loss (no gaps / missing sequence)
+- no duplicates when using idempotency_key
+- per-partition order preserved
+- offsets monotonic across restarts and commits
 
-no loss (no gaps / missing sequence)
-
-no duplicates when using idempotency_key
-
-per-partition order preserved
-
-offsets monotonic across restarts and commits
-
-Run it
+**Run it:**
+```bash
 chmod +x test_broker_v2.sh
 ./test_broker_v2.sh
+```
 
-If everything is working correctly, you’ll see:
+If everything is working correctly, you'll see:
 
+```
 BROKER SMOKE TEST: ALL GREEN ✅
+```
 
 If it fails, please paste the summary + logs in an Issue — reproducible correctness bugs are the top priority.
+
+---
 
 ## Why Ayder?
 
@@ -278,7 +280,7 @@ No manual intervention. No partition reassignment. No ISR drama.
 ### Docker (fastest)
 
 ```bash
-# Clone and run with Docker Compose (includes Prometheus + Grafana)
+# Clone and run with Docker Compose
 git clone https://github.com/A1darbek/ayder.git
 cd ayder
 docker compose up -d --build
@@ -310,23 +312,27 @@ curl -X POST 'localhost:1109/broker/topics/events/produce?partition=0' \
 # - liburing (Linux)
 # - pthreads + standard Linux headers
 
-### Ubuntu/Debian deps
-```bash
+# Ubuntu/Debian
 sudo apt-get update
 sudo apt-get install -y build-essential pkg-config \
   libuv1-dev libevent-dev libcurl4-openssl-dev libssl-dev zlib1g-dev liburing-dev
 
-…and for Alpine/musl:
-
-```md
-### Alpine (musl) deps
-```bash
+# Alpine (musl)
 apk add --no-cache build-base linux-headers pkgconf \
   libuv-dev libevent-dev curl-dev openssl-dev zlib-dev liburing-dev
 
+# Build
+make clean && make
+./ayder --port 1109
+```
+
+**Optional: Stricter build for development**
+```bash
+make clean && make CFLAGS="-O2 -g -Wall -Wextra -Wshadow -Werror"
+```
+
 ---
 
-```md
 ## musl / Alpine Support
 
 Ayder supports **glibc and musl** (e.g. Alpine).  
@@ -351,17 +357,10 @@ docker run --rm -it --shm-size=256m -e RF_SHARED_ENTRIES=262144 ayder:musl
 
 # Intentionally too big (will fail gracefully with a helpful error)
 docker run --rm -it --shm-size=64m -e RF_SHARED_ENTRIES=2097152 ayder:musl
+```
 
-If RF_SHARED_ENTRIES is not set, Ayder will auto-pick a capacity that fits the current /dev/shm.
+If `RF_SHARED_ENTRIES` is not set, Ayder will auto-pick a capacity that fits the current `/dev/shm`.
 
-
-This directly answers the “Bus error” report and shows how to avoid it.
-
----
-
-If you keep `Dockerfile.musl` in the repo, add:
-
-```md
 ### Docker (Alpine/musl)
 
 ```bash
@@ -369,30 +368,14 @@ docker build -f Dockerfile.musl -t ayder:musl .
 
 # Default (auto-picks SharedStorage size to fit /dev/shm)
 docker run --rm -it --shm-size=64m -p 1109:1109 ayder:musl
-
+```
 
 ---
-
-## 4) Optional: add a tiny “Build flags” note (fixes warnings complaints)
-
-Under “From Source” add:
-
-```md
-Tip: if you want a stricter build during development:
-```bash
-make clean && make CFLAGS="-O2 -g -Wall -Wextra -Wshadow -Werror"
-
-
-make clean && make
-./ayder --port 1109
-```
 
 ### Docker Compose Stack
 
 The included `docker-compose.yml` brings up:
 - **Ayder** on port `1109`
-- **Prometheus** on port `9090` (metrics scraping)
-- **Grafana** on port `3000` (dashboards, default password: `admin`)
 
 ```yaml
 # docker-compose.yml
@@ -402,8 +385,6 @@ services:
     ports:
       - "1109:1109"
     shm_size: 2g
-    environment:
-      - RF_BEARER_TOKENS=dev
 ```
 
 ---
@@ -457,8 +438,6 @@ Ayder acknowledges writes in two modes:
 | **Rocket** | Zero | `false` | In-memory fast path, not persisted |
 
 Use `timeout_ms` to wait for sync confirmation.
-
-
 
 ---
 
@@ -903,12 +882,3 @@ Errors follow a consistent format:
 ## License
 
 MIT
-
-
-
-
-
-
-
-
-
