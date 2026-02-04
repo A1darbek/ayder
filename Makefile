@@ -1,18 +1,18 @@
 CC=gcc
-CFLAGS=-O3 -g -I./include -Ideps/picohttpparser -luv -lz -pipe -flto -march=native \
-          -ffunction-sections \
-          -DNDEBUG -DHTTP_SERVER_FAST \
-          -Wall -Wextra -Wshadow -Wdouble-promotion -luring -lm -lcurl -lssl -lcrypto
+CPPFLAGS=-I./include -Ideps/picohttpparser -DHTTP_SERVER_FAST -DNDEBUG
+CFLAGS=-O3 -g -pipe -flto -march=native -ffunction-sections -Wall -Wextra -Wshadow -Wdouble-promotion
+LDFLAGS=-flto
+LDLIBS=-luv -levent -lz -luring -lm -lcurl -lssl -lcrypto
 
 SRC=$(wildcard src/*.c) deps/picohttpparser/picohttpparser.c
 OBJ=$(SRC:.c=.o)
 EXEC=ayder
 
 %.o: %.c
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 $(EXEC): $(OBJ)
-	$(CC) $(OBJ) -o $@ $(CFLAGS)
+	$(CC) $(OBJ) -o $@ $(LDFLAGS) $(LDLIBS)
 
 debug: $(EXEC)
 	gdb ./$(EXEC)
