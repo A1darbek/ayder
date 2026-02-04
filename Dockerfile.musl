@@ -61,4 +61,5 @@ ENTRYPOINT ["./entrypoint.sh"]
 # Otherwise, comment ENTRYPOINT above and use:
 # ENTRYPOINT ["./ayder"]
 
-CMD ["./ayder", "--workers", "4"]
+CMD ["./ayder", "--workers", "1"]
+
