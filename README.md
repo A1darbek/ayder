@@ -7,6 +7,13 @@ Single binary. HTTP API. `curl` works as a client. No JVM, no ZooKeeper, no clie
 ▶️ **1-minute demo: SIGKILL → restart → data still there**
 https://www.youtube.com/watch?v=c-n0X5t-A9Y
 
+**Live durability sandbox: SIGKILL → restart → committed offsets still correct**  
+Per-visitor container + persisted `/data` volume: https://ayder.xyz/invite  
+Tip: On the sandbox page, click **Run double proof** — it will produce events, SIGKILL the process, restart, then return a JSON proof showing:
+- the last committed offset before kill
+- the first offset consumed after restart
+- confirmation that commits persisted across restart
+
 ```bash
 # Produce (raw bytes in body)
 curl -X POST 'localhost:1109/broker/topics/orders/produce?partition=0' \
@@ -882,3 +889,4 @@ Errors follow a consistent format:
 ## License
 
 MIT
+
