@@ -6,7 +6,7 @@
 ############################
 # 1) BUILD (musl)
 ############################
-FROM alpine:3.20 AS build
+FROM alpine:3.23 AS build
 
 RUN apk add --no-cache \
     build-base linux-headers \
@@ -32,12 +32,12 @@ RUN mkdir -p deps/picohttpparser && \
         -o deps/picohttpparser/picohttpparser.h ; \
     fi
 
-RUN make clean && make
+RUN make clean && make CFLAGS="-O3 -g -pipe -flto -ffunction-sections -Wall -Wextra -Wshadow -Wdouble-promotion"
 
 ############################
 # 2) RUNTIME (musl)
 ############################
-FROM alpine:3.20 AS runtime
+FROM alpine:3.23 AS runtime
 
 RUN apk add --no-cache \
     ca-certificates \
@@ -58,8 +58,4 @@ EXPOSE 1109
 
 # If you have entrypoint.sh and want it:
 ENTRYPOINT ["./entrypoint.sh"]
-# Otherwise, comment ENTRYPOINT above and use:
-# ENTRYPOINT ["./ayder"]
-
 CMD ["./ayder", "--workers", "1"]
-
