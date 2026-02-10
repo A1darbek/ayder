@@ -15,7 +15,6 @@
 #include "ramforge_rotation_metrics.h"
 #include "log.h"
 #include "aof_batch.h"
-#include "zero_pause_rdb.h"
 #include "metrics_shared.h"
 #include <fcntl.h>
 #include <dlfcn.h>
@@ -718,3 +717,4 @@ void RAMForge_export_prometheus_metrics_buffer(char *buffer, size_t capacity) {
     if (buf.capacity > 0)
         buf.buffer[(buf.length < buf.capacity) ? buf.length : buf.capacity - 1] = '\0';
 }
+
