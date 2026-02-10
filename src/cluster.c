@@ -278,7 +278,7 @@ int start_cluster_with_args(int port, int argc, char **argv) {
 
     /* FIXED - if caller requests 0 workers, run a single worker in-process */
     if (worker_count == 0) {
-        printf("🚀 Single-process mode (no cluster manager)\n");
+        printf("Single-process mode (no cluster manager)\n");
         single_process_mode = 1;
         run_worker(0, port);
         /* run_worker never returns */
@@ -292,7 +292,7 @@ int start_cluster_with_args(int port, int argc, char **argv) {
         return -1;
     }
 
-    printf("🚀 Starting Ayder with %d worker%s on port %d\n",
+    printf("Starting Ayder with %d worker%s on port %d\n",
            worker_count, worker_count==1?"":"s", port);
 
     manager_pid = getpid();
@@ -327,7 +327,7 @@ int start_cluster_with_args(int port, int argc, char **argv) {
     }
 
 
-    printf("\n🌟 All workers live – monitoring … (Ctrl-C to stop)\n\n");
+    printf("\n All workers live – monitoring … (Ctrl-C to stop)\n\n");
     /* monitor loop */
     while(!cluster_shutdown){
         int st; pid_t dead=waitpid(-1,&st,WNOHANG);
@@ -387,4 +387,5 @@ int start_cluster_with_args(int port, int argc, char **argv) {
 
 int start_cluster(int port){
     return start_cluster_with_args(port,0,NULL);
+
 }
