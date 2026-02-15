@@ -19,8 +19,8 @@ static pthread_t g_ha_thread;
 static _Atomic int g_ha_running = 0;
 static _Atomic int g_ha_enabled = 0;
 
-#define HA_SNAPSHOT_KEY ((0xA1ULL << 32) | 0x40001ULL)
-#define SHMEM_HA_KEY 0xA001337
+#define HA_SNAPSHOT_KEY ((int)0x7F004001)   /* < INT_MAX */
+#define SHMEM_HA_KEY    ((int)0x0A001337)
 
 // any nonzero int is fine & stable
 // ═══════════════════════════════════════════════════════════════════════════════
