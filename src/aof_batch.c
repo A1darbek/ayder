@@ -388,21 +388,22 @@ static void *sealed_sync_thread(void *arg) {
             continue;
         }
 
-        uint64_t head = atomic_load_explicit(&g_opt_sealed.slot_head, memory_order_acquire);
-        uint64_t tail = atomic_load_explicit(&g_opt_sealed.slot_tail, memory_order_acquire);
+        uint64_t h = atomic_load_explicit(&g_opt_sealed.slot_head, memory_order_acquire);
+        uint64_t t = atomic_load_explicit(&g_opt_sealed.slot_tail, memory_order_acquire);
 
         size_t ready_count = 0;
 
-        while (tail < head && ready_count < SEALED_BATCH_GROUP_SIZE) {
-            sealed_batch_slot_t *slot = &g_opt_sealed.slots[tail % MAX_SEALED_BATCHES];
+        while (t < h && ready_count < SEALED_BATCH_GROUP_SIZE) {
+            sealed_batch_slot_t *slot = &g_opt_sealed.slots[t % MAX_SEALED_BATCHES];
 
-            if (atomic_load_explicit(&slot->state, memory_order_acquire) != 2) break; // not ready yet
+            if (atomic_load_explicit(&slot->state, memory_order_acquire) != 2)
+                break;
 
             ready_slots[ready_count] = slot;
             iovecs[ready_count].iov_base = (char*)g_opt_sealed.mmap_buffer + slot->offset_in_mmap;
             iovecs[ready_count].iov_len  = slot->size;
             ready_count++;
-            tail++;
+            t++;
         }
 
         if (ready_count == 0) {
@@ -412,30 +413,19 @@ static void *sealed_sync_thread(void *arg) {
         }
 
         uint64_t sync_start = now_us();
+
         ssize_t written = writev(g_opt_sealed.fd, iovecs, (int)ready_count);
-        if (written <= 0) {
-            perror("sealed writev failed");
-            continue;
-        }
+        if (written <= 0) { perror("sealed writev failed"); continue; }
 
-        if (fsync(g_opt_sealed.fd) != 0) {
-            perror("sealed fsync failed");
-            continue;
-        }
+        if (fsync(g_opt_sealed.fd) != 0) { perror("sealed fsync failed"); continue; }
 
-        // Update last_synced_batch_id IN ORDER (tail is monotonic)
         uint64_t max_id = ready_slots[ready_count - 1]->batch_id;
         atomic_store_explicit(&g_opt_sealed.last_synced_batch_id, max_id, memory_order_release);
 
-        // Mark slots free
-        for (size_t i = 0; i < ready_count; i++) {
+        for (size_t i = 0; i < ready_count; i++)
             atomic_store_explicit(&ready_slots[i]->state, 0, memory_order_release);
-        }
 
-        // Advance FIFO tail by the number flushed
-        atomic_store_explicit(&g_opt_sealed.slot_tail,
-                              atomic_load_explicit(&g_opt_sealed.slot_tail, memory_order_relaxed) + ready_count,
-                              memory_order_release);
+        atomic_store_explicit(&g_opt_sealed.slot_tail, t, memory_order_release);
 
         double fs_s = ((double)(now_us() - sync_start)) / 1e6;
         hist_obs(g_fsync_hist, fsync_bucket_le, HN, fs_s, &g_fsync_count, &g_fsync_sum_s);
@@ -715,66 +705,65 @@ size_t AOF_sealed_replay(const char *aof_path) {
     char path[1024];
     snprintf(path, sizeof(path), "%s.sealed", aof_path ? aof_path : "./append.aof");
 
-    int fd = open(path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) {
+    int local_fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (local_fd < 0) {
         if (errno != ENOENT)
             fprintf(stderr, "AOF_sealed_replay: open(%s): %s\n", path, strerror(errno));
         return 0;
     }
 
     struct stat st;
-    if (fstat(fd, &st) != 0 || st.st_size == 0) { close(fd); return 0; }
+    if (fstat(local_fd, &st) != 0 || st.st_size == 0) {
+        close(local_fd);
+        return 0;
+    }
 
-    size_t applied = 0, bad = 0, skipped = 0;
     const size_t fsz = (size_t)st.st_size;
 
-    // Read whole file into memory once (simple and fast; fsz is usually small)
     uint8_t *buf = malloc(fsz);
-    if (!buf) { close(fd); return 0; }
-    ssize_t r = read(fd, buf, fsz);
-    close(fd);
-    if (r != (ssize_t)fsz) { free(buf); return 0; }
+    if (!buf) {
+        close(local_fd);
+        return 0;
+    }
+
+    ssize_t r = read(local_fd, buf, fsz);
+    close(local_fd);
+    if (r != (ssize_t)fsz) {
+        free(buf);
+        return 0;
+    }
+
+    size_t applied = 0, bad = 0, skipped = 0;
 
     const uint8_t *p = buf, *end = buf + fsz;
     while (p + 32 <= end) {
-        // v2 header layout (32 bytes):
-        //  0: u32 magic (0x5EA1ED02)
-        //  4: u64 batch_id
-        // 12: u64 timestamp
-        // 20: u32 size        (payload length)
-        // 24: u32 id          (AOF_REC_* value)
-        // 28: u32 reserved    (0)
         const uint32_t magic = rd32(p + 0);
         if (magic != 0x5EA1ED02) {
-            // Try to re-synchronize to next 512 boundary (file is 512-aligned chunks)
-            const uintptr_t cur = (uintptr_t)(p - buf);
+            const uintptr_t cur  = (uintptr_t)(p - buf);
             const uintptr_t next = (cur + 511u) & ~((uintptr_t)511u);
             if (next <= (uintptr_t)fsz) p = buf + next; else break;
-            skipped++; continue;
+            skipped++;
+            continue;
         }
 
-        const uint64_t batch_id = rd64(p + 4);
-        (void)batch_id;
-        const uint32_t sz = rd32(p + 20);
+        const uint32_t sz     = rd32(p + 20);
         const uint32_t rec_id = rd32(p + 24);
 
         const uint8_t *payload = p + 32;
         if (payload + sz + 4 > end) { bad++; break; }
 
-        // CRC over header(32)+payload(sz); stored crc is the last 4 bytes
         const uint32_t crc_file = rd32(payload + sz);
-        uint32_t crc = crc32c(0, p, 32 + sz);
-        if (crc != crc_file) {
+        const uint32_t crc_calc = crc32c(0, p, 32 + sz);
+
+        if (crc_calc != crc_file) {
             fprintf(stderr, "AOF_sealed_replay: CRC mismatch (id=%u, sz=%u)\n", rec_id, sz);
             bad++;
         } else {
-            // Apply into broker in-memory state
-            rf_broker_replay_aof(rec_id, payload, sz);
+            rf_broker_replay_aof((int)rec_id, payload, sz);
             applied++;
         }
 
-        // Advance by 512-aligned chunk
-        size_t total = 32 + (size_t)sz + 4;
+        size_t total   = 32 + (size_t)sz + 4;
         size_t aligned = (total + 511) & ~((size_t)511);
         p += aligned;
     }
@@ -855,6 +844,11 @@ static int init_io_uring(void) {
 
 
     int ret = io_uring_queue_init_params(URING_QUEUE_DEPTH, &g_uring_ctx.ring, &params);
+    if (ret < 0) {
+        fprintf(stderr, "io_uring_queue_init_params failed: %s\n", strerror(-ret));
+        atomic_store(&g_uring_ctx.initialized, false);
+        return -1;
+    }
 
     if (pthread_mutex_init(&g_uring_ctx.submit_lock, NULL) != 0) {
         io_uring_queue_exit(&g_uring_ctx.ring);
@@ -1281,7 +1275,6 @@ static void *writer_thread(void *arg) {
                 /* Batch processing */
                 size_t batch_count = 0;
                 size_t total_batch_size = 0;
-                aof_cmd_t batch_cmds[BATCH_SIZE];
 
                 while (head != tail && batch_count < BATCH_SIZE && is_fd_valid(fd)) {
                     aof_cmd_t *c = &ring[tail];
@@ -1290,7 +1283,6 @@ static void *writer_thread(void *arg) {
                     size_t record_size = write_record_to_buffer(
                             batch_buffer + total_batch_size, c->id, c->data, c->sz);
 
-                    batch_cmds[batch_count] = *c;
                     total_batch_size += record_size;
                     batch_count++;
 
@@ -1368,13 +1360,13 @@ static void *writer_thread(void *arg) {
 
 /* ─── Segment rewrite (unchanged but optimized) ─────────── */
 static void dump_record_cb(int id, const void *data, size_t sz, void *ud) {
-    int fd = (int)(intptr_t)ud;
+    int out_fd  = (int)(intptr_t)ud;
 
     /* Use pre-allocated buffer for record writing */
     char record_buf[12 + MAX_BUFFER_SIZE];
     size_t record_size = write_record_to_buffer(record_buf, id, data, (uint32_t)sz);
 
-    ssize_t written = write(fd, record_buf, record_size);
+    ssize_t written = write(out_fd , record_buf, record_size);
     if (written != (ssize_t)record_size) {
         fprintf(stderr, "Write error in dump_record_cb\n");
     }
@@ -2073,8 +2065,8 @@ static void *aof_live_tail_loop(void *arg) {
     ino_t cur_ino = 0;
     off_t off = 0;
 
-    size_t cap = 1 << 20;                  // 1MB staging buffer
-    uint8_t *buf = malloc(cap);
+    size_t buf_cap = 1 << 20;   // 1MB
+    uint8_t *buf = malloc(buf_cap);
     size_t have = 0;
 
     // Initial open (may spin until file appears)
