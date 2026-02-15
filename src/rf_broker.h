@@ -281,4 +281,3 @@ int rf_set_ttl_ms(const char *topic, int partition, uint64_t ttl_ms);
 int rf_set_ttl_ms_all(uint64_t ttl_ms);
 int rf_set_max_bytes_all(uint64_t max_bytes);
 int rf_set_max_bytes(const char *topic, int part, uint64_t max_bytes);
-
