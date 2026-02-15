@@ -40,7 +40,7 @@ void AOF_append(int id, const void *data, size_t sz);
 
 /// Flush any pending entries, stop the writer thread, close the file.
 void AOF_shutdown(void);
-
+int AOF_sealed_wait(uint64_t batch_id);
 /* Asynchronous rewrite: returns 0 if launch OK, -1 otherwise */
 int AOF_begin_rewrite(const char *source_path);
 
