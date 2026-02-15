@@ -41,6 +41,8 @@
 #define AOF_REC_BROKER_MSG_BATCH 0x4242
 #define IDEMP_BUCKETS 1024
 
+
+
 static inline size_t align_up_sz(size_t x, size_t a) {
     return (x + (a - 1)) & ~(a - 1);
 }
@@ -111,9 +113,10 @@ static inline uint64_t normalize_persisted_ts_us(uint64_t ts_us, uint16_t reserv
 }
 
 
-static void rf_ttl_apply_to_partition(rf_partition_t *p, uint64_t ttl_ms) {
-    uint64_t win = ttl_ms ? (ttl_ms * 1000ULL) : 0;
-    atomic_store_explicit(&p->ttl_window_us, win, memory_order_release);
+static inline void rf_ttl_apply_to_partition(rf_partition_t *p, uint64_t ttl_ms) {
+    uint64_t us = ttl_ms ? (ttl_ms * 1000ULL) : 0;
+    atomic_store_explicit(&p->ttl_ms, us, memory_order_release);
+    atomic_store_explicit(&p->ttl_window_us, us, memory_order_release);
 }
 
 static inline uint64_t slot_payload_bytes(const rf_msg_slot_t *s) {
@@ -688,9 +691,7 @@ int rf_set_ttl_ms(const char *topic, int part, uint64_t ttl_ms) {
     for (int i = p0; i < p1; i++) {
         rf_partition_t *rp = &t->parts[i];
         /* set both: fixed TTL (other paths) and rolling window (read path) */
-        uint64_t us = ttl_ms ? ttl_ms * 1000ULL : 0;
-        atomic_store_explicit(&rp->ttl_ms, us, memory_order_release);
-        atomic_store_explicit(&rp->ttl_window_us, us, memory_order_release);
+        rf_ttl_apply_to_partition(rp, ttl_ms);
 
         /* opportunistic sweep of a window (optional) */
         rf_msg_slot_t *ring = atomic_load_explicit(&rp->ring, memory_order_acquire);
@@ -1069,6 +1070,7 @@ int rf_produce_sealed(const char *topic, int partition,
 size_t rf_consume(const char *topic, const char *group, int partition,
                   uint64_t from_exclusive, size_t max_msgs,
                   rf_msg_view_t *out, size_t out_cap, uint64_t *next_offset_out) {
+    (void)group;
     rf_topic_t *t = find_topic_lockfree(topic, rf_topic_id(topic));
     if (!t || partition < 0 || partition >= t->partitions) return 0;
     rf_partition_t *p = &t->parts[partition];
@@ -1544,9 +1546,6 @@ void rf_broker_shutdown(void) {
         rf_topic_t *topic = &g_topics[i];
         for (int p = 0; p < topic->partitions; p++) {
             rf_partition_t *part = &topic->parts[p];
-
-            // Wait for all operations to complete
-            uint64_t write_head = atomic_load_explicit(&part->write_head, memory_order_acquire);
 
             // Clean up ring buffer
             rf_msg_slot_t *ring = atomic_exchange_explicit(&part->ring, NULL, memory_order_acq_rel);
