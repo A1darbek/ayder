@@ -11,7 +11,8 @@ RUN apt-get update -qq && \
     apt-get install -y --no-install-recommends \
         build-essential curl ca-certificates \
         autotools-dev automake libtool pkg-config \
-        dmsetup util-linux zlib1g-dev liburing-dev libcurl4-openssl-dev libssl-dev && \
+        dmsetup util-linux zlib1g-dev liburing-dev libcurl4-openssl-dev libssl-dev \
+        libevent-dev && \
     rm -rf /var/lib/apt/lists/*
 
 # ---- Build & install libuv 1.51 ----
@@ -56,7 +57,8 @@ ARG DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update -qq && \
     apt-get install -y --no-install-recommends \
-        dmsetup util-linux zlib1g liburing2 && \
+        dmsetup util-linux zlib1g liburing2 \
+        ca-certificates libcurl4 libssl3 libevent-2.1-7 && \
     rm -rf /var/lib/apt/lists/*
 
 # copy our glibc-compatible libuv
