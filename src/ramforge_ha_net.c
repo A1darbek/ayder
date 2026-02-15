@@ -130,9 +130,9 @@ static void handle_append_entries(const ha_msg_header_t *h, const void *pl, size
         AOF_append_sealed(e->type, e->data, e->size);
         last_idx = e->index;
         p += need;
-            fprintf(stderr, "[HA-APPLY->BUS] rec_type=0x%x size=%u idx=%lu\n",
-                    e->type, e->size, e->index);
 
+        fprintf(stderr, "[HA-APPLY->BUS] rec_type=0x%x size=%u idx=%lu\n",
+                e->type, e->size, e->index);
     }
 
     /* advance only to what we actually applied; commit cannot exceed applied */
