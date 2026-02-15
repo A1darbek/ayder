@@ -114,16 +114,15 @@ static int parse_node_list(ha_config_t *config) {
 }
 // Find local node index based on RF_HA_NODE_ID
 static int find_local_node(ha_config_t *config) {
+    char local_buf[256];
     const char *local_id = getenv("RF_HA_NODE_ID");
     if (!local_id || !*local_id) {
-        // Try to use hostname as fallback
-        char hostname[256];
-        if (gethostname(hostname, sizeof(hostname)) == 0) {
-            local_id = hostname;
-        } else {
+        if (gethostname(local_buf, sizeof(local_buf)) != 0) {
             fprintf(stderr, "❌ RF_HA_NODE_ID not set and hostname unavailable\n");
             return -1;
         }
+        local_buf[sizeof(local_buf) - 1] = 0;
+        local_id = local_buf;
     }
 
     for (int i = 0; i < config->node_count; i++) {
@@ -289,65 +288,4 @@ uint64_t HA_get_replication_lag_ms(const ha_runtime_t *runtime) {
 
     // Rough estimate: assume 1ms per entry lag
     return (commit - applied);
-}
-
-void HA_export_metrics(const ha_config_t *config, const ha_runtime_t *runtime,
-                       char *buf, size_t cap) {
-    char *p = buf, *end = buf + cap;
-
-#define APP(...) do { \
-        int n = snprintf(p, (size_t)(end-p), __VA_ARGS__); \
-        if (n < 0) n = 0; \
-        p += (n < (end-p) ? n : (int)(end-p)); \
-    } while(0)
-
-    ha_role_t role = atomic_load(&runtime->role);
-    ha_state_t state = atomic_load(&runtime->state);
-
-    APP("# HELP ramforge_ha_role Current HA role (0=leader, 1=follower, 2=candidate, 3=learner)\n");
-    APP("# TYPE ramforge_ha_role gauge\n");
-    APP("ramforge_ha_role %d\n", role);
-
-    APP("# HELP ramforge_ha_state Current HA state (0=init, 1=ready, 2=syncing, 3=degraded, 4=failed)\n");
-    APP("# TYPE ramforge_ha_state gauge\n");
-    APP("ramforge_ha_state %d\n", state);
-
-    APP("# HELP ramforge_ha_term Current election term\n");
-    APP("# TYPE ramforge_ha_term counter\n");
-    APP("ramforge_ha_term %lu\n", atomic_load(&runtime->term));
-
-    APP("# HELP ramforge_ha_commit_index Highest committed log index\n");
-    APP("# TYPE ramforge_ha_commit_index counter\n");
-    APP("ramforge_ha_commit_index %lu\n", atomic_load(&runtime->commit_index));
-
-    APP("# HELP ramforge_ha_applied_index Highest applied log index\n");
-    APP("# TYPE ramforge_ha_applied_index counter\n");
-    APP("ramforge_ha_applied_index %lu\n", atomic_load(&runtime->applied_index));
-
-    uint64_t lag_ms = HA_get_replication_lag_ms(runtime);
-    APP("# HELP ramforge_ha_replication_lag_ms Replication lag in milliseconds\n");
-    APP("# TYPE ramforge_ha_replication_lag_ms gauge\n");
-    APP("ramforge_ha_replication_lag_ms %lu\n", lag_ms);
-
-    APP("# HELP ramforge_ha_elections_total Total elections started\n");
-    APP("# TYPE ramforge_ha_elections_total counter\n");
-    APP("ramforge_ha_elections_total %lu\n", atomic_load(&runtime->elections_started));
-
-    APP("# HELP ramforge_ha_heartbeats_sent_total Heartbeats sent\n");
-    APP("# TYPE ramforge_ha_heartbeats_sent_total counter\n");
-    APP("ramforge_ha_heartbeats_sent_total %lu\n", atomic_load(&runtime->heartbeats_sent));
-
-    APP("# HELP ramforge_ha_heartbeats_received_total Heartbeats received\n");
-    APP("# TYPE ramforge_ha_heartbeats_received_total counter\n");
-    APP("ramforge_ha_heartbeats_received_total %lu\n", atomic_load(&runtime->heartbeats_received));
-
-    APP("# HELP ramforge_ha_writes_replicated_total Writes successfully replicated\n");
-    APP("# TYPE ramforge_ha_writes_replicated_total counter\n");
-    APP("ramforge_ha_writes_replicated_total %lu\n", atomic_load(&runtime->writes_replicated));
-
-    APP("# HELP ramforge_ha_writes_failed_total Writes that failed replication\n");
-    APP("# TYPE ramforge_ha_writes_failed_total counter\n");
-    APP("ramforge_ha_writes_failed_total %lu\n", atomic_load(&runtime->writes_failed));
-
-#undef APP
 }
