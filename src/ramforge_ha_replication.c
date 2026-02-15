@@ -361,18 +361,6 @@ static int connect_to_peer(int peer_index) {
     return fd;
 }
 
-// Clean up connection - called on send failure
-static void cleanup_peer_connection(int peer_index, int expected_fd) {
-    if (peer_index < 0 || peer_index >= HA_MAX_NODES) return;
-
-    peer_conn_t *conn = &g_peer_conns[peer_index];
-
-    pthread_mutex_lock(&conn->lock);
-    if (expected_fd < 0 || conn->fd == expected_fd) {
-        cleanup_peer_connection_locked(conn);
-    }
-    pthread_mutex_unlock(&conn->lock);
-}
 
 int send_message(int peer_index, ha_msg_header_t *header,
                  const void *payload, size_t payload_size) {
