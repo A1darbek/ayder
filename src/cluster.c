@@ -139,6 +139,8 @@ static App* init_worker_systems(int wid) {
     }
 
     rf_broker_init(/*ring_per_partition*/ 0, /*default_partitions*/ 8);
+
+    rf_bus_start_promoter();
     // Initialize persistence based on AOF mode
     int aof_enabled = (g_aof_mode > 0) ? 1 : 0;
     if (aof_enabled) {
@@ -154,9 +156,6 @@ static App* init_worker_systems(int wid) {
         // IMPORTANT: Pass LOCAL storage to persistence (for AOF recovery)
         // but your HTTP handlers will use shared storage for live data
         Persistence_zp_init( aof, &storage, enhanced_flush_ms);
-
-        /* start in-memory cross-worker promoter */
-        rf_bus_start_promoter();
         if (single_process_mode || wid == 0) {
             printf("✓ AOF persistence enabled (flush_ms=%u)\n", enhanced_flush_ms);
             printf("   Ring capacity: 128K entries\n");
@@ -327,7 +326,7 @@ int start_cluster_with_args(int port, int argc, char **argv) {
     }
 
 
-    printf("\n All workers live – monitoring … (Ctrl-C to stop)\n\n");
+    printf("\n🌟 All workers live – monitoring … (Ctrl-C to stop)\n\n");
     /* monitor loop */
     while(!cluster_shutdown){
         int st; pid_t dead=waitpid(-1,&st,WNOHANG);
@@ -387,5 +386,4 @@ int start_cluster_with_args(int port, int argc, char **argv) {
 
 int start_cluster(int port){
     return start_cluster_with_args(port,0,NULL);
-
 }
