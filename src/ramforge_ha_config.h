@@ -138,8 +138,6 @@ const char* HA_get_leader_url(const ha_config_t *config);
 // Get current replication lag in milliseconds
 uint64_t HA_get_replication_lag_ms(const ha_runtime_t *runtime);
 
-// Export metrics for monitoring
-void HA_export_metrics(const ha_config_t *config, const ha_runtime_t *runtime,
-                       char *buf, size_t cap);
+
 
 #endif // RAMFORGE_HA_CONFIG_H
