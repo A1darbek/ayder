@@ -1151,11 +1151,6 @@ static void process_request(connection_ctx_t* ctx) {
     send_response(ctx, response_json, response_len, status_code);
 
     cleanup:
-    // (your existing cleanup / latency histogram block stays the same)
-    uint64_t elapsed = get_time_ns() - ctx->start_time_ns;
-    if (unlikely(elapsed > 50000)) {
-        uint64_t us = elapsed / 1000;
-    }
     if (ctx->keep_alive) {
         ctx->request_len = 0;
         ctx->first_byte_us = 0;
@@ -1290,7 +1285,7 @@ static int parse_http_request(connection_ctx_t* ctx, const char* data, size_t le
             for (;;){
                 if (ctx->chunk_state == 0){
                     // read hex size until CRLF
-                    size_t p = ctx->cursor, s = 0; int have_crlf = 0; size_t size = 0; int any = 0;
+                    size_t p = ctx->cursor; int have_crlf = 0; size_t size = 0; int any = 0;
                     // scan until \r\n
                     while (p+1 < end){
                         if (ctx->request_buf[p] == '\r' && ctx->request_buf[p+1] == '\n'){
