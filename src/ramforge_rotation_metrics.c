@@ -13,7 +13,6 @@
 #include <inttypes.h>
 #include <libgen.h>
 #include "ramforge_rotation_metrics.h"
-#include "log.h"
 #include "aof_batch.h"
 #include "metrics_shared.h"
 #include <fcntl.h>
@@ -332,6 +331,8 @@ static RotationReason should_rotate_aof(void) {
     return ROTATION_NONE;
 }
 
+
+static int (*AOF_rotate_file_safe)(const char *) = NULL;
 static void execute_aof_rotation(RotationReason reason) {
     pthread_mutex_lock(&g_rotation_lock);
 
@@ -365,14 +366,13 @@ static void execute_aof_rotation(RotationReason reason) {
     strftime(ts, sizeof(ts), "%Y%m%d%H%M%S", localtime(&now));
     snprintf(ts_path, sizeof(ts_path), "%s_%s", g_aof_base_path, ts);
 
-    /* Use safe rotation if available, fallback to original */
+
     int rotation_result;
-    if (AOF_rotate_file) {  /* Function pointer check */
-        rotation_result = AOF_rotate_file(ts_path);
+    if (AOF_rotate_file_safe) {
+        rotation_result = AOF_rotate_file_safe(ts_path);
     } else {
         rotation_result = AOF_rotate_file(ts_path);
     }
-
     if (rotation_result != 0) {
         fprintf(stderr, "❌ AOF rotation failed\n");
         atomic_fetch_add(&g_metrics.rotation_failures, 1);
@@ -492,7 +492,6 @@ static void enhanced_metrics_timer_cb(uv_timer_t *timer) {
     }
 }
 
-static int (*AOF_rotate_file_safe)(const char *) = NULL;
 
 void RAMForge_rotation_init(const char *rdb_base_path, const char *aof_base_path) {
     g_is_rotation_manager = 1;
@@ -638,7 +637,6 @@ void RAMForge_cleanup_rotation_system(void) {
 void RAMForge_export_prometheus_metrics_buffer(char *buffer, size_t capacity) {
     metrics_buffer_t buf;
     metrics_buf_init(&buf, buffer, capacity);
-    uint64_t total_ops = atomic_load(&g_metrics.total_operations);
 
     metrics_buf_printf(&buf, "# HELP ayder_aof_files_total Current AOF segment count\n");
     metrics_buf_printf(&buf, "# TYPE ayder_aof_files_total gauge\n");
@@ -717,4 +715,3 @@ void RAMForge_export_prometheus_metrics_buffer(char *buffer, size_t capacity) {
     if (buf.capacity > 0)
         buf.buffer[(buf.length < buf.capacity) ? buf.length : buf.capacity - 1] = '\0';
 }
-
