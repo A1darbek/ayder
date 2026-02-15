@@ -196,7 +196,7 @@ void slab_init(void) {
 
     // Initialize fast lookup table
     memset(class_lookup, -1, sizeof(class_lookup));
-    for (int i = 0; i < (int)NUM_CLASSES; i++) {
+    for (size_t i = 0; i < NUM_CLASSES; i++) {
         if (i == 0) {
             for (size_t j = 0; j <= size_classes[0] && j < LOOKUP_TABLE_SIZE; j++) {
                 class_lookup[j] = (int8_t)i;
@@ -210,7 +210,7 @@ void slab_init(void) {
     }
 
     // Initialize each size class
-    for (int i = 0; i < (int)NUM_CLASSES; i++) {
+    for (size_t i = 0; i < NUM_CLASSES; i++) {
         classes[i].block_size  = size_classes[i];
         classes[i].free_list   = NULL;
         classes[i].pages       = NULL;
@@ -218,7 +218,7 @@ void slab_init(void) {
     }
 
     // Pre-allocate pages for common sizes to avoid allocation in hot path
-    for (int i = 0; i < (int)NUM_CLASSES && i < 8; i++) {
+    for (size_t i = 0; i < NUM_CLASSES && i < 8; i++) {
         for (int j = 0; j < PREALLOC_PAGES_PER_CLASS; j++) {
             (void)slab_alloc_page(&classes[i], i);
         }
@@ -257,7 +257,7 @@ static slab_page* find_page_for_ptr(void *ptr) {
     void *page_start = (void*)(addr & ~page_mask);
 
     // Search classes (common first)
-    for (int ci = 0; ci < (int)NUM_CLASSES; ci++) {
+    for (size_t ci = 0; ci < (int)NUM_CLASSES; ci++) {
         slab_page *pg = classes[ci].pages;
         while (pg) {
             if (pg->page_start == page_start && pg->magic == SLAB_MAGIC) {
@@ -325,7 +325,7 @@ void slab_free(void *ptr) {
 void slab_destroy(void) {
     if (!slab_initialized) return;
 
-    for (int i = 0; i < (int)NUM_CLASSES; i++) {
+    for (size_t i = 0; i < (int)NUM_CLASSES; i++) {
         slab_page *pg = classes[i].pages;
         while (pg) {
             slab_page *next = pg->next;
