@@ -15,7 +15,238 @@
 #include "rf_broker.h"
 #include "ramforge_ha_integration.h"
 #include "http_timing.h"
+#include <stdarg.h>
+
+#define JOUT_LIT(o, s) jout_try_mem((o), (s), sizeof(s) - 1)
+
+
 extern App *g_app;
+
+typedef struct {
+    char *p;
+    char *end; /* last writable (reserve 1 for NUL) */
+} jout_t;
+
+
+
+static inline void jout_init_res(jout_t *o, Response *res){
+    o->p = res->buffer;
+    o->end = res->buffer + RESPONSE_BUFFER_SIZE - 1;
+    if (o->p <= o->end) *o->p = '\0';
+}
+static inline void jout_init_buf(jout_t *o, char *buf, size_t cap){
+    o->p = buf;
+    o->end = (cap ? (buf + cap - 1) : buf);
+    if (cap) *buf = '\0';
+}
+static inline size_t jout_avail(const jout_t *o){
+    return (o->p < o->end) ? (size_t)(o->end - o->p) : 0;
+}
+static inline int jout_try_mem(jout_t *o, const void *src, size_t n){
+    if (n > jout_avail(o)) return 0;
+    memcpy(o->p, src, n);
+    o->p += n;
+    *o->p = '\0';
+    return 1;
+}
+static inline int jout_try_c(jout_t *o, char c){
+    if (jout_avail(o) < 1) return 0;
+    *o->p++ = c;
+    *o->p = '\0';
+    return 1;
+}
+static int jout_try_vprintf(jout_t *o, const char *fmt, va_list ap){
+    va_list ap2;
+    va_copy(ap2, ap);
+    int need = vsnprintf(NULL, 0, fmt, ap2);
+    va_end(ap2);
+    if (need < 0) return 0;
+    if ((size_t)need > jout_avail(o)) return 0;
+    vsnprintf(o->p, (size_t)need + 1, fmt, ap);
+    o->p += (size_t)need;
+    *o->p = '\0';
+    return 1;
+}
+static int jout_try_printf(jout_t *o, const char *fmt, ...){
+    va_list ap;
+    va_start(ap, fmt);
+    int ok = jout_try_vprintf(o, fmt, ap);
+    va_end(ap);
+    return ok;
+}
+
+/* Like your json_escape_into but tells you if it truncated */
+static size_t json_escape_into_ex(char *dst, size_t cap, const uint8_t *s, size_t n, int *trunc){
+    size_t o = 0;
+    if (trunc) *trunc = 0;
+    for (size_t i = 0; i < n && o < cap; i++) {
+        unsigned char c = s[i];
+        if (c == '"' || c == '\\') {
+            if (o + 2 > cap) { if (trunc) *trunc = 1; break; }
+            dst[o++]='\\'; dst[o++]=(char)c;
+        } else if (c <= 0x1F) {
+            if (o + 6 > cap) { if (trunc) *trunc = 1; break; }
+            dst[o++]='\\'; dst[o++]='u'; dst[o++]='0'; dst[o++]='0';
+            const char *hex="0123456789abcdef";
+            dst[o++]=hex[(c>>4)&0xF];
+            dst[o++]=hex[c&0xF];
+        } else {
+            dst[o++]=(char)c;
+        }
+    }
+    return o;
+}
+
+static inline int jv_to_cstr(const json_value_t *v, char *out, size_t cap){
+    if (!v || !out || cap==0) return 0;
+    if (v->type == JSON_STRING){
+        size_t n = v->as.s.len < cap-1 ? v->as.s.len : cap-1;
+        memcpy(out, v->as.s.ptr, n); out[n]=0; return 1;
+    }
+    /* stringify numbers/booleans for convenience */
+    if (v->type == JSON_INT) {
+        int n = snprintf(out, cap, "%" PRId64, (int64_t) v->as.i);
+        if (n < 0) n = 0;
+        if ((size_t) n >= cap) out[cap - 1] = 0;
+        return 1;
+    }
+    if (v->type == JSON_DOUBLE) {
+        int n = snprintf(out, cap, "%.17g", v->as.d);
+        if (n < 0) n = 0;
+        if ((size_t) n >= cap) out[cap - 1] = 0;
+        return 1;
+    }
+    if (v->type == JSON_BOOL) {
+        int n = snprintf(out, cap, "%s", v->as.b ? "true" : "false");
+        if (n < 0) n = 0;
+        if ((size_t) n >= cap) out[cap - 1] = 0;
+        return 1;
+    }
+    return 0;
+}
+
+/* Build {"field":value,...} into a scratch buffer (safe); returns 1 if built, 0 if too big */
+static int build_projected_object_json(char *out, size_t cap, json_value_t *obj, json_value_t *fields){
+    jout_t w; jout_init_buf(&w, out, cap);
+    if (!obj || obj->type != JSON_OBJECT) return 0;
+
+    if (!jout_try_c(&w, '{')) return 0;
+    int first = 1;
+
+    if (fields && fields->type==JSON_ARRAY && fields->as.array.count>0){
+        for (size_t i=0;i<fields->as.array.count;i++){
+            json_value_t *fn = &fields->as.array.items[i];
+            if (fn->type != JSON_STRING) continue;
+
+            char name[64];
+            if (!jv_to_cstr(fn, name, sizeof name)) continue;
+
+            json_value_t *fv = json_get_field(obj, name);
+            if (!fv) continue;
+
+            if (!first) { if (!jout_try_c(&w, ',')) return 0; }
+            first = 0;
+
+            if (!jout_try_printf(&w, "\"%s\":", name)) return 0;
+
+            switch (fv->type){
+                case JSON_STRING:
+                    /* IMPORTANT: fast_json strings are raw slices (already escaped in source JSON) */
+                    if (!jout_try_c(&w, '"')) return 0;
+                    if (!jout_try_mem(&w, fv->as.s.ptr, fv->as.s.len)) return 0;
+                    if (!jout_try_c(&w, '"')) return 0;
+                    break;
+                case JSON_INT:
+                    if (!jout_try_printf(&w, "%" PRId64, (int64_t)fv->as.i)) return 0;
+                    break;
+                case JSON_DOUBLE:
+                    if (!jout_try_printf(&w, "%.17g", fv->as.d)) return 0;
+                    break;
+                case JSON_BOOL:
+                    if (!jout_try_mem(&w, fv->as.b ? "true" : "false", fv->as.b ? 4 : 5)) return 0;
+                    break;
+                case JSON_NULL:
+                default:
+                    if (!jout_try_mem(&w, "null", 4)) return 0;
+                    break;
+            }
+        }
+    }
+
+    if (!jout_try_c(&w, '}')) return 0;
+    return 1;
+}
+
+typedef struct {
+    char *p;
+    char *end;
+    int truncated;
+} respw_t;
+
+static inline respw_t rw_init(Response *res) {
+    respw_t w;
+    w.p = res->buffer;
+    w.end = res->buffer + RESPONSE_BUFFER_SIZE - 1;
+    w.truncated = 0;
+    if (w.p <= w.end) *w.p = '\0';
+    return w;
+}
+
+static inline void rw_nul(respw_t *w) {
+    if (w->p <= w->end) *w->p = '\0';
+    else w->end[0] = '\0';
+}
+
+static inline void rw_putc(respw_t *w, char c) {
+    if (w->p < w->end) *w->p++ = c;
+    else w->truncated = 1;
+    rw_nul(w);
+}
+
+static inline void rw_mem(respw_t *w, const void *src, size_t n) {
+    if (!n) return;
+    size_t avail = (w->p < w->end) ? (size_t)(w->end - w->p) : 0;
+    if (n > avail) { n = avail; w->truncated = 1; }
+    if (n) {
+        memcpy(w->p, src, n);
+        w->p += n;
+    }
+    rw_nul(w);
+}
+
+static inline void rw_str(respw_t *w, const char *s) {
+    if (!s) return;
+    rw_mem(w, s, strlen(s));
+}
+
+static inline void rw_printf(respw_t *w, const char *fmt, ...) {
+    if (w->p >= w->end) { w->truncated = 1; rw_nul(w); return; }
+    va_list ap;
+    va_start(ap, fmt);
+    size_t avail = (size_t)(w->end - w->p);
+    int n = vsnprintf(w->p, avail + 1, fmt, ap);
+    va_end(ap);
+
+    if (n < 0) { w->truncated = 1; rw_nul(w); return; }
+    if ((size_t)n > avail) {
+        w->p = w->end;
+        w->truncated = 1;
+    } else {
+        w->p += (size_t)n;
+    }
+    rw_nul(w);
+}
+
+static inline uint64_t rf_monotonic_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
+}
+static inline uint64_t rf_wall_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
+}
 
 typedef struct {
     const char *error;      // machine-readable code
@@ -35,24 +266,6 @@ static void send_error(Response *res, const error_response_t *err) {
     res->buffer[(n>0 && n<(int)RESPONSE_BUFFER_SIZE)?n:(RESPONSE_BUFFER_SIZE-1)] = '\0';
 }
 
-// EXAMPLE USAGE:
-static const error_response_t ERR_MISSING_TOPIC = {
-        .error = "missing_topic",
-        .message = "Topic name is required in the URL path",
-        .docs = "https://ayder.dev/docs/api/produce"
-};
-
-static const error_response_t ERR_INVALID_JSON = {
-        .error = "invalid_json",
-        .message = "Request body must be valid JSON",
-        .docs = "https://ayder.dev/docs/api/request-format"
-};
-
-static const error_response_t ERR_PARTITION_NOT_FOUND = {
-        .error = "partition_not_found",
-        .message = "The specified topic or partition does not exist. Create it with POST /broker/topics first.",
-        .docs = "https://ayder.dev/docs/api/topics#create"
-};
 
 
 static inline uint64_t now_us(void) {
@@ -167,19 +380,25 @@ static size_t url_decode_into(char *dst, size_t cap, const char *src, size_t n){
 
 /* JSON-escape into dst; returns bytes written (cap-limited).
    Only used for non-b64 consumer path (texty/legacy). */
-static size_t json_escape_into(char *dst, size_t cap, const uint8_t *s, size_t n){
-    size_t o=0;
-    for (size_t i=0;i<n && o<cap;i++){
+static size_t json_escape_into(char *dst, size_t cap, const uint8_t *s, size_t n) {
+    size_t o = 0;
+    for (size_t i = 0; i < n && o < cap; i++) {
         unsigned char c = s[i];
-        if (c=='"' || c=='\\'){
-            if (o+2>cap) break; dst[o++]='\\'; dst[o++]=c;
-        } else if (c<=0x1F){
-            if (o+6>cap) break;
-            dst[o++]='\\'; dst[o++]='u'; dst[o++]='0'; dst[o++]='0';
-            const char *hex="0123456789abcdef";
-            dst[o++]=hex[(c>>4)&0xF]; dst[o++]=hex[c&0xF];
+        if (c == '"' || c == '\\') {
+            if (o + 2 > cap) break;
+            dst[o++] = '\\';
+            dst[o++] = c;
+        } else if (c <= 0x1F) {
+            if (o + 6 > cap) break;
+            dst[o++] = '\\';
+            dst[o++] = 'u';
+            dst[o++] = '0';
+            dst[o++] = '0';
+            const char *hex = "0123456789abcdef";
+            dst[o++] = hex[(c >> 4) & 0xF];
+            dst[o++] = hex[c & 0xF];
         } else {
-            dst[o++]=c;
+            dst[o++] = c;
         }
     }
     return o;
@@ -233,27 +452,6 @@ static inline int jv_to_double(const json_value_t *v, double *out){
     }
 }
 
-static inline int jv_to_cstr(const json_value_t *v, char *out, size_t cap){
-    if (!v || !out || cap==0) return 0;
-    if (v->type == JSON_STRING){
-        size_t n = v->as.s.len < cap-1 ? v->as.s.len : cap-1;
-        memcpy(out, v->as.s.ptr, n); out[n]=0; return 1;
-    }
-    /* stringify numbers/booleans for convenience */
-    if (v->type == JSON_INT){
-        int n = snprintf(out, cap, "%" PRId64, (int64_t)v->as.i);
-        if (n<0) n=0; if ((size_t)n>=cap) out[cap-1]=0; return 1;
-    }
-    if (v->type == JSON_DOUBLE){
-        int n = snprintf(out, cap, "%.17g", v->as.d);
-        if (n<0) n=0; if ((size_t)n>=cap) out[cap-1]=0; return 1;
-    }
-    if (v->type == JSON_BOOL){
-        int n = snprintf(out, cap, "%s", v->as.b ? "true":"false");
-        if (n<0) n=0; if ((size_t)n>=cap) out[cap-1]=0; return 1;
-    }
-    return 0;
-}
 
 /* evaluate a single condition: {"field","op","value"} */
 static int eval_condition(json_value_t *obj, const char *field, const char *op, json_value_t *want){
@@ -317,13 +515,17 @@ static size_t build_group_key(json_value_t *obj, json_value_t *group_by, char *o
         char name[64]; jv_to_cstr(fld, name, sizeof name);
         json_value_t *v = json_get_field(obj, name);
         if (o && o<cap) out[o++]='|';
-        int n = snprintf(out+o, (o<cap?cap-o:0), "%s=", name);
-        if (n<0) n=0; o += (size_t)n;
+        int n = snprintf(out + o, (o < cap ? cap - o : 0), "%s=", name);
+        if (n < 0) n = 0;
+        o += (size_t)n;
         char vb[256]; vb[0]=0;
         if (!jv_to_cstr(v, vb, sizeof vb)) strncpy(vb,"null",sizeof vb);
         size_t l=strlen(vb);
         if (o+l>=cap) l = (cap>o?cap-o-1:0);
-        if (l) memcpy(out+o, vb, l); o+=l;
+        if (l) {
+            memcpy(out + o, vb, l);
+            o += l;
+        }
         if (o<cap) out[o]=0;
     }
     return o;
@@ -344,8 +546,6 @@ int broker_query_handler(Request *req, Response *res){
     json_value_t *jflt   = json_get_field(root, "filter");
     json_value_t *jagg   = json_get_field(root, "aggregate");
     json_value_t *jgb    = jagg ? json_get_field(jagg, "group_by") : NULL;
-    json_value_t *jmeas  = jagg ? json_get_field(jagg, "measures") : NULL; /* only count is honored */
-    json_value_t *jwin   = json_get_field(root, "window"); /* accepted */
     json_value_t *jtrans = json_get_field(root, "transform");
     json_value_t *jleft  = jtrans ? json_get_field(jtrans, "left_fields") : NULL;
     json_value_t *jemit  = jtrans ? json_get_field(jtrans, "emit_rows")   : NULL;
@@ -356,7 +556,6 @@ int broker_query_handler(Request *req, Response *res){
         json_free(root); return 0;
     }
 
-    /* source fields */
     json_value_t *jt = json_get_field(jsrc, "topic");
     json_value_t *jg = json_get_field(jsrc, "group");
     json_value_t *jp = json_get_field(jsrc, "partition");
@@ -374,7 +573,8 @@ int broker_query_handler(Request *req, Response *res){
     if (jg && jg->type==JSON_STRING) jv_to_cstr(jg, group, sizeof group);
 
     int partition = (jp->type==JSON_INT) ? (int)jp->as.i : (int)jp->as.d;
-    size_t limit  = 200;
+
+    size_t limit = 200;
     if (jl && jl->type==JSON_INT && jl->as.i>0 && jl->as.i<=2000) limit = (size_t)jl->as.i;
 
     uint64_t from_exclusive = (uint64_t)-1;
@@ -382,131 +582,146 @@ int broker_query_handler(Request *req, Response *res){
         uint64_t start = (jo->type==JSON_INT)? (uint64_t)jo->as.i : (uint64_t)jo->as.d;
         from_exclusive = (start==0) ? (uint64_t)-1 : (start-1);
     } else {
-        /* default to committed offset if available */
         uint64_t committed=0;
         if (rf_offset_load(topic, group, partition, &committed)) from_exclusive = committed;
     }
 
-    /* consume */
-    size_t cap = (limit>1024?1024:limit);
+    size_t cap = (limit > 1024 ? 1024 : limit);
     rf_msg_view_t stack_msgs[256];
     rf_msg_view_t *msgs = (cap<=256) ? stack_msgs : slab_alloc(cap * sizeof(*msgs));
-    if (!msgs){ memcpy(res->buffer,"{\"ok\":false,\"error\":\"oom\"}",28); res->buffer[28]=0; json_free(root); return 0; }
+    if (!msgs) {
+        static const char OOM_JSON[] = "{\"ok\":false,\"error\":\"oom\"}";
+        memcpy(res->buffer, OOM_JSON, sizeof(OOM_JSON)); /* includes '\0' */
+        json_free(root);
+        return 0;
+    }
 
     uint64_t next_offset=0;
-    size_t nread = rf_consume(topic, group, partition, from_exclusive, limit, msgs, cap, &next_offset);
+    size_t want = (limit < cap) ? limit : cap;               /* FIX */
+    size_t nread = rf_consume(topic, group, partition, from_exclusive, want, msgs, cap, &next_offset);
 
-    /* aggregates (count only) */
     agg_t aggs[128]; size_t agg_n=0;
 
-    /* rows emission */
     int emit_rows = (jemit && jemit->type==JSON_INT && jemit->as.i>=0) ? (int)jemit->as.i : 0;
     int rows_out = 0;
+    int stop_rows = 0;
 
-    char *p = res->buffer, *end = res->buffer + RESPONSE_BUFFER_SIZE - 1;
-#define APP(...) do { int __n = snprintf(p, (size_t)(end-p), __VA_ARGS__); if (__n<0) __n=0; p += (__n<(end-p)?__n:(int)(end-p)); } while(0)
+    jout_t out; jout_init_res(&out, res);
 
-    APP("{\"ok\":true,\"rows\":[");
+    /* reserve tail so we can always close JSON */
+    const size_t TAIL_RESERVE = 512;
+    char *hard_end = out.end;
+    if ((size_t)(hard_end - res->buffer) > TAIL_RESERVE) out.end = hard_end - (ptrdiff_t)TAIL_RESERVE;
+
+    (void)JOUT_LIT(&out, "{\"ok\":true,\"rows\":[");
     int first_row = 1;
 
     for (size_t i=0;i<nread;i++){
         const uint8_t *val = (const uint8_t*)msgs[i].val;
         size_t vl = msgs[i].val_len;
-        if (vl==0) continue;
-        if (val[0] != '{') continue; /* only JSON objects participate */
+        if (vl==0 || val[0] != '{') continue;
 
         json_value_t *obj = json_parse((const char*)val, vl);
         if (!obj || obj->type != JSON_OBJECT){ if (obj) json_free(obj); continue; }
 
-        /* filter */
         if (!obj_matches_filters(obj, jflt)){ json_free(obj); continue; }
 
-        /* group key */
-        char gkey[256]; gkey[0]=0;
+        /* aggregate count */
         if (jgb && jgb->type==JSON_ARRAY && jgb->as.array.count>0) {
+            char gkey[256]; gkey[0]=0;
             build_group_key(obj, jgb, gkey, sizeof gkey);
             if (gkey[0]){
-                /* upsert count */
                 size_t k=0; for (; k<agg_n; k++) if (strcmp(aggs[k].key, gkey)==0) break;
-                if (k==agg_n && agg_n< (sizeof aggs/sizeof aggs[0])) { strncpy(aggs[agg_n].key, gkey, sizeof aggs[agg_n].key-1); aggs[agg_n].key[sizeof aggs[agg_n].key-1]=0; aggs[agg_n].count=0; agg_n++; }
-                if (k<agg_n) aggs[k].count++;
+                if (k==agg_n && agg_n < (sizeof aggs/sizeof aggs[0])) {
+                    strncpy(aggs[agg_n].key, gkey, sizeof aggs[agg_n].key-1);
+                    aggs[agg_n].key[sizeof aggs[agg_n].key-1]=0;
+                    aggs[agg_n].count=0;
+                    agg_n++;
+                }
+                if (k < agg_n) aggs[k].count++;
             }
         }
 
-        if (emit_rows > 0 && rows_out < emit_rows){
-            /* build row projection */
-            if (!first_row) { if (p<end) *p++=','; } else first_row=0;
+        /* emit rows */
+        if (!stop_rows && emit_rows > 0 && rows_out < emit_rows){
+            char *mark = out.p;
+
+            if (!first_row){
+                if (!jout_try_c(&out, ',')) { out.p=mark; *out.p=0; stop_rows=1; json_free(obj); continue; }
+            }
+
             if (!jleft || jleft->type!=JSON_ARRAY || jleft->as.array.count==0){
-                /* if no left_fields: emit whole object as-is (string copy) */
-                if ((size_t)(end-p) > vl+2){
-                    *p++='{'; *p++='}'; /* keep it minimal rather than copying raw */
-                } else {/* out-of-space: skip */ }
+                /* emit full object: raw bytes */
+                if (!jout_try_mem(&out, val, vl)) {
+                    out.p=mark; *out.p=0; stop_rows=1;
+                } else {
+                    first_row = 0;
+                    rows_out++;
+                }
             } else {
-                *p++='{';
-                int first_field=1;
-                for (size_t f=0; f<jleft->as.array.count; f++){
-                    json_value_t *fname = &jleft->as.array.items[f];
-                    if (fname->type!=JSON_STRING) continue;
-                    char name[64]; jv_to_cstr(fname, name, sizeof name);
-                    json_value_t *fv = json_get_field(obj, name);
-                    if (!fv) continue;
-
-                    if (!first_field) { if (p<end) *p++=','; } else first_field=0;
-
-                    /* write "name": */
-                    int n = snprintf(p, (size_t)(end-p), "\"%s\":", name);
-                    if (n<0) n=0; p += (n<(end-p)?n:(int)(end-p));
-
-                    if (fv->type == JSON_STRING){
-                        char esc[512]; size_t e = json_escape_into(esc, sizeof esc-1, (const uint8_t*)fv->as.s.ptr, fv->as.s.len); esc[e]=0;
-                        n = snprintf(p, (size_t)(end-p), "\"%s\"", esc);
-                        if (n<0) n=0; p += (n<(end-p)?n:(int)(end-p));
-                    } else if (fv->type == JSON_INT){
-                        n = snprintf(p, (size_t)(end-p), "%" PRId64, (int64_t)fv->as.i);
-                        if (n<0) n=0; p += (n<(end-p)?n:(int)(end-p));
-                    } else if (fv->type == JSON_DOUBLE){
-                        n = snprintf(p, (size_t)(end-p), "%.17g", fv->as.d);
-                        if (n<0) n=0; p += (n<(end-p)?n:(int)(end-p));
-                    } else if (fv->type == JSON_BOOL){
-                        n = snprintf(p, (size_t)(end-p), "%s", fv->as.b?"true":"false");
-                        if (n<0) n=0; p += (n<(end-p)?n:(int)(end-p));
+                char rowbuf[4096];
+                if (!build_projected_object_json(rowbuf, sizeof rowbuf, obj, jleft)) {
+                    out.p=mark; *out.p=0; stop_rows=1;
+                } else {
+                    size_t rl = strlen(rowbuf);
+                    if (!jout_try_mem(&out, rowbuf, rl)) {
+                        out.p=mark; *out.p=0; stop_rows=1;
                     } else {
-                        /* null/array/object -> emit null */
-                        if (p<end) *p++='n'; if (p<end) *p++='u'; if (p<end) *p++='l'; if (p<end) *p++='l';
+                        first_row = 0;
+                        rows_out++;
                     }
                 }
-                if (p<end) *p++='}';
             }
-            rows_out++;
         }
 
         json_free(obj);
     }
 
-    /* close rows and write aggregates */
-    APP("],\"aggregates\":[");
+    (void)JOUT_LIT(&out, "],\"aggregates\":[");
+
+    int first_agg = 1;
     for (size_t i=0;i<agg_n;i++){
-        if (i) { if (p<end) *p++=','; }
-        char esc[512]; size_t e = json_escape_into(esc, sizeof esc-1, (const uint8_t*)aggs[i].key, strlen(aggs[i].key)); esc[e]=0;
-        APP("{\"key\":\"%s\",\"count\":%" PRIu64 "}", esc, aggs[i].count);
+        char rec[512];
+        jout_t w; jout_init_buf(&w, rec, sizeof rec);
+
+        if (!first_agg) { if (!jout_try_c(&w, ',')) break; }
+        first_agg = 0;
+
+        char esc[512]; int tr=0;
+        size_t e = json_escape_into_ex(esc, sizeof esc-1,
+                                       (const uint8_t*)aggs[i].key, strlen(aggs[i].key), &tr);
+        esc[e]=0;
+        if (tr) break;
+
+        if (!jout_try_printf(&w, "{\"key\":\"%s\",\"count\":%" PRIu64 "}", esc, aggs[i].count)) break;
+
+        size_t rl = strlen(rec);
+        if (!jout_try_mem(&out, rec, rl)) break;
     }
 
-    /* basic source echo + cursors */
-    APP("],\"source\":{\"topic\":\"%s\",\"group\":\"%s\",\"partition\":%d,\"next_offset\":%" PRIu64 ",\"consumed\":%zu}}",
-        topic, group, partition, next_offset, nread);
+    /* restore end and write tail (always fits because of reserve) */
+    out.end = hard_end;
 
-    *p = 0;
+    (void)jout_try_printf(&out,
+                          "],\"source\":{\"topic\":\"%s\",\"group\":\"%s\",\"partition\":%d,\"next_offset\":%" PRIu64 ",\"consumed\":%zu}}",
+                          topic, group, partition, next_offset, nread);
+
+    res->buffer[RESPONSE_BUFFER_SIZE - 1] = '\0';
 
     if (msgs != stack_msgs) slab_free(msgs);
     json_free(root);
     return 0;
 }
 typedef struct {
-    char key[512];
-    uint64_t ts_ms;
-    uint64_t offset;
-    json_value_t *obj;   /* parsed JSON object (owned, must json_free) */
+    char        key[512];
+    uint64_t    ts_ms;
+    uint64_t    offset;
+    json_value_t *obj;
+    const char  *raw;
+    size_t      raw_len;
 } join_evt_t;
+
+
 
 static inline int jv_to_cstr2(const json_value_t *v, char *out, size_t cap){
     if (!v || !out || cap==0) return 0;
@@ -514,9 +729,24 @@ static inline int jv_to_cstr2(const json_value_t *v, char *out, size_t cap){
         size_t n = v->as.s.len < cap-1 ? v->as.s.len : cap-1;
         memcpy(out, v->as.s.ptr, n); out[n]=0; return 1;
     }
-    if (v->type == JSON_INT) { int n = snprintf(out, cap, "%" PRId64, (int64_t)v->as.i); if (n<0) n=0; if ((size_t)n>=cap) out[cap-1]=0; return 1; }
-    if (v->type == JSON_DOUBLE) { int n = snprintf(out, cap, "%.17g", v->as.d); if (n<0) n=0; if ((size_t)n>=cap) out[cap-1]=0; return 1; }
-    if (v->type == JSON_BOOL) { int n = snprintf(out, cap, "%s", v->as.b?"true":"false"); if (n<0) n=0; if ((size_t)n>=cap) out[cap-1]=0; return 1; }
+    if (v->type == JSON_INT) {
+        int n = snprintf(out, cap, "%" PRId64, (int64_t) v->as.i);
+        if (n < 0) n = 0;
+        if ((size_t) n >= cap) out[cap - 1] = 0;
+        return 1;
+    }
+    if (v->type == JSON_DOUBLE) {
+        int n = snprintf(out, cap, "%.17g", v->as.d);
+        if (n < 0) n = 0;
+        if ((size_t) n >= cap) out[cap - 1] = 0;
+        return 1;
+    }
+    if (v->type == JSON_BOOL) {
+        int n = snprintf(out, cap, "%s", v->as.b ? "true" : "false");
+        if (n < 0) n = 0;
+        if ((size_t) n >= cap) out[cap - 1] = 0;
+        return 1;
+    }
     return 0;
 }
 
@@ -526,6 +756,7 @@ static inline int extract_key_single(json_value_t *obj, const char *field, char 
     if (!v) return 0;
     return jv_to_cstr2(v, out, cap);
 }
+
 
 static inline int extract_key_composite(json_value_t *obj, json_value_t *fields_arr, char *out, size_t cap){
     if (!obj || obj->type!=JSON_OBJECT || !fields_arr || fields_arr->type!=JSON_ARRAY) return 0;
@@ -559,7 +790,12 @@ static inline void write_projected_object_or_missing(char **pp, char *end, json_
     if (!obj){
         if (missing_as_empty){ if (p<end) *p++='{'; if (p<end) *p++='}'; *pp = p; return; }
         /* null */
-        if (p<end) *p++='n'; if (p<end) *p++='u'; if (p<end) *p++='l'; if (p<end) *p++='l'; *pp=p; return;
+        if (p < end) *p++ = 'n';
+        if (p < end) *p++ = 'u';
+        if (p < end) *p++ = 'l';
+        if (p < end) *p++ = 'l';
+        *pp = p;
+        return;
     }
     /* same as before */
     *p++ = '{';
@@ -573,22 +809,30 @@ static inline void write_projected_object_or_missing(char **pp, char *end, json_
             if (!fv) continue;
             if (!first) { if (p<end) *p++=','; } else first=0;
             int n = snprintf(p, (size_t)(end-p), "\"%s\":", name);
-            if (n<0) n=0; p += (n<(end-p)?n:(int)(end-p));
+            if (n<0) n=0;
+            p += (n<(end-p)?n:(int)(end-p));
             if (fv->type == JSON_STRING){
                 char esc[512]; size_t e = json_escape_into(esc, sizeof esc-1, (const uint8_t*)fv->as.s.ptr, fv->as.s.len); esc[e]=0;
                 n = snprintf(p, (size_t)(end-p), "\"%s\"", esc);
-                if (n<0) n=0; p += (n<(end-p)?n:(int)(end-p));
+                if (n < 0) n = 0;
+                p += (n < (end - p) ? n : (int)(end - p));
             } else if (fv->type == JSON_INT){
                 n = snprintf(p, (size_t)(end-p), "%" PRId64, (int64_t)fv->as.i);
-                if (n<0) n=0; p += (n<(end-p)?n:(int)(end-p));
+                if (n < 0) n = 0;
+                p += (n < (end - p) ? n : (int)(end - p));
             } else if (fv->type == JSON_DOUBLE){
                 n = snprintf(p, (size_t)(end-p), "%.17g", fv->as.d);
-                if (n<0) n=0; p += (n<(end-p)?n:(int)(end-p));
+                if (n < 0) n = 0;
+                p += (n < (end - p) ? n : (int)(end - p));
             } else if (fv->type == JSON_BOOL){
                 n = snprintf(p, (size_t)(end-p), "%s", fv->as.b?"true":"false");
-                if (n<0) n=0; p += (n<(end-p)?n:(int)(end-p));
+                if (n < 0) n = 0;
+                p += (n < (end - p) ? n : (int)(end - p));
             } else {
-                if (p<end) *p++='n'; if (p<end) *p++='u'; if (p<end) *p++='l'; if (p<end) *p++='l';
+                if (p < end) *p++ = 'n';
+                if (p < end) *p++ = 'u';
+                if (p < end) *p++ = 'l';
+                if (p < end) *p++ = 'l';
             }
         }
     }
@@ -605,7 +849,8 @@ int broker_join_handler(Request *req, Response *res){
     if (!root || root->type!=JSON_OBJECT){
         const char *e = "{\"ok\":false,\"error\":\"invalid_json\"}";
         memcpy(res->buffer,e,strlen(e)); res->buffer[strlen(e)]=0;
-        if (root) json_free(root); return 0;
+        if (root) json_free(root);
+        return 0;
     }
 
     json_value_t *jl = json_get_field(root,"left");
@@ -799,8 +1044,10 @@ int broker_join_handler(Request *req, Response *res){
         memcpy(res->buffer,e,strlen(e)); res->buffer[strlen(e)]=0;
         for (size_t i=0;i<Ln;i++) if (L[i].obj) json_free(L[i].obj);
         for (size_t i=0;i<Rn;i++) if (R[i].obj) json_free(R[i].obj);
-        if (head) slab_free(head); if (next) slab_free(next);
-        if (lmsgs!=lstack) slab_free(lmsgs); if (rmsgs!=rstack) slab_free(rmsgs);
+        if (head) slab_free(head);
+        if (next) slab_free(next);
+        if (lmsgs!=lstack) slab_free(lmsgs);
+        if (rmsgs!=rstack) slab_free(rmsgs);
         slab_free(L); slab_free(R); json_free(root); return 0;
     }
     for (int i=0;i<BUCKS;i++) head[i]=-1;
@@ -813,7 +1060,8 @@ int broker_join_handler(Request *req, Response *res){
     // match flags for outers
     uint8_t *mL = slab_alloc(Ln ? Ln : 1);
     uint8_t *mR = slab_alloc(Rn ? Rn : 1);
-    if (Ln) memset(mL,0,Ln); if (Rn) memset(mR,0,Rn);
+    if (Ln) memset(mL,0,Ln);
+    if (Rn) memset(mR,0,Rn);
 
     // emit rows
     char *p = res->buffer, *end = res->buffer + RESPONSE_BUFFER_SIZE - 1;
@@ -883,10 +1131,12 @@ int broker_join_handler(Request *req, Response *res){
     // cleanup
     for (size_t i=0;i<Ln;i++) if (L[i].obj) json_free(L[i].obj);
     for (size_t i=0;i<Rn;i++) if (R[i].obj) json_free(R[i].obj);
-    if (mL) slab_free(mL); if (mR) slab_free(mR);
+    if (mL) slab_free(mL);
+    if (mR) slab_free(mR);
     slab_free(L); slab_free(R);
     slab_free(head); slab_free(next);
-    if (lmsgs!=lstack) slab_free(lmsgs);
+    if (lmsgs!=lstack)
+        slab_free(lmsgs);
     if (rmsgs!=rstack) slab_free(rmsgs);
     json_free(root);
     return 0;
@@ -1185,11 +1435,12 @@ int broker_consume(Request *req, Response *res) {
     const char* topic_in      = req->params[0].value;
     const char* group_in      = req->params[1].value;
     const char* partition_str = req->params[2].value;
+
     if (!topic_in || !*topic_in || !group_in || !*group_in || !partition_str) {
         send_error(res, &(error_response_t){
-                .error = "missing_params",
-                .message = "Topic, group, and partition are required: /broker/consume/{topic}/{group}/{partition}",
-                .docs = "https://ayder.dev/docs/api/consume"
+                .error="missing_params",
+                .message="Topic, group, and partition are required: /broker/consume/{topic}/{group}/{partition}",
+                .docs="https://ayder.dev/docs/api/consume"
         });
         return -1;
     }
@@ -1201,10 +1452,9 @@ int broker_consume(Request *req, Response *res) {
     int partition=0; const char* scan=partition_str;
     while (*scan>='0' && *scan<='9'){ partition = partition*10 + (*scan - '0'); scan++; }
 
-    /* --- NEW: parse offset/limit via qs_str() --- */
-    uint64_t from_offset = (uint64_t)-1;
-    size_t   max_msgs    = 100;
-    int      has_offset  = 0;
+    uint64_t from_exclusive = (uint64_t)-1;
+    size_t   max_msgs = 100;
+    int      has_offset = 0;
 
     const char *off_q=NULL, *lim_q=NULL, *enc_q=NULL;
     size_t off_len=0, lim_len=0, enc_len=0;
@@ -1216,126 +1466,88 @@ int broker_consume(Request *req, Response *res) {
     if (off_q && off_len) {
         char buf[32];
         size_t n = (off_len < sizeof(buf)-1) ? off_len : sizeof(buf)-1;
-        memcpy(buf, off_q, n); buf[n] = 0;
+        memcpy(buf, off_q, n); buf[n]=0;
         long long s = strtoll(buf, NULL, 10);
-        /* API expects inclusive start; rf_consume wants from_exclusive */
-        from_offset = (s <= 0) ? (uint64_t)-1 : (uint64_t)(s - 1);
+        from_exclusive = (s <= 0) ? (uint64_t)-1 : (uint64_t)(s - 1);
         has_offset = 1;
     }
 
     if (lim_q && lim_len) {
         char buf[32];
         size_t n = (lim_len < sizeof(buf)-1) ? lim_len : sizeof(buf)-1;
-        memcpy(buf, lim_q, n); buf[n] = 0;
-        unsigned long limit = strtoul(buf, NULL, 10);
-        if (limit > 0 && limit <= 1000) max_msgs = (size_t)limit;
+        memcpy(buf, lim_q, n); buf[n]=0;
+        unsigned long L = strtoul(buf, NULL, 10);
+        if (L > 0 && L <= 1000) max_msgs = (size_t)L;
     }
 
     int want_b64 = (enc_q && enc_len==3 && !strncmp(enc_q,"b64",3)) ? 1 : 0;
 
-    /* --- NEW: always load committed offset once; reuse for both logic + response --- */
     uint64_t committed = 0;
     int have_committed = rf_offset_load(topic_buf, group_buf, partition, &committed);
-
-    if (!has_offset){
-        from_offset = have_committed ? committed : (uint64_t)-1;
-    }
+    if (!has_offset) from_exclusive = have_committed ? committed : (uint64_t)-1;
 
     rf_msg_view_t stack_msgs[100];
     rf_msg_view_t *msgs = (max_msgs<=100) ? stack_msgs : slab_alloc(max_msgs * sizeof(*msgs));
-
     if (!msgs) {
         send_error(res, &(error_response_t){
-                .error = "out_of_memory",
-                .message = "Server temporarily out of memory. Reduce limit or retry.",
-                .docs = NULL
+                .error="out_of_memory",
+                .message="Server temporarily out of memory. Reduce limit or retry.",
+                .docs=NULL
         });
         return -1;
     }
 
     uint64_t next_offset=0;
-    size_t consumed = rf_consume(topic_buf, group_buf, partition, from_offset,
-                                 max_msgs, msgs, max_msgs, &next_offset);
+    size_t consumed = rf_consume(topic_buf, group_buf, partition,
+                                 from_exclusive, max_msgs,
+                                 msgs, max_msgs, &next_offset);
 
-    char *p   = res->buffer;
-    char *end = res->buffer + RESPONSE_BUFFER_SIZE;   /* one-past-the-end */
-    int truncated = 0;
+    respw_t w = rw_init(res);
 
-#define SAFE_AVAIL() ((p < end) ? (size_t)(end - p) : 0)
+    rw_str(&w, "{\"messages\":[");
+    for (size_t i=0; i<consumed; i++) {
+        if (i) rw_putc(&w, ',');
+        rw_printf(&w, "{\"offset\":%" PRIu64 ",\"partition\":%d", msgs[i].offset, msgs[i].partition);
 
-#define APPF(...) do { \
-        size_t _av = SAFE_AVAIL(); \
-        if (_av == 0) { truncated = 1; break; } \
-        int _n = snprintf(p, _av, __VA_ARGS__); \
-        if (_n < 0) { truncated = 1; p = end - 1; break; } \
-        if ((size_t)_n >= _av) { truncated = 1; p = end - 1; } \
-        else p += _n; \
-    } while (0)
+        if (want_b64) {
+            /* quick worst-case size guard */
+            size_t vlen = b64_len(msgs[i].val_len);
+            size_t klen = msgs[i].key_len ? b64_len(msgs[i].key_len) : 0;
+            size_t overhead = 64 + vlen + (msgs[i].key_len ? (32 + klen) : 0);
 
-#define PUTC(ch) do { \
-        if (p + 1 < end) *p++ = (ch); \
-        else { truncated = 1; p = end - 1; } \
-    } while (0)
+            if ((size_t)(w.end - w.p) < overhead) { w.truncated = 1; break; }
 
-    APPF("{\"messages\":[");
-    for (size_t i=0; i<consumed; i++){
-        if (truncated) break;
+            rw_str(&w, ",\"value_b64\":\"");
+            w.p += b64_encode((const uint8_t*)msgs[i].val, msgs[i].val_len, w.p);
+            rw_putc(&w, '"');
 
-        if (i) PUTC(',');
-
-        APPF("{\"offset\":%" PRIu64 ",\"partition\":%d",
-             msgs[i].offset, msgs[i].partition);
-
-        if (want_b64){
-            /* Conservative space check before dumping base64 */
-            size_t v_b64_len = b64_len(msgs[i].val_len);
-            size_t k_b64_len = msgs[i].key_len ? b64_len(msgs[i].key_len) : 0;
-
-            /* room for: ,"value_b64":"<v>","key_b64":"<k>"} plus some slack */
-            size_t need = 32 + v_b64_len + (msgs[i].key_len ? (16 + k_b64_len) : 0) + 4;
-            if (SAFE_AVAIL() <= need) { truncated = 1; break; }
-
-            APPF(",\"value_b64\":\"");
-            p += b64_encode((const uint8_t*)msgs[i].val, msgs[i].val_len, p);
-            PUTC('"');
-
-            if (msgs[i].key_len){
-                APPF(",\"key_b64\":\"");
-                p += b64_encode((const uint8_t*)msgs[i].key, msgs[i].key_len, p);
-                PUTC('"');
+            if (msgs[i].key_len) {
+                rw_str(&w, ",\"key_b64\":\"");
+                w.p += b64_encode((const uint8_t*)msgs[i].key, msgs[i].key_len, w.p);
+                rw_putc(&w, '"');
             }
-            PUTC('}');
+            rw_putc(&w, '}');
         } else {
             char kbuf[256], vbuf[1024];
-            size_t klen = (msgs[i].key_len < sizeof(kbuf)-1) ? msgs[i].key_len : sizeof(kbuf)-1;
-            size_t vlen = (msgs[i].val_len < sizeof(vbuf)-1) ? msgs[i].val_len : sizeof(vbuf)-1;
-
-            size_t ke = json_escape_into(kbuf, sizeof(kbuf)-1, (const uint8_t*)msgs[i].key, klen);
-            size_t ve = json_escape_into(vbuf, sizeof(vbuf)-1, (const uint8_t*)msgs[i].val, vlen);
+            size_t kraw = (msgs[i].key_len < sizeof(kbuf)-1) ? msgs[i].key_len : sizeof(kbuf)-1;
+            size_t vraw = (msgs[i].val_len < sizeof(vbuf)-1) ? msgs[i].val_len : sizeof(vbuf)-1;
+            size_t ke = json_escape_into(kbuf, sizeof(kbuf)-1, (const uint8_t*)msgs[i].key, kraw);
+            size_t ve = json_escape_into(vbuf, sizeof(vbuf)-1, (const uint8_t*)msgs[i].val, vraw);
             kbuf[ke]=0; vbuf[ve]=0;
-
-            APPF(",\"key\":\"%s\",\"value\":\"%s\"}", kbuf, vbuf);
+            rw_printf(&w, ",\"key\":\"%s\",\"value\":\"%s\"}", kbuf, vbuf);
         }
     }
 
-    APPF("],\"count\":%zu,\"next_offset\":%" PRIu64 ",\"committed_offset\":",
-         consumed, next_offset);
-    if (have_committed) APPF("%" PRIu64, committed);
-    else APPF("null");
-
-    APPF(",\"truncated\":%s}", truncated ? "true":"false");
-
-    /* hard guarantee */
-    res->buffer[RESPONSE_BUFFER_SIZE - 1] = '\0';
-
-#undef SAFE_AVAIL
-#undef APPF
-#undef PUTC
+    rw_printf(&w, "],\"count\":%zu,\"next_offset\":%" PRIu64 ",\"committed_offset\":",
+              consumed, next_offset);
+    if (have_committed) rw_printf(&w, "%" PRIu64, committed);
+    else rw_str(&w, "null");
+    rw_printf(&w, ",\"truncated\":%s}", w.truncated ? "true":"false");
 
     if (msgs!=stack_msgs) slab_free(msgs);
     return 0;
 }
-// POST /broker/commit → commit consumer offset (sub-50μs)
+// POST /broker/commit → commit consumer offset
 int broker_commit_fast(Request *req, Response *res) {
     json_value_t* root = json_parse(req->body, req->body_len);
     if (!root || root->type != JSON_OBJECT) {
@@ -1680,51 +1892,53 @@ int broker_delete_before_offset(Request *req, Response *res) {
 int kv_get_handler(Request *req, Response *res){
     const char *ns=NULL, *key=NULL;
     for (int i=0;i<req->param_count;i++){
-        if (!ns && strcmp(req->params[i].name,"ns")==0)  ns  = req->params[i].value;
-        if (!key&& strcmp(req->params[i].name,"key")==0) key = req->params[i].value;
+        if (!ns  && strcmp(req->params[i].name,"ns")==0)  ns  = req->params[i].value;
+        if (!key && strcmp(req->params[i].name,"key")==0) key = req->params[i].value;
     }
     if (!ns || !key) {
         send_error(res, &(error_response_t){
-                .error = "missing_params",
-                .message = "Namespace and key are required: /kv/{namespace}/{key}",
-                .docs = "https://ayder.dev/docs/api/kv#get"
+                .error="missing_params",
+                .message="Namespace and key are required: /kv/{namespace}/{key}",
+                .docs="https://ayder.dev/docs/api/kv#get"
         });
         return 0;
     }
 
     int skey = kv_int_key(ns,key);
-    uint8_t buf[MAX_DATA_SIZE]; // shared_storage.h
+
+    uint8_t buf[MAX_DATA_SIZE];
     if (!shared_storage_get_fast(g_shared_storage, skey, buf, sizeof(buf))) {
-        send_error(res, &(error_response_t){
-                .error = "not_found",
-                .message = "Key does not exist in this namespace",
-                .docs = NULL
-        });
-        return 0;
-    }
-    kvrec_t *r = (kvrec_t*)buf;
-    if (r->flags & KV_FLAG_TOMBSTONE) {
-        send_error(res, &(error_response_t){
-                .error = "not_found",
-                .message = "Key was deleted (tombstone exists)",
-                .docs = NULL
-        });
-        return 0;
-    }
-    if (r->expires_us && r->expires_us <= wall_us()) {
-        strcpy(res->buffer, "{\"ok\":false,\"error\":\"expired\",\"message\":\"Key has expired\"}");
+        send_error(res, &(error_response_t){ .error="not_found", .message="Key does not exist in this namespace", .docs=NULL });
         return 0;
     }
 
-    size_t need = b64_len(r->value_len);
-    // {"value":"...","cas":123}
-    char *p = res->buffer;
-    int n = snprintf(p, RESPONSE_BUFFER_SIZE, "{\"value\":\"");
-    p += n;
-    size_t wrote = b64_encode(r->value, r->value_len, p);
-    p += wrote;
-    n = snprintf(p, RESPONSE_BUFFER_SIZE - (p - res->buffer), "\",\"cas\":%" PRIu64 "}", r->cas);
-    (void)n;
+    kvrec_t *r = (kvrec_t*)buf;
+    if (r->flags & KV_FLAG_TOMBSTONE) {
+        send_error(res, &(error_response_t){ .error="not_found", .message="Key was deleted (tombstone exists)", .docs=NULL });
+        return 0;
+    }
+    if (r->expires_us && r->expires_us <= rf_wall_us()) {
+        send_error(res, &(error_response_t){ .error="not_found", .message="Key expired", .docs=NULL });
+        return 0;
+    }
+
+    respw_t w = rw_init(res);
+
+    size_t v64 = b64_len(r->value_len);
+    /* {"value":"<b64>","cas":184467...} */
+    size_t overhead = 32 + v64 + 32;
+    if ((size_t)(w.end - w.p) < overhead) {
+        send_error(res, &(error_response_t){
+                .error="response_too_large",
+                .message="Value is too large to return in a single response",
+                .docs="https://ayder.dev/docs/api/kv#limits"
+        });
+        return 0;
+    }
+
+    rw_str(&w, "{\"value\":\"");
+    w.p += b64_encode((const uint8_t*)r->value, r->value_len, w.p);
+    rw_printf(&w, "\",\"cas\":%" PRIu64 "}", r->cas);
     return 0;
 }
 
@@ -1772,12 +1986,12 @@ int kv_put_handler(Request *req, Response *res){
     }
 
     int skey = kv_int_key(ns,key);
-    uint8_t curbuf[MAX_DATA_SIZE]; size_t cur_sz=0; uint64_t cur_cas=0; uint32_t cur_flags=0;
+    uint8_t curbuf[MAX_DATA_SIZE];
+    uint64_t cur_cas = 0;
     int have = shared_storage_get_fast(g_shared_storage, skey, curbuf, sizeof(curbuf));
     if (have) {
         kvrec_t *r = (kvrec_t*)curbuf;
         cur_cas = r->cas;
-        cur_flags = r->flags;
     }
 
     // CAS check (only if provided)
@@ -1944,6 +2158,7 @@ int kv_delete_handler(Request *req, Response *res){
 
 // Route Registration
 void register_application_routes(App *app, int control_plane) {
+    (void)control_plane;
     // Set global app reference for route handlers
     g_app = app;
     // System routes
