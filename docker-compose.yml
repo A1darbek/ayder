@@ -1,4 +1,3 @@
-version: "3.8"
 services:
   ayder:
     build: .
@@ -20,3 +19,4 @@ services:
 
 volumes:
   ayder_data:
+
