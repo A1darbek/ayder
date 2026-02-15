@@ -108,7 +108,6 @@ void storage_save(Storage *st, int id, const void *data, size_t size) {
     if (new_val == NULL) return;  // Handle malloc failure
     memcpy(new_val, data, size);
     size_t new_sz  = size;
-    uint8_t new_flag = BUCKET_OCCUPIED;
 
     for (;;) {
         cur_flag = st->flags[idx];
