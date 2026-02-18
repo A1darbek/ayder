@@ -836,14 +836,28 @@ static int init_io_uring(void) {
     if (running_under_valgrind()) {
         printf("ℹ️  Valgrind detected — disabling io_uring for this run\n");
         atomic_store(&g_uring_ctx.initialized, false);
-        return -1; // NOTE: Aidarbek eger baska error shyksa onda return -1 ge ornyna keltir
+        return -1;
     }
     struct io_uring_params params = {0};
-    params.flags = IORING_SETUP_SQPOLL | IORING_SETUP_SQ_AFF;
-    params.sq_thread_idle = 2000;  /* 2 second idle timeout */
+    const char *sqpoll = getenv("RF_URING_SQPOLL");
+    if (sqpoll && atoi(sqpoll) > 0) {
+        params.flags |= IORING_SETUP_SQPOLL;
+        params.sq_thread_idle = 2000;
+
+        const char *cpu = getenv("RF_URING_SQ_CPU");
+        if (cpu) {
+            params.flags |= IORING_SETUP_SQ_AFF;
+            params.sq_thread_cpu = atoi(cpu);
+        }
+    }
 
 
     int ret = io_uring_queue_init_params(URING_QUEUE_DEPTH, &g_uring_ctx.ring, &params);
+    if (ret == -EPERM && (params.flags & IORING_SETUP_SQPOLL)) {
+        memset(&params, 0, sizeof(params));
+        ret = io_uring_queue_init_params(URING_QUEUE_DEPTH, &g_uring_ctx.ring, &params);
+    }
+
     if (ret < 0) {
         fprintf(stderr, "io_uring_queue_init_params failed: %s\n", strerror(-ret));
         atomic_store(&g_uring_ctx.initialized, false);
@@ -1625,8 +1639,8 @@ void AOF_init(const char *path, size_t ring_capacity, unsigned interval_ms) {
     }
 
     if (init_io_uring() != 0) {
-        fprintf(stderr, "Failed to initialize io_uring\n");
-        exit(1);
+    fprintf(stderr, "io_uring unavailable — falling back to sync AOF writes\n");
+    atomic_store(&g_uring_ctx.initialized, false);
     }
 
     if (init_wal_buffer() != 0) {
