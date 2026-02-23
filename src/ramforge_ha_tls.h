@@ -1,9 +1,9 @@
 
 #pragma once
 
+#include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <stdatomic.h>
 
 #include <openssl/ssl.h>
 
@@ -11,18 +11,18 @@
 
 // Initialize TLS contexts from env (idempotent).
 // If RF_HA_TLS!=1, this is a no-op and returns 0.
-int  HA_tls_init_from_env(void);
+int HA_tls_init_from_env(void);
 void HA_tls_shutdown(void);
-int  HA_tls_enabled(void);
+int HA_tls_enabled(void);
 
 void HA_tls_graceful_shutdown(SSL *ssl);
 
 // Create SSL objects bound to an existing fd.
-SSL* HA_tls_new_client(int fd, const char *sni_host);
-SSL* HA_tls_new_server(int fd);
+SSL *HA_tls_new_client(int fd, const char *sni_host);
+SSL *HA_tls_new_server(int fd);
 
 // Nonblocking handshake helper (poll-based). Returns 0 on success, -1 on failure.
-int  HA_tls_handshake(SSL *ssl, int fd, int is_server, int timeout_ms);
+int HA_tls_handshake(SSL *ssl, int fd, int is_server, int timeout_ms);
 
 // Exact read/write helpers for stream framing (poll-based).
 // Return bytes transferred, or -1 on failure.

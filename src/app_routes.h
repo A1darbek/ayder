@@ -10,5 +10,4 @@ extern App *g_app;
 
 void register_application_routes(App *app, int control_plane);
 
-
 #endif

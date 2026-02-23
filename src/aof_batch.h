@@ -1,35 +1,31 @@
 #ifndef AOF_BATCH_H
 #define AOF_BATCH_H
 
-#include <stddef.h>
-#include "storage.h"
 #include "rf_broker.h"
+#include "storage.h"
+#include <stddef.h>
 
 #ifndef AOF_REC_BROKER_TTL
-#define AOF_REC_BROKER_TTL 0x54544C31  /* 'TTL1' */
+#  define AOF_REC_BROKER_TTL 0x54544C31 /* 'TTL1' */
 #endif
 #define AOF_REC_BROKER_RETENTION 0x5252
 
 #define AOF_REC_KV_PUT 0x4B560001
 #define AOF_REC_KV_DEL 0x4B560002
 
+#define KV_FLAG_TOMBSTONE (1u << 0)
 
-#define KV_FLAG_TOMBSTONE  (1u<<0)
-
-#pragma pack(push,1)
+#pragma pack(push, 1)
 typedef struct {
-    uint64_t cas;            // 0 if never written
-    uint64_t expires_us;     // 0 = no ttl
-    uint32_t flags;          // tombstone, etc
-    uint32_t value_len;      // payload length
-    uint8_t  value[];        // payload bytes
+  uint64_t cas;        // 0 if never written
+  uint64_t expires_us; // 0 = no ttl
+  uint32_t flags;      // tombstone, etc
+  uint32_t value_len;  // payload length
+  uint8_t value[];     // payload bytes
 } kvrec_t;
 #pragma pack(pop)
 
-
-void AOF_init(const char *path,
-              size_t ring_capacity,
-              unsigned flush_interval_ms);
+void AOF_init(const char *path, size_t ring_capacity, unsigned flush_interval_ms);
 
 void AOF_prepare_for_rotation(void);
 int AOF_rotate_file(const char *new_path);
@@ -54,7 +50,6 @@ int aof_write_record(int fd, int id, const void *data, uint32_t size);
 void AOF_sealed_follower_start(int worker_id);
 size_t AOF_sealed_queue_depth(void);
 
-
 /* Check if non-blocking rewrite is in progress */
 int AOF_rewrite_in_progress(void);
 void AOF_sync(void);
@@ -62,9 +57,8 @@ size_t AOF_pending_writes(void);
 uint64_t AOF_append_sealed(int id, const void *data, size_t sz);
 uint64_t AOF_sealed_last_synced_id(void);
 
-
 /* Replays <aof_path>.sealed (idempotent). Returns #records applied. */
-size_t   AOF_sealed_replay(const char *aof_path);
+size_t AOF_sealed_replay(const char *aof_path);
 /* Non-blocking rewrite - returns 0 on success, -1 if already running */
 int AOF_rewrite_nonblocking(Storage *st);
 
