@@ -1,8 +1,8 @@
 #ifndef HTTP_SERVER_H
 #define HTTP_SERVER_H
 
-#include <uv.h>
 #include "app.h"
+#include <uv.h>
 
 /**
  * Initialize & run HTTP server on `port`.

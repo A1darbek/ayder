@@ -1,0 +1,7 @@
+BasedOnStyle: LLVM
+IndentWidth: 2
+ColumnLimit:     120
+AlignConsecutiveAssignments:
+  Enabled:         true
+  AcrossComments:  true
+IndentPPDirectives: AfterHash

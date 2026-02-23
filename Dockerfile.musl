@@ -32,7 +32,7 @@ RUN mkdir -p deps/picohttpparser && \
         -o deps/picohttpparser/picohttpparser.h ; \
     fi
 
-RUN make clean && make CFLAGS="-O3 -g -pipe -flto -ffunction-sections -Wall -Wextra -Wshadow -Wdouble-promotion"
+RUN make clean && make CFLAGS="-O3 -g -pipe -flto=auto -ffunction-sections -Wall -Wextra -Wshadow -Wdouble-promotion"
 
 ############################
 # 2) RUNTIME (musl)
