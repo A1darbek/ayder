@@ -1,11 +1,16 @@
 // ramforge_ha_config.c - Configuration Loading and Management
 #include "ramforge_ha_config.h"
-#include "log.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+
+#ifndef LOGI
+#define LOGI(fmt, ...) fprintf(stderr, "[HA-CONFIG] " fmt "\n", ##__VA_ARGS__)
+#define LOGW(fmt, ...) fprintf(stderr, "[HA-CONFIG][WARN] " fmt "\n", ##__VA_ARGS__)
+#define LOGE(fmt, ...) fprintf(stderr, "[HA-CONFIG][ERR] " fmt "\n", ##__VA_ARGS__)
+#endif
 
 static inline uint64_t now_us(void) {
   struct timespec ts;
@@ -26,8 +31,6 @@ static int env_is_on(const char *name) {
   return (e && *e && strcmp(e, "0") != 0);
 }
 
-// Parse node list from RF_HA_NODES environment variable
-// Format: "node1:host1:port1:priority,node2:host2:port2:priority,..."
 static int parse_node_list(ha_config_t *config) {
   const char *env = getenv("RF_HA_NODES");
   if (!env || !*env) {
@@ -41,7 +44,6 @@ static int parse_node_list(ha_config_t *config) {
   while (*p && config->node_count < HA_MAX_NODES) {
     ha_node_config_t *node = &config->nodes[config->node_count];
 
-    // Parse node_id
     const char *start = p;
     while (*p && *p != ':' && *p != ',')
       p++;
@@ -55,8 +57,6 @@ static int parse_node_list(ha_config_t *config) {
       break;
     p++;
 
-    // Parse host:port for cluster communication
-    // Parse HOST for cluster communication
     start = p;
     while (*p && *p != ':' && *p != ',')
       p++;
@@ -70,7 +70,6 @@ static int parse_node_list(ha_config_t *config) {
       break;
     p++;
 
-    // Parse cluster port
     char port_buf[16];
     start        = p;
     int port_len = 0;
@@ -79,12 +78,10 @@ static int parse_node_list(ha_config_t *config) {
     }
     port_buf[port_len] = 0;
 
-    // Complete advertise_addr = "HOST:PORT"
     strncat(node->advertise_addr, ":", sizeof(node->advertise_addr) - strlen(node->advertise_addr) - 1);
     strncat(node->advertise_addr, port_buf, sizeof(node->advertise_addr) - strlen(node->advertise_addr) - 1);
 
-    // Parse priority (optional)
-    node->priority = 10; // Default priority
+    node->priority = 10;
     if (*p == ':') {
       p++;
       node->priority = atoi(p);
@@ -92,12 +89,8 @@ static int parse_node_list(ha_config_t *config) {
         p++;
     }
 
-    // All nodes are voters by default
     node->is_voter = 1;
 
-    // FIX: Generate HTTP address using cluster_port + 1 (data plane port)
-    // Cluster port is 7000, 8000, 9000
-    // Data plane HTTP is 7001, 8001, 9001
     int cluster_port = atoi(port_buf);
 
     char host_only[256];
@@ -107,7 +100,6 @@ static int parse_node_list(ha_config_t *config) {
     memcpy(host_only, node->advertise_addr, cut);
     host_only[cut] = 0;
 
-    // FIX: HTTP runs on cluster_port + 1 (the actual data plane port)
     snprintf(node->http_addr, sizeof(node->http_addr), "http://%s:%d", host_only, cluster_port + 1);
 
     LOGI("Node[%d] advertise_addr=%s http_addr=%s priority=%d voter=%d", (int)config->node_count, node->advertise_addr,
@@ -121,7 +113,7 @@ static int parse_node_list(ha_config_t *config) {
   LOGI("Parsed %d HA nodes", config->node_count);
   return 0;
 }
-// Find local node index based on RF_HA_NODE_ID
+
 static int find_local_node(ha_config_t *config) {
   char local_buf[256];
   const char *local_id = getenv("RF_HA_NODE_ID");
@@ -150,11 +142,9 @@ int HA_init_from_env(ha_config_t *config, ha_runtime_t *runtime) {
   memset(config, 0, sizeof(*config));
   memset(runtime, 0, sizeof(*runtime));
 
-  // Parse node list
   if (parse_node_list(config) != 0)
     return -1;
 
-  // Validate cluster size
   if (config->node_count < 1) {
     LOGE("Need at least 1 node");
     return -1;
@@ -164,17 +154,15 @@ int HA_init_from_env(ha_config_t *config, ha_runtime_t *runtime) {
     LOGW("Even number of nodes (%d) - consider adding one for proper quorum", config->node_count);
   }
 
-  // Find local node
   if (find_local_node(config) != 0)
     return -1;
 
-  // Load timing configuration
   const char *env;
 
   config->mtls_enabled             = env_is_on("RF_HA_MTLS");
   config->mtls_verify_peer         = config->mtls_enabled ? 1 : 0;
   config->mtls_require_client_cert = config->mtls_enabled ? 1 : 0;
-  config->mtls_verify_mode         = 2; // either host/ip OR node_id by default
+  config->mtls_verify_mode         = 2;
 
   if ((env = getenv("RF_HA_MTLS_VERIFY_PEER")))
     config->mtls_verify_peer = atoi(env);
@@ -194,6 +182,7 @@ int HA_init_from_env(ha_config_t *config, ha_runtime_t *runtime) {
     config->ha_max_msg_bytes = (uint32_t)strtoul(env, NULL, 10);
   if (config->ha_max_msg_bytes < 64 * 1024)
     config->ha_max_msg_bytes = 64 * 1024;
+
   config->heartbeat_interval_ms = HA_HEARTBEAT_MS;
   if ((env = getenv("RF_HA_HEARTBEAT_MS"))) {
     config->heartbeat_interval_ms = atoi(env);
@@ -214,23 +203,21 @@ int HA_init_from_env(ha_config_t *config, ha_runtime_t *runtime) {
     config->max_replication_lag_ms = atoi(env);
   }
 
-  // Load replication configuration
   config->replication_batch_size = HA_REPLICATION_BATCH;
   if ((env = getenv("RF_HA_REPLICATION_BATCH"))) {
     config->replication_batch_size = atoi(env);
   }
 
-  config->sync_mode = 0; // async by default
+  config->sync_mode = 0;
   if ((env = getenv("RF_HA_SYNC_MODE"))) {
     config->sync_mode = atoi(env);
   }
 
-  config->write_concern = (config->node_count / 2) + 1; // majority
+  config->write_concern = (config->node_count / 2) + 1;
   if ((env = getenv("RF_HA_WRITE_CONCERN"))) {
     config->write_concern = atoi(env);
   }
 
-  // Load redirection configuration
   config->redirect_status = 307;
   if ((env = getenv("RF_HA_REDIRECT_STATUS"))) {
     config->redirect_status = atoi(env);
@@ -241,7 +228,6 @@ int HA_init_from_env(ha_config_t *config, ha_runtime_t *runtime) {
     config->retry_after_sec = atoi(env);
   }
 
-  // Initialize runtime state
   atomic_store(&runtime->role, HA_ROLE_FOLLOWER);
   atomic_store(&runtime->state, HA_STATE_INITIALIZING);
   atomic_store(&runtime->term, 0);
@@ -251,14 +237,39 @@ int HA_init_from_env(ha_config_t *config, ha_runtime_t *runtime) {
   atomic_store(&runtime->last_heartbeat_us, now_us());
   atomic_store(&runtime->voted_for, -1);
 
+  uint64_t voters_mask = 0;
+  uint64_t learners_mask = 0;
+
   for (int i = 0; i < HA_MAX_NODES; i++) {
     atomic_store(&runtime->next_index[i], 1);
     atomic_store(&runtime->match_index[i], 0);
     atomic_store(&runtime->last_ack_us[i], 0);
+    if (i < config->node_count && config->nodes[i].node_id[0]) {
+      if (config->nodes[i].is_voter) voters_mask |= HA_NODE_MASK(i);
+      else learners_mask |= HA_NODE_MASK(i);
+    }
   }
+
+  atomic_store(&runtime->voters_old_mask, voters_mask);
+  atomic_store(&runtime->voters_new_mask, voters_mask);
+  atomic_store(&runtime->learners_mask, learners_mask);
+  atomic_store(&runtime->joint_active, 0);
+  atomic_store(&runtime->config_epoch, 1);
+  atomic_store(&runtime->cfg_change_inflight, 0);
+
+  atomic_store(&runtime->bootstrap_gate_active, 0);
+  atomic_store(&runtime->bootstrap_quorum_confirmed, 0);
+  atomic_store(&runtime->bootstrap_gate_start_us, 0);
+  atomic_store(&runtime->last_quorum_ok_us, now_us());
+  atomic_store(&runtime->quorum_miss_streak, 0);
 
   if (pthread_rwlock_init(&runtime->state_lock, NULL) != 0) {
     LOGE("Failed to initialize state lock");
+    return -1;
+  }
+  if (pthread_rwlock_init(&runtime->membership_lock, NULL) != 0) {
+    LOGE("Failed to initialize membership lock");
+    pthread_rwlock_destroy(&runtime->state_lock);
     return -1;
   }
 
@@ -291,6 +302,8 @@ uint64_t HA_get_replication_lag_ms(const ha_runtime_t *runtime) {
   if (commit <= applied)
     return 0;
 
-  // Rough estimate: assume 1ms per entry lag
   return (commit - applied);
 }
+
+
+
