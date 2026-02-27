@@ -3,101 +3,106 @@
 #define RAMFORGE_HA_REPLICATION_H
 
 #include "ramforge_ha_config.h"
-#include <stddef.h>
 #include <stdint.h>
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// Replication Log Entry
-// ═══════════════════════════════════════════════════════════════════════════════
+#include <stddef.h>
 
 typedef struct {
-  uint64_t index;        // Log index
-  uint64_t term;         // Election term when entry was created
-  uint64_t timestamp_us; // Creation timestamp
-  uint32_t type;         // Entry type (sealed record type)
-  uint32_t size;         // Payload size
-  uint32_t crc;          // CRC32C checksum
-  uint32_t reserved;
-  uint8_t data[]; // Variable-length payload
+    uint64_t index;
+    uint64_t term;
+    uint64_t timestamp_us;
+    uint32_t type;
+    uint32_t size;
+    uint32_t crc;
+    uint32_t reserved;
+    uint8_t data[];
 } __attribute__((packed)) ha_log_entry_t;
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Replication Messages (Zero-Copy Protocol)
-// ═══════════════════════════════════════════════════════════════════════════════
-
 typedef enum {
-  HA_MSG_HEARTBEAT        = 1, // Leader heartbeat
-  HA_MSG_APPEND_ENTRIES   = 2, // Replicate log entries
-  HA_MSG_APPEND_RESPONSE  = 3, // Acknowledge replication
-  HA_MSG_VOTE_REQUEST     = 4, // Request votes for election
-  HA_MSG_VOTE_RESPONSE    = 5, // Grant or deny vote
-  HA_MSG_INSTALL_SNAPSHOT = 6  // Transfer snapshot
+    HA_MSG_HEARTBEAT = 1,
+    HA_MSG_APPEND_ENTRIES = 2,
+    HA_MSG_APPEND_RESPONSE = 3,
+    HA_MSG_VOTE_REQUEST = 4,
+    HA_MSG_VOTE_RESPONSE = 5,
+    HA_MSG_INSTALL_SNAPSHOT = 6
 } ha_msg_type_t;
 
 typedef struct {
-  uint32_t magic;        // 0xHA01
-  uint32_t type;         // ha_msg_type_t
-  uint64_t term;         // Sender's current term
-  int32_t from_node;     // Sender node index
-  int32_t to_node;       // Recipient node index (-1 for broadcast)
-  uint32_t payload_size; // Size of message-specific payload
-  uint32_t crc;          // Header CRC
+    uint32_t magic;
+    uint32_t type;
+    uint64_t term;
+    int32_t from_node;
+    int32_t to_node;
+    uint32_t payload_size;
+    uint32_t crc;
 } __attribute__((packed)) ha_msg_header_t;
 
 typedef struct {
-  uint64_t commit_index;   // Leader's commit index
-  uint64_t prev_log_index; // Index of log entry immediately preceding new ones
-  uint64_t prev_log_term;  // Term of prev_log_index entry
-  uint32_t entry_count;    // Number of entries in this message
-  uint32_t reserved;
-  // Followed by entry_count ha_log_entry_t records
+    uint64_t commit_index;
+    uint64_t prev_log_index;
+    uint64_t prev_log_term;
+    uint32_t entry_count;
+    uint32_t reserved;
 } __attribute__((packed)) ha_append_entries_t;
 
 typedef struct {
-  uint64_t match_index; // Highest log index follower has
-  int32_t success;      // 1 if follower contained entry matching prev_log_index/term
-  uint32_t reserved;
+    uint64_t match_index;
+    int32_t success;
+    uint32_t reserved;
 } __attribute__((packed)) ha_append_response_t;
 
 typedef struct {
-  uint64_t last_log_index; // Index of candidate's last log entry
-  uint64_t last_log_term;  // Term of candidate's last log entry
-  int32_t priority;        // Candidate's priority
-  uint32_t reserved;
+    uint64_t last_log_index;
+    uint64_t last_log_term;
+    int32_t priority;
+    uint32_t reserved;
 } __attribute__((packed)) ha_vote_request_t;
 
 typedef struct {
-  int32_t vote_granted; // 1 if vote granted, 0 otherwise
-  uint32_t reserved;
+    int32_t vote_granted;
+    uint32_t reserved;
 } __attribute__((packed)) ha_vote_response_t;
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Replication Engine API
-// ═══════════════════════════════════════════════════════════════════════════════
+#define HA_SNAPSHOT_FLAG_START 0x1u
+#define HA_SNAPSHOT_FLAG_END   0x2u
 
-// Initialize replication engine
+typedef struct {
+    uint64_t snapshot_id;
+    uint64_t last_included_index;
+    uint64_t last_included_term;
+    uint64_t leader_commit;
+    uint32_t flags;          // HA_SNAPSHOT_FLAG_*
+    uint32_t record_count;   // [rec_id:u32][size:u32][payload]
+    uint32_t payload_bytes;  // bytes after this header
+    uint32_t reserved;
+} __attribute__((packed)) ha_install_snapshot_t;
+
 int HA_replication_init(ha_config_t *config, ha_runtime_t *runtime);
-
-// Shutdown replication engine
+void HA_replication_bind(ha_config_t *config, ha_runtime_t *runtime);
 void HA_replication_shutdown(void);
 void HA_request_catchup(void);
-// Append entry to local log (called by leader for new writes)
 uint64_t HA_append_local_entry(uint32_t type, const void *data, uint32_t size);
 
-// Replicate entries to followers (async, batched)
 int HA_replicate_to_followers(void);
 int HA_start_election(void);
-int send_message(int peer_index, ha_msg_header_t *header, const void *payload, size_t payload_size);
+int send_message(int peer_index, ha_msg_header_t *header,
+                 const void *payload, size_t payload_size);
 int HA_leader_on_ack(int peer_index, uint64_t match_index);
-// Wait for write concern to be satisfied (returns when enough replicas ack)
 int HA_wait_for_replication(uint64_t index, uint32_t timeout_ms);
 int HA_forward_append_and_replicate(uint32_t rec_type, const void *data, size_t size);
 uint64_t HA_repl_kick_read(void);
-// Apply committed entries to state machine
 int HA_apply_committed_entries(void);
 void HA_leader_on_nack(int peer_index, uint64_t follower_index);
 
-// Get current log stats
 void HA_get_log_stats(uint64_t *last_index, uint64_t *committed, uint64_t *applied);
+int HA_has_fresh_quorum(void);
+
+/* Dynamic membership helpers */
+int HA_get_membership_view(ha_membership_view_t *out);
+int HA_apply_cfg_change_entry(const void *data, uint32_t size);
+int HA_apply_membership_snapshot(const ha_membership_record_t *rec);
+int HA_is_peer_active(int peer_index);
+int HA_local_is_voter(void);
 
 #endif // RAMFORGE_HA_REPLICATION_H
+
+
