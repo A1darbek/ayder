@@ -2,140 +2,158 @@
 #ifndef RAMFORGE_HA_CONFIG_H
 #define RAMFORGE_HA_CONFIG_H
 
-#include <pthread.h>
-#include <stdatomic.h>
 #include <stdint.h>
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// HA Node Roles and States
-// ═══════════════════════════════════════════════════════════════════════════════
+#include <stdatomic.h>
+#include <pthread.h>
 
 typedef enum {
-  HA_ROLE_LEADER    = 0, // Active leader accepting writes
-  HA_ROLE_FOLLOWER  = 1, // Follower replicating from leader
-  HA_ROLE_CANDIDATE = 2, // Candidate during election
-  HA_ROLE_LEARNER   = 3  // Read-only learner (not in voting quorum)
+    HA_ROLE_LEADER = 0,
+    HA_ROLE_FOLLOWER = 1,
+    HA_ROLE_CANDIDATE = 2,
+    HA_ROLE_LEARNER = 3
 } ha_role_t;
 
 typedef enum {
-  HA_STATE_INITIALIZING = 0,
-  HA_STATE_READY        = 1,
-  HA_STATE_SYNCING      = 2,
-  HA_STATE_DEGRADED     = 3,
-  HA_STATE_FAILED       = 4
+    HA_STATE_INITIALIZING = 0,
+    HA_STATE_READY = 1,
+    HA_STATE_SYNCING = 2,
+    HA_STATE_DEGRADED = 3,
+    HA_STATE_FAILED = 4
 } ha_state_t;
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// HA Configuration
-// ═══════════════════════════════════════════════════════════════════════════════
+#define HA_MAX_NODES 7
+#define HA_HEARTBEAT_MS 100
+#define HA_ELECTION_TIMEOUT_MS 1000
+#define HA_REPLICATION_BATCH 256
+#define HA_MAX_LAG_MS 5000
+#define HA_NODE_MASK(i) (1ULL << (uint64_t)(i))
 
-#define HA_MAX_NODES 7              // Max cluster size (must be odd for quorum)
-#define HA_HEARTBEAT_MS 100         // Fast heartbeat for sub-second detection
-#define HA_ELECTION_TIMEOUT_MS 1000 // Fast election timeout
-#define HA_REPLICATION_BATCH 256    // Batch size for replication
-#define HA_MAX_LAG_MS 5000          // Max acceptable replication lag
+#define HA_LOG_CFG_CHANGE 0x48414346u /* HACF */
+#define AOF_REC_HA_MEMBERSHIP 0x48414D31u /* HAM1 */
+
+typedef enum {
+    HA_CFG_OP_ADD_LEARNER = 1,
+    HA_CFG_OP_PROMOTE_VOTER_JOINT_BEGIN = 2,
+    HA_CFG_OP_PROMOTE_VOTER_FINALIZE = 3,
+    HA_CFG_OP_REMOVE_MEMBER_JOINT_BEGIN = 4,
+    HA_CFG_OP_REMOVE_MEMBER_FINALIZE = 5
+} ha_cfg_change_op_t;
 
 typedef struct {
-  char node_id[64];         // Unique node identifier
-  char advertise_addr[256]; // IP:port for cluster communication
-  char http_addr[256];      // IP:port for client traffic
-  int priority;             // Election priority (higher = preferred)
-  int is_voter;             // 1 if participates in quorum, 0 for learner
+    char node_id[64];
+    char advertise_addr[256];
+    char http_addr[256];
+    int priority;
+    int is_voter;
 } ha_node_config_t;
 
 typedef struct {
-  // Cluster configuration
-  int node_count;
-  ha_node_config_t nodes[HA_MAX_NODES];
-  int local_node_index; // Index of this node in nodes[]
+    int node_count;
+    ha_node_config_t nodes[HA_MAX_NODES];
+    int local_node_index;
 
-  // Timing configuration
-  uint32_t heartbeat_interval_ms;
-  uint32_t election_timeout_ms;
-  uint32_t replication_timeout_ms;
-  uint32_t max_replication_lag_ms;
+    uint32_t heartbeat_interval_ms;
+    uint32_t election_timeout_ms;
+    uint32_t replication_timeout_ms;
+    uint32_t max_replication_lag_ms;
 
-  // Replication configuration
-  size_t replication_batch_size;
-  int sync_mode;     // 0=async, 1=sync to majority, 2=sync to all
-  int write_concern; // Number of nodes that must ack writes
+    size_t replication_batch_size;
+    int sync_mode;
+    int write_concern;
 
-  // Leader redirection
-  char leader_url[256]; // Current leader URL for redirects
-  int redirect_status;  // 307 or 308
-  int retry_after_sec;  // Retry-After header value
+    char leader_url[256];
+    int redirect_status;
+    int retry_after_sec;
 
-  // --- mTLS (cluster / advertise_addr only) ---
-  int mtls_enabled;             // RF_HA_MTLS=1
-  int mtls_verify_peer;         // default 1
-  int mtls_require_client_cert; // default 1 (server side)
-  int mtls_verify_mode;         // 0=host/ip, 1=node_id, 2=either
+    int  mtls_enabled;
+    int  mtls_verify_peer;
+    int  mtls_require_client_cert;
+    int  mtls_verify_mode;
 
-  char mtls_ca_file[256];   // RF_HA_MTLS_CA_FILE
-  char mtls_ca_path[256];   // RF_HA_MTLS_CA_PATH (optional)
-  char mtls_cert_file[256]; // RF_HA_MTLS_CERT_FILE
-  char mtls_key_file[256];  // RF_HA_MTLS_KEY_FILE
-  char mtls_key_pass[128];  // RF_HA_MTLS_KEY_PASS (optional)
+    char mtls_ca_file[256];
+    char mtls_ca_path[256];
+    char mtls_cert_file[256];
+    char mtls_key_file[256];
+    char mtls_key_pass[128];
 
-  uint32_t ha_max_msg_bytes; // RF_HA_MAX_MSG_BYTES (default 2MB)
+    uint32_t ha_max_msg_bytes;
 } ha_config_t;
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// HA Runtime State
-// ═══════════════════════════════════════════════════════════════════════════════
+typedef struct {
+    uint32_t op;
+    uint32_t node_index;
+    uint64_t expected_epoch;
+    uint64_t voters_old_mask;
+    uint64_t voters_new_mask;
+    uint64_t learners_mask;
+    ha_node_config_t member;
+} __attribute__((packed)) ha_cfg_change_t;
 
 typedef struct {
-  // Role and state
-  _Atomic(ha_role_t) role;
-  _Atomic(ha_state_t) state;
-  _Atomic uint64_t term;          // Current election term
-  _Atomic uint64_t commit_index;  // Highest committed log index
-  _Atomic uint64_t applied_index; // Highest applied log index
+    uint64_t epoch;
+    uint64_t voters_old_mask;
+    uint64_t voters_new_mask;
+    uint64_t learners_mask;
+    uint32_t joint_active;
+    uint32_t node_count;
+    ha_node_config_t nodes[HA_MAX_NODES];
+} __attribute__((packed)) ha_membership_record_t;
 
-  // Leader tracking
-  _Atomic int current_leader;         // Index of current leader (-1 if unknown)
-  _Atomic uint64_t last_heartbeat_us; // Last heartbeat from leader
-  _Atomic int voted_for;              // Node we voted for in current term (-1 if none)
+typedef ha_membership_record_t ha_membership_view_t;
 
-  // Replication tracking (for leader)
-  _Atomic uint64_t next_index[HA_MAX_NODES];  // Next log entry to send to each follower
-  _Atomic uint64_t match_index[HA_MAX_NODES]; // Highest known replicated entry per follower
-  _Atomic uint64_t last_ack_us[HA_MAX_NODES]; // Last ack time from each node
+typedef struct {
+    _Atomic(ha_role_t) role;
+    _Atomic(ha_state_t) state;
+    _Atomic uint64_t term;
+    _Atomic uint64_t commit_index;
+    _Atomic uint64_t applied_index;
 
-  // Statistics
-  _Atomic uint64_t elections_started;
-  _Atomic uint64_t elections_won;
-  _Atomic uint64_t heartbeats_sent;
-  _Atomic uint64_t heartbeats_received;
-  _Atomic uint64_t writes_replicated;
-  _Atomic uint64_t writes_failed;
+    _Atomic int current_leader;
+    _Atomic uint64_t last_heartbeat_us;
+    _Atomic int voted_for;
 
-  // Thread safety
-  pthread_rwlock_t state_lock;
+    _Atomic uint64_t voters_old_mask;
+    _Atomic uint64_t voters_new_mask;
+    _Atomic uint64_t learners_mask;
+    _Atomic int joint_active;
+    _Atomic uint64_t config_epoch;
+    _Atomic int cfg_change_inflight;
+    pthread_rwlock_t membership_lock;
 
-  _Atomic int votes_granted;
+    _Atomic uint64_t next_index[HA_MAX_NODES];
+    _Atomic uint64_t match_index[HA_MAX_NODES];
+    _Atomic uint64_t last_ack_us[HA_MAX_NODES];
+
+    _Atomic uint64_t elections_started;
+    _Atomic uint64_t elections_won;
+    _Atomic uint64_t heartbeats_sent;
+    _Atomic uint64_t heartbeats_received;
+    _Atomic uint64_t writes_replicated;
+    _Atomic uint64_t writes_failed;
+    _Atomic uint64_t snapshots_sent;
+    _Atomic uint64_t snapshots_received;
+    _Atomic uint64_t snapshot_bytes_sent;
+    _Atomic uint64_t snapshot_bytes_received;
+    _Atomic uint64_t snapshot_failures;
+
+    /* Quorum stability guards (startup/reconnect hysteresis). */
+    _Atomic int bootstrap_gate_active;
+    _Atomic int bootstrap_quorum_confirmed;
+    _Atomic uint64_t bootstrap_gate_start_us;
+    _Atomic uint64_t last_quorum_ok_us;
+    _Atomic uint32_t quorum_miss_streak;
+
+    pthread_rwlock_t state_lock;
+
+    _Atomic int votes_granted;
 } ha_runtime_t;
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Public API
-// ═══════════════════════════════════════════════════════════════════════════════
-
-// Initialize HA system from environment variables
 int HA_init_from_env(ha_config_t *config, ha_runtime_t *runtime);
-
-// Get current role
 ha_role_t HA_get_role(const ha_runtime_t *runtime);
-
-// Check if node is leader
 int HA_is_leader(const ha_runtime_t *runtime);
-
-// Check if node is ready to serve requests
 int HA_is_ready(const ha_runtime_t *runtime);
-
-// Get leader URL for redirection
-const char *HA_get_leader_url(const ha_config_t *config);
-
-// Get current replication lag in milliseconds
+const char* HA_get_leader_url(const ha_config_t *config);
 uint64_t HA_get_replication_lag_ms(const ha_runtime_t *runtime);
 
 #endif // RAMFORGE_HA_CONFIG_H
+
