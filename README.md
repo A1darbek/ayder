@@ -1,91 +1,31 @@
 # Ayder
 
-**HTTP-native durable event log / message bus — written in C**
+Ayder is an HTTP-native durable event log and message bus written in C.
 
-Single binary. HTTP API. `curl` works as a client. No JVM, no ZooKeeper, no client libraries to start sending events.
+Single binary, no JVM, no ZooKeeper, no thick client requirement. You can start with `curl` and grow into multi-node Raft deployments.
 
-▶️ **1-minute demo: SIGKILL → restart → data still there**
-https://www.youtube.com/watch?v=c-n0X5t-A9Y
+## Why This Project Exists
 
-**Live durability sandbox: SIGKILL → restart → committed offsets still correct**  
-Per-visitor container + persisted `/data` volume: https://ayder.xyz/invite  
-Tip: On the sandbox page, click **Run double proof** — it will produce events, SIGKILL the process, restart, then return a JSON proof showing:
-- the last committed offset before kill
-- the first offset consumed after restart
-- confirmation that commits persisted across restart
+Most teams want three things at once:
+- operational simplicity
+- durable replicated writes
+- predictable behavior during node failures
 
-```bash
-# Produce (raw bytes in body)
-curl -X POST 'localhost:1109/broker/topics/orders/produce?partition=0' \
-  -H 'Authorization: Bearer dev' \
-  -d '{"item":"widget"}'
+Ayder is built for that intersection: Kafka-style durability goals with a much lighter operational footprint.
 
-# Consume (base64 for binary-safe payloads)
-curl 'localhost:1109/broker/consume/orders/mygroup/0?encoding=b64' \
-  -H 'Authorization: Bearer dev'
-```
+## Real Jepsen Result (Strict Claim)
 
-Looking for 2–3 design partners to try Ayder in real workloads.
-30-minute setup, white-glove onboarding. See Discussions or email me.
-
----
-
-## Documentation Map
-
-Start here based on what you want to do:
-- Test docs entrypoint: `tests/README.md`
-- Run strict Jepsen claim path: `tests/jepsen/README.md`
-- Run practical HA demos and wrappers: `tests/demo/README.md`
-- Use chaos/benchmark helper scripts: `scripts/README.md`
-- Understand local cluster layout and ports: `cluster/README.md`
-
-If you are preparing a public claim (HN or otherwise), read this order:
-1. `tests/demo/README.md` (short gate + full strict run)
-2. `tests/jepsen/README.md` (artifact and checker details)
-3. `README.md` strict-claim section (wording + proof bundle paths)
-
----
-## Jepsen-style Smoke Test (reproducible)
-
-Ayder ships with a Jepsen-style failure test script you can run locally:
-
-**Script:** `./test_broker_v2.sh`
-
-**Faults:** SIGKILL during writes, restart loops, optional network delay/jitter (tc netem), partitions
-
-**Checks (invariants):**
-- no loss (no gaps / missing sequence)
-- no duplicates when using idempotency_key
-- per-partition order preserved
-- offsets monotonic across restarts and commits
-
-**Run it:**
-```bash
-chmod +x test_broker_v2.sh
-./test_broker_v2.sh
-```
-
-If everything is working correctly, you'll see:
-
-```
-BROKER SMOKE TEST: ALL GREEN ✅
-```
-
-If it fails, please paste the summary + logs in an Issue — reproducible correctness bugs are the top priority.
-
----
-
-## Jepsen Gold Strict Claim (HN-ready)
-
-Claim wording used for publication:
+Current public claim:
 - strictly linearizable under mixed faults, 45/45 pass
 
-Latest full strict pass (as of 2026-03-13):
+Verified run (UTC date):
+- 2026-03-13
 - matrix dir: `tests/jepsen/results/gold_20260313T103615Z`
 - matrix summary: `tests/jepsen/results/gold_20260313T103615Z/cells.csv`
-- result: all 9 cells returned `exit_code=0` (45/45 total runs passed)
+- result: all 9 cells `exit_code=0` (45/45 total runs passed)
 
-Recommended strict run command (mixed first):
+Strict run command (mixed first):
+
 ```bash
 sudo -v
 sudo --preserve-env=STRICT_CLAIM,START_CLUSTER,TOKEN,AYDER_JEPSEN_WORKLOAD,AYDER_JEPSEN_PROFILE,AYDER_JEPSEN_MODES,AYDER_JEPSEN_DURATIONS,AYDER_JEPSEN_RUNS_PER_CELL,AYDER_JEPSEN_NEMESIS_STARTUP_SEC,AYDER_JEPSEN_MIXED_NEMESIS_STARTUP_SEC,AYDER_JEPSEN_PRE_READY_TIMEOUT_SEC \
@@ -101,845 +41,138 @@ AYDER_JEPSEN_PRE_READY_TIMEOUT_SEC=180 \
 bash ./tests/demo/ha_broker_jepsen_gold.sh
 ```
 
-Quick validation after the run:
+Quick validation:
+
 ```bash
 RESULT=tests/jepsen/results/gold_YYYYMMDDTHHMMSSZ
 cat "$RESULT/cells.csv"
 awk -F, 'NR>1 && $4!=0 {bad=1} END {exit bad}' "$RESULT/cells.csv" && echo "ALL CELLS PASS"
 ```
 
-For public proof bundles, include:
+Proof bundle format:
 - `tests/jepsen/artifacts/gold_<run_id>.tar.gz`
 - `tests/jepsen/artifacts/gold_<run_id>.tar.gz.sha256`
 
----
-## Why Ayder?
-
-### Benchmarks (3-node Raft, sync-majority, real network)
-- **wrk2 (rate limited 50K req/s):** 49,871 msg/s, **client p99 3.46ms**
-- **server timing (handler only):** **p99.999 1.22ms** (`server_us`, see output below)
-- **unclean recovery (SIGKILL):** follower catch-up + healthy cluster in **~40–50s** (~8M offsets)
-
-
-| | Kafka | Redis Streams | Ayder |
-|---|-------|---------------|-------|
-| **Protocol** | Kafka binary protocol (client library) | RESP | HTTP (curl works) |
-| **Durability** | Replicated log | Replication depends on Redis topology; quorum semantics differ from a consensus log | Raft consensus (sync-majority) |
-| **Operations** | ZooKeeper/KRaft + JVM tuning | Single node or Redis Cluster | Single binary, zero dependencies |
-| **Latency (P99)** | often 10–50ms (varies by setup) | n/a (depends on topology) | 3.46ms (wrk2 @ 50K req/s) |
-| **Recovery time** | can be long at scale (reports vary) | Minutes | ~40–50s (measured) |
-| **First message** | ~30 min setup | ~5 min setup | ~60 seconds |
-
-**Kafka** is battle-tested but operationally heavy. JVM tuning, partition rebalancing, and config sprawl add up.
-
-**Redis Streams** is simple and fast, but replication is async-only — no majority quorum, no strong durability guarantees.
-
-**Ayder** sits in the middle: Kafka-grade durability (Raft sync-majority) with Redis-like simplicity (single binary, HTTP API). Think of it as what Nginx did to Apache — same pattern applied to event streaming.
-
----
-
-## What You Get
-
-- **Append-only logs** with per-partition offsets
-- **Consumer groups** with committed offsets
-- **Durability** via sealed append-only files (AOF) + crash recovery
-- **HA replication** with Raft consensus (3 / 5 / 7 node clusters)
-- **KV store** with CAS and TTL
-- **Stream processing** with filters, aggregations, and windowed joins (including cross-format Avro+Protobuf joins)
-
----
-
-## Performance
-
-All benchmarks below are run over real network (not loopback). Commands and full outputs are included.
-
-
-### Production Benchmark: 3-Node Cluster (Real Network)
-
-**Setup:**
-- 3-node Raft cluster on DigitalOcean (8 vCPU AMD)
-- Sync-majority writes (2/3 nodes confirm before ACK)
-- 64B payload
-- Separate machines, real network
-
-#### wrk2 (Rate-Limited 50K req/s) — Latency Test
-
-| Metric | Client-side | Server-side |
-|--------|-------------|-------------|
-| **Throughput** | 49,871 msg/s | — |
-| **P50** | 1.60ms | — |
-| **P99** | 3.46ms | — |
-| **P99.9** | 12.94ms | — |
-| **P99.999** | 154.49ms | **1.22ms** |
-
-**Server-side breakdown at P99.999:**
-```
-Handler:     1.22ms
-Queue wait:  0.47ms
-HTTP parse:  0.41ms
-```
-
-The 154ms client-side tail is network/kernel scheduling — the broker itself stays under 2ms even at P99.999. **HTTP is not the bottleneck.**
-
-#### wrk (Max Throughput) — Throughput Test
-
-| Metric | Value |
-|--------|-------|
-| **Throughput** | 93,807 msg/s |
-| **P50** | 3.78ms |
-| **P99** | 10.22ms |
-| **Max** | 224.51ms |
-
-<details>
-<summary>Full wrk output (3-node cluster, max throughput)</summary>
-
-```
-Running 1m test @ http://10.114.0.3:8001
-  12 threads and 400 connections
-  Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     4.26ms    2.97ms 224.51ms   93.76%
-    Req/Sec     7.86k     1.19k   13.70k    67.61%
-  Latency Distribution
-     50%    3.78ms
-     75%    4.93ms
-     90%    6.44ms
-     99%   10.22ms
-  5634332 requests in 1.00m, 2.99GB read
-Requests/sec:  93807.95
-Transfer/sec:     50.92MB
-```
-</details>
-
-<details>
-<summary>Full wrk2 output (3-node cluster, rate-limited)</summary>
-
-```
-Running 1m test @ http://10.114.0.2:9001
-  12 threads and 400 connections
-  Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     1.72ms    1.19ms 216.19ms   96.39%
-    Req/Sec     4.35k     1.17k    7.89k    79.58%
-  Latency Distribution (HdrHistogram - Recorded Latency)
- 50.000%    1.60ms
- 75.000%    2.03ms
- 90.000%    2.52ms
- 99.000%    3.46ms
- 99.900%   12.94ms
- 99.990%   31.76ms
- 99.999%  154.49ms
-100.000%  216.32ms
-
-  2991950 requests in 1.00m, 1.80GB read
-Requests/sec:  49871.12
-
-SERVER  server_us p99.999=1219us (1.219ms)
-SERVER  queue_us p99.999=473us (0.473ms)
-SERVER  recv_parse_us p99.999=411us (0.411ms)
-```
-</details>
-
----
-
-### ARM64 Benchmark: Snapdragon X Elite (WSL2)
-
-Ayder runs natively on ARM64. Here's a benchmark on consumer hardware:
-
-**Setup:**
-- Snapdragon X Elite laptop (1.42 kg)
-- WSL2 Ubuntu, 16GB RAM
-- Running on **battery** (unplugged)
-- 3-node Raft cluster (same machine — testing code efficiency)
-- wrk: 12 threads, 400 connections, 60 seconds
-
-| Metric | Client-side | Server-side |
-|--------|-------------|-------------|
-| **Throughput** | 106,645 msg/s | — |
-| **P50** | 3.57ms | — |
-| **P99** | 7.62ms | — |
-| **P99.999** | 250.84ms | **0.65ms** |
-
-**Server-side breakdown at P99.999:**
-```
-Handler:     0.65ms
-Queue wait:  0.29ms
-HTTP parse:  0.29ms
-```
-
-**Comparison: Snapdragon vs Cloud VMs (Server-side P99.999)**
-
-| Environment | Throughput | Server P99.999 | Hardware |
-|-------------|------------|----------------|----------|
-| **Snapdragon X Elite** (WSL2, battery) | 106,645/s | **0.65ms** | 1.42kg laptop |
-| **DigitalOcean** (8-vCPU AMD, 3 VMs) | 93,807/s | 1.22ms | Cloud infrastructure |
-
-The laptop's server-side latency is **47% faster** while handling **14% more throughput** — on battery, in WSL2.
-
-**What this proves:**
-- ARM64 is ready for server workloads
-- Efficient C code runs beautifully on Snapdragon
-- WSL2 overhead is minimal for async I/O
-- You can test full HA clusters on your laptop
-
-<details>
-<summary>Full wrk output (Snapdragon X Elite)</summary>
-
-```
-Running 1m test @ http://172.31.76.127:7001
-  12 threads and 400 connections
-  Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     3.81ms    3.80ms 289.49ms   99.00%
-    Req/Sec     8.94k     1.16k   22.81k    80.11%
-  Latency Distribution
-     50%    3.57ms
-     75%    4.01ms
-     90%    4.51ms
-     99%    7.62ms
-  6408525 requests in 1.00m, 3.80GB read
-Requests/sec: 106645.65
-Transfer/sec:     64.83MB
-
-CLIENT  p99.999=250843us (250.843ms)  max=289485us (289.485ms)
-SERVER  server_us p99.999=651us (0.651ms)  max=11964us (11.964ms)
-SERVER  queue_us p99.999=285us (0.285ms)  max=3920us (3.920ms)
-SERVER  recv_parse_us p99.999=293us (0.293ms)  max=4149us (4.149ms)
-```
-</details>
-
----
-
-## Recovery Time
-
-Recovery time is an area where operational complexity shows up quickly in practice.
-
-
-| Scenario | Kafka | Ayder |
-|----------|-------|-------|
-| **Cluster restart (unclean)** | 2+ hours (reported in production) | **40-50 seconds** |
-| **Broker sync after failure** | 181 minutes for 1TB data | Auto catch-up in seconds |
-| **50+ broker rolling restart** | 2+ hours (2 min per broker) | N/A — single binary |
-
-**Tested crash recovery:**
-
-```bash
-# 3-node cluster with 8 million offsets
-1. SIGKILL a follower mid-write
-2. Leader continues, follower misses offsets
-3. Restart follower
-4. Follower replays local AOF → asks leader for missing offsets
-5. Leader streams missing data → follower catches up
-6. Cluster fully healthy in 40-50 seconds
-7. Zero data loss
-```
-
-No manual intervention. No partition reassignment. No ISR drama.
-
----
-
 ## Quick Start
 
-### Docker (fastest)
+### Docker Compose
 
 ```bash
-# Clone and run with Docker Compose
 git clone https://github.com/A1darbek/ayder.git
 cd ayder
 docker compose up -d --build
-
-# Or build and run standalone
-docker build -t ayder .
-docker run -p 1109:1109 --shm-size=2g ayder
-
-# That's it. Now produce:
-curl -X POST localhost:1109/broker/topics \
-  -H 'Authorization: Bearer dev' \
-  -H 'Content-Type: application/json' \
-  -d '{"name":"events","partitions":4}'
-
-curl -X POST 'localhost:1109/broker/topics/events/produce?partition=0' \
-  -H 'Authorization: Bearer dev' \
-  -d 'hello world'
 ```
 
-### From Source
+### Build From Source
 
 ```bash
-# Dependencies:
-# - libuv (>= 1.51 recommended)
-# - libevent
-# - libcurl
-# - openssl (libssl + libcrypto)
-# - zlib
-# - liburing (Linux)
-# - pthreads + standard Linux headers
-
-# Ubuntu/Debian
+# Debian/Ubuntu
 sudo apt-get update
 sudo apt-get install -y build-essential pkg-config \
   libuv1-dev libevent-dev libcurl4-openssl-dev libssl-dev zlib1g-dev liburing-dev
 
-# Alpine (musl)
-apk add --no-cache build-base linux-headers pkgconf \
-  libuv-dev libevent-dev curl-dev openssl-dev zlib-dev liburing-dev
-
-# Build
 make clean && make
 ./ayder --port 1109
 ```
 
-**Optional: Stricter build for development**
-```bash
-make clean && make CFLAGS="-O2 -g -Wall -Wextra -Wshadow -Werror"
-```
-
----
-
-## musl / Alpine Support
-
-Ayder supports **glibc and musl** (e.g. Alpine).  
-If you're running in containers, be aware Ayder uses **POSIX shared memory** (`/dev/shm`) for SharedStorage.
-
-### /dev/shm sizing (important)
-
-If `/dev/shm` is too small for the configured SharedStorage capacity, Ayder will exit with a clear message instead of crashing.
-
-You can control the capacity with:
-
-- `RF_SHARED_ENTRIES` (power-of-2 recommended)
-
-Examples:
+## 60-Second API Walkthrough
 
 ```bash
-# Works on small shm
-docker run --rm -it --shm-size=64m -e RF_SHARED_ENTRIES=131072 ayder:musl
-
-# Larger table (needs larger shm)
-docker run --rm -it --shm-size=256m -e RF_SHARED_ENTRIES=262144 ayder:musl
-
-# Intentionally too big (will fail gracefully with a helpful error)
-docker run --rm -it --shm-size=64m -e RF_SHARED_ENTRIES=2097152 ayder:musl
-```
-
-If `RF_SHARED_ENTRIES` is not set, Ayder will auto-pick a capacity that fits the current `/dev/shm`.
-
-### Docker (Alpine/musl)
-
-```bash
-docker build -f Dockerfile.musl -t ayder:musl .
-
-# Default (auto-picks SharedStorage size to fit /dev/shm)
-docker run --rm -it --shm-size=64m -p 1109:1109 ayder:musl
-```
-
----
-
-### Docker Compose Stack
-
-The included `docker-compose.yml` brings up:
-- **Ayder** on port `1109`
-
-```yaml
-# docker-compose.yml
-services:
-  ayder:
-    build: .
-    ports:
-      - "1109:1109"
-    shm_size: 2g
-```
-
----
-
-## Usage Examples
-
-```bash
-# Create a topic
+# 1) Create topic
 curl -X POST localhost:1109/broker/topics \
   -H 'Authorization: Bearer dev' \
   -H 'Content-Type: application/json' \
-  -d '{"name":"events","partitions":8}'
+  -d '{"name":"events","partitions":1}'
 
-# Produce a message
+# 2) Produce
 curl -X POST 'localhost:1109/broker/topics/events/produce?partition=0' \
   -H 'Authorization: Bearer dev' \
   -d 'hello world'
 
-# Consume messages (binary-safe with base64)
-curl 'localhost:1109/broker/consume/events/mygroup/0?offset=0' \
+# 3) Consume
+curl 'localhost:1109/broker/consume/events/mygroup/0?offset=0&limit=10&encoding=b64' \
   -H 'Authorization: Bearer dev'
 
-# Commit offset
-curl -X POST localhost:1109/broker/commit \
+# 4) Commit offset
+curl -X POST 'localhost:1109/broker/commit/events/mygroup/0' \
   -H 'Authorization: Bearer dev' \
   -H 'Content-Type: application/json' \
-  -d '{"topic":"events","group":"mygroup","partition":0,"offset":10}'
+  -d '{"offset":0}'
 ```
 
----
-
-## Core Concepts
-
-### Topics and Partitions
-
-A **topic** contains N **partitions**. Each partition is an independent append-only log with its own offset sequence.
-
-### Consumer Groups
-
-Consumers read from `/broker/consume/{topic}/{group}/{partition}`. Progress is tracked per `(topic, group, partition)` tuple via explicit commits.
-
-If you consume without specifying `?offset=`, Ayder resumes from the last committed offset for that consumer group.
-
-### Write Durability
-
-Ayder acknowledges writes in two modes:
-
-| Mode | `batch_id` | `durable` | Description |
-|------|-----------|-----------|-------------|
-| **Sealed** | Non-zero | `true` | Appended to AOF, survives crashes |
-| **Rocket** | Zero | `false` | In-memory fast path, not persisted |
-
-Use `timeout_ms` to wait for sync confirmation.
-
----
-
-## API Reference
-
-### Health and Metrics
-
-```bash
-GET  /health      # → {"ok":true}
-GET  /ready       # → {"ready":true}
-GET  /metrics     # → Prometheus format
-GET  /metrics_ha  # → HA cluster metrics
-```
-
-### Topic Management
-
-**Create topic**
-```bash
-POST /broker/topics
-{"name":"events","partitions":8}
-```
-
-Response:
-```json
-{"ok":true,"topic":"events","partitions":8}
-```
-
-### Produce
-
-**Single message** (raw bytes in body)
-```
-POST /broker/topics/{topic}/produce
-```
-
-Query parameters:
-| Parameter | Description |
-|-----------|-------------|
-| `partition` | Target partition (optional; auto-assigned if omitted) |
-| `key` | Message key, URL-encoded (optional) |
-| `idempotency_key` | Deduplication key, URL-encoded (optional) |
-| `timeout_ms` | Wait for sync confirmation (optional) |
-| `timing` | Set to `1` to include timing breakdown (optional) |
-
-Response:
-```json
-{
-  "ok": true,
-  "offset": 123,
-  "partition": 0,
-  "batch_id": 9991,
-  "sealed": true,
-  "durable": true,
-  "mode": "sealed",
-  "synced": true
-}
-```
-
-Duplicate detection (when `idempotency_key` matches):
-```json
-{"ok":true,"offset":123,"partition":0,"sealed":true,"synced":null,"duplicate":true}
-```
-
-**Batch produce** (NDJSON — one message per line)
-```
-POST /broker/topics/{topic}/produce-ndjson
-```
-
-Response:
-```json
-{
-  "ok": true,
-  "first_offset": 1000,
-  "count": 250,
-  "partition": 0,
-  "batch_id": 424242,
-  "sealed": true,
-  "durable": true,
-  "mode": "sealed",
-  "synced": false
-}
-```
-
-### Consume
-
-```
-GET /broker/consume/{topic}/{group}/{partition}
-```
-
-Query parameters:
-| Parameter | Description |
-|-----------|-------------|
-| `offset` | Start offset, inclusive (resumes from commit if omitted) |
-| `limit` | Max messages to return (default: 100, max: 1000) |
-| `encoding` | Set to `b64` for binary-safe base64 encoding |
-
-Response:
-```json
-{
-  "messages": [
-    {"offset": 0, "partition": 0, "value_b64": "aGVsbG8=", "key_b64": "a2V5"}
-  ],
-  "count": 1,
-  "next_offset": 1,
-  "committed_offset": 0,
-  "truncated": false
-}
-```
-
-Use `next_offset` as the `?offset=` parameter for subsequent reads.
-
-### Commit
-
-```
-POST /broker/commit
-{"topic":"events","group":"g1","partition":0,"offset":124}
-```
-
-Response:
-```json
-{"ok":true}
-```
-
-Commits are stored per `(topic, group, partition)`. Backward commits are ignored.
-
-### Retention
-
-**Delete before offset** (hard floor)
-```
-POST /broker/delete-before
-{"topic":"events","partition":0,"before_offset":100000}
-```
-
-Response:
-```json
-{"ok":true,"deleted_count":12345,"freed_bytes":987654}
-```
+## Why Ayder?
 
-**Set retention policy**
-```
-POST /broker/retention
-```
-
-Examples:
-```json
-// TTL + size cap for specific partition
-{"topic":"events","partition":0,"ttl_ms":60000,"max_bytes":104857600}
+### Practical Positioning
 
-// TTL for all topics
-{"topic":"*","ttl_ms":300000}
-```
+- Kafka: powerful and battle-tested, but operationally heavy for small/medium teams.
+- Redis Streams: very easy to start, but durability/consensus semantics differ from a replicated consensus log.
+- Ayder: single-binary ergonomics with Raft-based replicated durability.
 
----
+### At-a-Glance Comparison
 
-## KV Store
+| | Kafka | Redis Streams | Ayder |
+|---|---|---|---|
+| Protocol | Kafka binary protocol | RESP | HTTP |
+| Operational model | JVM + cluster tuning | simple, topology-dependent | single binary + HA mode |
+| Replication semantics | replicated log | topology-dependent | Raft consensus |
+| First message time | typically higher setup | very fast | very fast |
 
-Ayder includes a key-value store with CAS (compare-and-swap) and TTL support.
+## Performance Snapshot
 
-**Put**
-```
-POST /kv/{namespace}/{key}?cas=<u64>&ttl_ms=<u64>
-```
+Measured on real-network HA runs (3-node, sync-majority):
+- wrk2 rate-limited throughput: 49,871 msg/s
+- client p99 latency: 3.46 ms
+- server p99.999 handler: 1.219 ms
+- max-throughput wrk run: 93,807 msg/s
 
-Body contains raw value bytes.
+Recovery observation from documented runbooks:
+- follower SIGKILL and catch-up to healthy cluster in about 40-50 seconds (around 8M offsets in tested setup)
 
-Response:
-```json
-{"ok":true,"cas":2,"sealed":true,"durable":true,"mode":"sealed","synced":true,"batch_id":123}
-```
+## HA Model and Write Semantics
 
-**Get**
-```
-GET /kv/{namespace}/{key}
-```
+Ayder supports 3/5/7 node Raft clusters.
 
-Response:
-```json
-{"value":"<base64>","cas":2}
-```
+Write concern guidance:
+- `RF_HA_WRITE_CONCERN=1`: leader-local ack, lowest latency, weakest durability
+- `RF_HA_WRITE_CONCERN=majority`: recommended for strong durability
+- `RF_HA_WRITE_CONCERN=all`: strongest ack rule, higher tail latency
 
-**Get metadata**
-```
-GET /kv/{namespace}/{key}/meta
-```
+Common strict path settings used in Jepsen campaigns:
+- `RF_HA_SYNC_MODE=1`
+- majority write concern for voter count
+- mixed fault modes (`partition-only`, `kill-only`, `mixed`)
 
-Response:
-```json
-{"cas":2,"ttl_ms":12345}
-```
+## Features
 
-**Delete**
-```
-DELETE /kv/{namespace}/{key}?cas=<u64>
-```
+- Append-only broker topics with per-partition offsets
+- Consumer groups with committed offsets
+- Durable storage with crash recovery
+- Raft HA replication with dynamic membership flows
+- KV with CAS and TTL
+- Built-in stream processing (filters, aggregates, joins)
 
-Response:
-```json
-{"ok":true,"deleted":true,"sealed":true,"durable":true,"mode":"sealed","synced":false,"batch_id":456}
-```
+## Project Documentation Map
 
----
+Use these docs by task:
+- `tests/README.md` - test docs entrypoint
+- `tests/demo/README.md` - practical local runbooks and strict command flow
+- `tests/jepsen/README.md` - Jepsen workload/checker internals and artifacts
+- `scripts/README.md` - chaos and benchmark helper scripts
+- `cluster/README.md` - local cluster ports/layout/start flow
 
-## Stream Processing
+## Limits and Non-Goals (Current State)
 
-Built-in stream processing — no separate service required.
-
-### Query
-
-```
-POST /broker/query
-```
-
-Consume JSON objects from a topic/partition with:
-- Row filtering (eq, ne, lt, gt, in, contains)
-- `group_by` with aggregations (count, sum, avg, min, max)
-- Field projection
-- Tumbling windows
-
-### Join
-
-```
-POST /broker/join
-```
-
-Windowed join between two sources:
-- Join types: inner / left / right / full
-- Composite keys
-- Window size and allowed lateness
-- Optional `dedupe_once`
-- Cross-format support (Avro + Protobuf in same join)
-
----
-
-## HA Clustering
-
-Ayder supports **3, 5, or 7 node clusters** with Raft-based replication.
-
-### Write Modes
-
-| Mode | Acknowledgment |
-|------|----------------|
-| `async` | Leader appends locally, replicates in background |
-| `sync-majority` | Waits for majority (e.g., 2/3 nodes) |
-| `sync-all` | Waits for all nodes |
-
-### Redirect Behavior
-
-Writes must go to the leader. If you send a write to a follower, it returns an HTTP redirect with the leader's address in the `Location` header.
-
-Options:
-1. Follow redirects automatically
-2. Discover the leader via `/metrics_ha` and pin writes to it
-
-### Follower Recovery
-
-When a follower rejoins after downtime:
-
-1. Replays local AOF
-2. Connects to leader
-3. Requests missing offsets
-4. Leader streams missing data
-5. Follower catches up automatically
-
-Example scenario:
-
-```bash
-# 3-node cluster
-node1 (7001) = LEADER
-node2 (8001) = FOLLOWER
-node3 (9001) = FOLLOWER
-
-# Write to leader
-curl -X POST 'localhost:7001/broker/topics/test/produce?partition=0' \
-  -H 'Authorization: Bearer dev' -d 'msg-0'
-# → offset 0
-
-# Kill node2
-kill -9 $(pgrep -f "port 8001")
-
-# Write while node2 is down
-curl -X POST 'localhost:7001/broker/topics/test/produce?partition=0' \
-  -H 'Authorization: Bearer dev' -d 'msg-1'
-# → offset 1
-
-curl -X POST 'localhost:7001/broker/topics/test/produce?partition=0' \
-  -H 'Authorization: Bearer dev' -d 'msg-2'
-# → offset 2
-
-# Restart node2 — automatically catches up to offset 2
-
-# Verify all data is present on recovered node
-curl 'localhost:8001/broker/consume/test/g1/0?offset=0&limit=10' \
-  -H 'Authorization: Bearer dev'
-# → offsets 0, 1, 2 all present
-```
-
----
-
-## Running
-
-### Single Node
-
-```bash
-# Default port is 1109
-./ayder --port 1109
-
-# Or specify custom port
-./ayder --port 7001
-```
-
-### HA Cluster (3/5/7 nodes)
-
-Ayder uses Raft for consensus. Here's a complete 3-node setup:
-
-**Environment variables:**
-
-| Variable | Description |
-|----------|-------------|
-| `RF_HA_ENABLED` | Enable HA mode (`1`) |
-| `RF_HA_NODE_ID` | Unique node identifier |
-| `RF_HA_NODES` | Cluster topology: `id:host:raft_port:priority,...` |
-| `RF_HA_BOOTSTRAP_LEADER` | Set to `1` on initial leader only |
-| `RF_HA_WRITE_CONCERN` | Nodes to wait for: `1`=leader only, `2`=majority, `N`=all |
-| `RF_HA_DEDICATED_WORKER` | **Set to `0` for best P99 latency** (highly recommended) |
-| `RF_HA_TLS` | Enable mTLS for Raft (`1`) |
-| `RF_HA_TLS_CA` | Path to CA certificate |
-| `RF_HA_TLS_CERT` | Path to node certificate |
-| `RF_HA_TLS_KEY` | Path to node private key |
-| `RF_BEARER_TOKENS` | HTTP auth tokens (format: `token1@scope:token2:...`) |
-
-**3-Node Example:**
-
-```bash
-# Node 1 (bootstrap leader)
-export RF_HA_ENABLED=1
-export RF_HA_NODE_ID=node1
-export RF_HA_BOOTSTRAP_LEADER=1
-export RF_HA_NODES='node1:10.0.0.1:7000:100,node2:10.0.0.2:8000:50,node3:10.0.0.3:9000:25'
-export RF_HA_WRITE_CONCERN=2  # sync-majority (2/3 nodes)
-export RF_HA_DEDICATED_WORKER=0  # critical for low P99
-export RF_BEARER_TOKENS='dev@scope:token2:token3'
-export RF_HA_TLS=1
-export RF_HA_TLS_CA=./certs/ca.crt
-export RF_HA_TLS_CERT=./certs/node1.crt
-export RF_HA_TLS_KEY=./certs/node1.key
-./ayder --port 7001
-
-# Node 2
-export RF_HA_ENABLED=1
-export RF_HA_NODE_ID=node2
-export RF_HA_NODES='node1:10.0.0.1:7000:100,node2:10.0.0.2:8000:50,node3:10.0.0.3:9000:25'
-export RF_HA_WRITE_CONCERN=2
-export RF_HA_DEDICATED_WORKER=0
-export RF_BEARER_TOKENS='dev@scope:token2:token3'
-export RF_HA_TLS=1
-export RF_HA_TLS_CA=./certs/ca.crt
-export RF_HA_TLS_CERT=./certs/node2.crt
-export RF_HA_TLS_KEY=./certs/node2.key
-./ayder --port 8001
-
-# Node 3 (same pattern, port 9001)
-```
-
-**5-Node and 7-Node Clusters:**
-
-```bash
-# 5-node topology
-export RF_HA_NODES='node1:host1:7000:100,node2:host2:8000:80,node3:host3:9000:60,node4:host4:10000:40,node5:host5:11000:20'
-export RF_HA_WRITE_CONCERN=3  # majority of 5
-
-# 7-node topology
-export RF_HA_NODES='node1:host1:7000:100,node2:host2:8000:90,node3:host3:9000:80,node4:host4:10000:70,node5:host5:11000:60,node6:host6:12000:50,node7:host7:13000:40'
-export RF_HA_WRITE_CONCERN=4  # majority of 7
-```
-
-**Generate TLS certificates:**
-
-```bash
-# Create CA
-openssl req -x509 -newkey rsa:4096 -keyout ca.key -out ca.crt \
-  -days 365 -nodes -subj "/CN=ayder-ca"
-
-# Create node certificate (repeat for each node)
-openssl req -newkey rsa:2048 -nodes -keyout node1.key -out node1.csr \
-  -subj "/CN=node1" -addext "subjectAltName=DNS:node1,IP:10.0.0.1"
-
-openssl x509 -req -in node1.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
-  -out node1.crt -days 365 -copy_extensions copy
-```
-
-**Write concern tradeoffs:**
-
-| `RF_HA_WRITE_CONCERN` | Durability | Latency | Survives |
-|-----------------------|------------|---------|----------|
-| `1` | Low | ~1ms | Nothing (leader only) |
-| `2` (3-node) | High | ~3ms | 1 node failure |
-| `3` (5-node) | High | ~3ms | 2 node failures |
-| `N` (all nodes) | Maximum | Higher | N-1 failures, but blocks if any node slow |
-
----
+- not Kafka protocol compatible
+- not a SQL database
+- exactly-once still requires client idempotency discipline
 
 ## Author
 
-Built by **Aydarbek Romanuly** — solo founder from Kazakhstan 🇰🇿
+Built by Aydarbek Romanuly.
 
 - GitHub: [@A1darbek](https://github.com/A1darbek)
 - Email: aidarbekromanuly@gmail.com
 
----
-
-## Error Responses
-
-Errors follow a consistent format:
-
-```json
-{
-  "ok": false,
-  "error": "missing_topic",
-  "message": "Topic name is required",
-  "docs": "https://ayder.dev/docs/api/produce"
-}
-```
-
----
-
-## What Ayder Is
-
-✅ HTTP-native event log with partitions and offsets  
-✅ Fast writes with cursor-based consumption  
-✅ Durable with crash recovery  
-✅ Horizontally scalable with Raft replication  
-✅ Built-in stream processing with cross-format joins  
-✅ ARM64-native (tested on Snapdragon X Elite)
-
-## What Ayder Is Not (Yet)
-
-❌ Kafka protocol compatible  
-❌ A SQL database  
-❌ Magic exactly-once without client-side idempotency discipline
-
----
-
 ## License
 
 MIT
-
