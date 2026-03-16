@@ -1,8 +1,20 @@
 # Ayder
 
-Ayder is an HTTP-native durable event log and message bus written in C.
+**HTTP-native durable event log and message bus, written in C.**
 
-Single binary, no JVM, no ZooKeeper, no thick client requirement. You can start with `curl` and grow into multi-node Raft deployments.
+Ayder is designed to be simple to run and serious about correctness: one binary, HTTP API, Raft-backed durability, and straightforward operational behavior under failure.
+
+You can start with `curl` on a single node and scale to multi-node deployments without switching protocols or client stacks.
+
+**1-minute demo: SIGKILL -> restart -> data still there**  
+https://www.youtube.com/watch?v=c-n0X5t-A9Y
+
+**Live durability sandbox: SIGKILL -> restart -> committed offsets still correct**  
+Per-visitor container + persisted `/data` volume: https://ayder.xyz/invite  
+On the sandbox page, click **Run double proof** to produce events, SIGKILL, restart, and get a JSON proof that includes:
+- last committed offset before kill
+- first consumed offset after restart
+- commit persistence across restart
 
 ## Why This Project Exists
 
@@ -15,8 +27,8 @@ Ayder is built for that intersection: Kafka-style durability goals with a much l
 
 ## Real Jepsen Result (Strict Claim)
 
-Current public claim:
-- strictly linearizable under mixed faults, 45/45 pass
+Public correctness claim:
+- strictly linearizable under mixed faults: 45/45 pass in the latest full `hn-ready` matrix
 
 Verified run (UTC date):
 - 2026-03-13
