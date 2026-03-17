@@ -8,6 +8,12 @@ CMake Deprecation Warning:
   use the cmake-file-api(7) to view CMake-generated project build trees.
 
 
+-- The C compiler identification is GNU 14.2.0
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
 CMake Error at CMakeLists.txt:6 (add_executable):
   The target name "src/main.c" is reserved or not valid for certain CMake
   features, such as generator expressions, and may result in undefined

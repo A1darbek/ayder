@@ -52,8 +52,6 @@ cluster/node*/append.aof.sealed
 cluster/node*/append.aof.sealed.lock
 tests/jepsen/artifacts/
 tests/jepsen/results/
-tests/jepsen/.lein-failures
-tests/jepsen/.toolchain/
+tests/jepsen/.lein-failurestests/jepsen/.toolchain/
 tests/jepsen/target/
-tests/jepsen/store/
-tests/jepsen/tests/
+tests/jepsen/store/tests/jepsen/tests/
