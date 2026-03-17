@@ -6,25 +6,6 @@ Ayder is designed to be simple to run and serious about correctness: one binary,
 
 You can start with `curl` on a single node and scale to multi-node deployments without switching protocols or client stacks.
 
-**1-minute demo: SIGKILL -> restart -> data still there**  
-https://www.youtube.com/watch?v=c-n0X5t-A9Y
-
-**Live durability sandbox: SIGKILL -> restart -> committed offsets still correct**  
-Per-visitor container + persisted `/data` volume: https://ayder.xyz/invite  
-On the sandbox page, click **Run double proof** to produce events, SIGKILL, restart, and get a JSON proof that includes:
-- last committed offset before kill
-- first consumed offset after restart
-- commit persistence across restart
-
-## Why This Project Exists
-
-Most teams want three things at once:
-- operational simplicity
-- durable replicated writes
-- predictable behavior during node failures
-
-Ayder is built for that intersection: Kafka-style durability goals with a much lighter operational footprint.
-
 ## Real Jepsen Result (Strict Claim)
 
 Public correctness claim:
@@ -64,6 +45,27 @@ awk -F, 'NR>1 && $4!=0 {bad=1} END {exit bad}' "$RESULT/cells.csv" && echo "ALL 
 Proof bundle format:
 - `tests/jepsen/artifacts/gold_<run_id>.tar.gz`
 - `tests/jepsen/artifacts/gold_<run_id>.tar.gz.sha256`
+
+## See It Live
+
+**1-minute demo: SIGKILL -> restart -> data still there**  
+https://www.youtube.com/watch?v=c-n0X5t-A9Y
+
+**Live durability sandbox: SIGKILL -> restart -> committed offsets still correct**  
+Per-visitor container + persisted `/data` volume: https://ayder.xyz/invite  
+On the sandbox page, click **Run double proof** to produce events, SIGKILL, restart, and get a JSON proof that includes:
+- last committed offset before kill
+- first consumed offset after restart
+- commit persistence across restart
+
+## Why This Project Exists
+
+Most teams want three things at once:
+- operational simplicity
+- durable replicated writes
+- predictable behavior during node failures
+
+Ayder is built for that intersection: Kafka-style durability goals with a much lighter operational footprint.
 
 ## Quick Start
 
