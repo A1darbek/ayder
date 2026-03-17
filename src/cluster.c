@@ -139,6 +139,8 @@ static App* init_worker_systems(int wid) {
     }
 
     rf_broker_init(/*ring_per_partition*/ 0, /*default_partitions*/ 8);
+
+    rf_bus_start_promoter();
     // Initialize persistence based on AOF mode
     int aof_enabled = (g_aof_mode > 0) ? 1 : 0;
     if (aof_enabled) {
@@ -154,9 +156,6 @@ static App* init_worker_systems(int wid) {
         // IMPORTANT: Pass LOCAL storage to persistence (for AOF recovery)
         // but your HTTP handlers will use shared storage for live data
         Persistence_zp_init( aof, &storage, enhanced_flush_ms);
-
-        /* start in-memory cross-worker promoter */
-        rf_bus_start_promoter();
         if (single_process_mode || wid == 0) {
             printf("✓ AOF persistence enabled (flush_ms=%u)\n", enhanced_flush_ms);
             printf("   Ring capacity: 128K entries\n");
@@ -278,7 +277,7 @@ int start_cluster_with_args(int port, int argc, char **argv) {
 
     /* FIXED - if caller requests 0 workers, run a single worker in-process */
     if (worker_count == 0) {
-        printf("🚀 Single-process mode (no cluster manager)\n");
+        printf("Single-process mode (no cluster manager)\n");
         single_process_mode = 1;
         run_worker(0, port);
         /* run_worker never returns */
@@ -292,7 +291,7 @@ int start_cluster_with_args(int port, int argc, char **argv) {
         return -1;
     }
 
-    printf("🚀 Starting Ayder with %d worker%s on port %d\n",
+    printf("Starting Ayder with %d worker%s on port %d\n",
            worker_count, worker_count==1?"":"s", port);
 
     manager_pid = getpid();

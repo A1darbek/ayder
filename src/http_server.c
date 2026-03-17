@@ -158,12 +158,13 @@ uint64_t RAMForge_http_total(void){ return total_requests; }
 static int    RL_DEFAULT_RPS        = 50;     // tokens per second
 static int    RL_DEFAULT_BURST      = 100;    // bucket capacity
 static uint64_t RL_DEFAULT_DAILY    = 100000; // daily requests
+static int    RL_ENABLED            = 1;      // set RF_HTTP_DISABLE_RL=1 to disable
 
 static size_t BP_MAX_SEALED_Q       = 4096;   // backpressure if sealed queue > this
 static size_t BP_MAX_ACTIVE_CONNS   = 32768;  // backpressure if active conns > this
 static int    BP_RETRY_AFTER_SEC    = 1;      // Retry-After for 503
 
-int   HA_ROLE_FOLLOWER   = 0;          // 1 => follower/replica/read-only
+int   HA_HTTP_IS_FOLLOWER   = 0;          // 1 => follower/replica/read-only
 int   HA_READ_ONLY       = 0;          // force read-only regardless of role
 /* Redirect target/behavior */
 char  HA_LEADER_URL[1024] = {0};
@@ -177,7 +178,7 @@ static int   HA_AUTO_CONFIGURED  = 0;         // 1 if we successfully auto-confi
 static inline void ha_refresh_http_flags(void){
     if (!RAMForge_HA_is_enabled()) return;
     /* live role */
-    HA_ROLE_FOLLOWER = RAMForge_HA_is_follower() ? 1 : 0;
+    HA_HTTP_IS_FOLLOWER = RAMForge_HA_is_follower() ? 1 : 0;
 
     /* live leader url - only if we have HA enabled and configured */
     const char *lu = RAMForge_HA_get_leader_url();
@@ -194,7 +195,7 @@ static inline void ha_refresh_http_flags(void){
     if (ra >= 0) HA_RETRY_AFTER = ra;
     ha_shared_snapshot_t s;
     if (RAMForge_HA_read_snapshot(&s) && s.enabled) {
-        HA_ROLE_FOLLOWER = (s.role == HA_ROLE_FOLLOWER) ? 1 : 0;
+        HA_HTTP_IS_FOLLOWER = (s.role == HA_ROLE_FOLLOWER) ? 1 : 0;
 
         if (s.leader_url[0]) {
             size_t n = strlen(s.leader_url);
@@ -240,7 +241,7 @@ static void ha_auto_configure_http(void) {
     const char *force_follower_env = getenv("RF_HTTP_FORCE_FOLLOWER");
     if (force_follower_env && force_follower_env[0] != '0') {
         /* User explicitly wants follower mode - respect it */
-        HA_ROLE_FOLLOWER = 1;
+        HA_HTTP_IS_FOLLOWER = 1;
         fprintf(stderr, "[HA-HTTP] Explicit follower mode via RF_HTTP_FORCE_FOLLOWER\n");
     }
 
@@ -342,7 +343,11 @@ static void load_auth_env_overrides(void){
     if ((e=getenv("BP_MAX_SEALED_Q")))    BP_MAX_SEALED_Q    = (size_t)strtoull(e,NULL,10)?:BP_MAX_SEALED_Q;
     if ((e=getenv("BP_MAX_ACTIVE_CONNS")))BP_MAX_ACTIVE_CONNS= (size_t)strtoull(e,NULL,10)?:BP_MAX_ACTIVE_CONNS;
     if ((e=getenv("BP_RETRY_AFTER_SEC"))) BP_RETRY_AFTER_SEC = atoi(e)>0?atoi(e):BP_RETRY_AFTER_SEC;
+    if ((e=getenv("RF_HTTP_DISABLE_RL"))) RL_ENABLED = (e[0] == '0') ? 1 : 0;
 
+    if (!RL_ENABLED) {
+        fprintf(stderr, "[AUTH] Rate limiting disabled via RF_HTTP_DISABLE_RL\n");
+    }
 
 }
 
@@ -963,7 +968,10 @@ static int is_write_path(const char *method, const char *url) {
             !strcmp(url, "/broker/retention") ||
             !strcmp(url, "/broker/delete-before") ||
             !strcmp(url, "/admin/sealed/gc") ||
-            !strcmp(url, "/admin/compact")
+            !strcmp(url, "/admin/compact") ||
+            !strcmp(url, "/ha/membership/add") ||
+            !strcmp(url, "/ha/membership/promote") ||
+            !strcmp(url, "/ha/membership/remove")
     ))
         return 1;
     return 0;
@@ -992,7 +1000,7 @@ static int check_keep_alive(struct phr_header* headers, size_t num_headers, int 
 
 static void load_ha_http_env_overrides(void){
     const char *e;
-    if ((e=getenv("RF_HTTP_FORCE_FOLLOWER"))) HA_ROLE_FOLLOWER = (e[0] != '0');
+    if ((e=getenv("RF_HTTP_FORCE_FOLLOWER"))) HA_HTTP_IS_FOLLOWER = (e[0] != '0');
     if ((e=getenv("RF_HTTP_READ_ONLY")))     HA_READ_ONLY     = (e[0] != '0');
     if ((e=getenv("RF_HTTP_LEADER_URL")))    snprintf(HA_LEADER_URL, sizeof(HA_LEADER_URL), "%s", e);
     if ((e=getenv("RF_HTTP_REDIRECT_STATUS"))){ int s=atoi(e); HA_REDIRECT_STATUS = (s==308)?308:307; }
@@ -1053,17 +1061,21 @@ static void process_request(connection_ctx_t* ctx) {
             // 2) Rate-limit + daily quota
 
 
-            uint32_t lim=0, rem=0; uint64_t reset=0; int wait_s=0;
-            int rl = rl_take_one(cfg, tok, toklen, &lim, &rem, &reset, &wait_s);
-            if (rl > 0) {
-                if (wait_s < 1) wait_s = 1;
-                send_rate_limited(ctx, wait_s, lim, rem, reset);
-                goto cleanup;
+            if (RL_ENABLED) {
+                uint32_t lim=0, rem=0; uint64_t reset=0; int wait_s=0;
+                int rl = rl_take_one(cfg, tok, toklen, &lim, &rem, &reset, &wait_s);
+                if (rl > 0) {
+                    if (wait_s < 1) wait_s = 1;
+                    send_rate_limited(ctx, wait_s, lim, rem, reset);
+                    goto cleanup;
+                } else {
+                    ctx->rl_limit = lim;
+                    ctx->rl_remaining = rem;
+                    ctx->rl_reset_epoch_s = reset;
+                    ctx->rl_have = 1;
+                }
             } else {
-                ctx->rl_limit = lim;
-                ctx->rl_remaining = rem;
-                ctx->rl_reset_epoch_s = reset;
-                ctx->rl_have = 1;
+                ctx->rl_have = 0;
             }
         }
     }
@@ -1079,7 +1091,7 @@ static void process_request(connection_ctx_t* ctx) {
 +       ──────────────────────────────────────────────────────────────────── */
     if (is_write_path(ctx->method_str, ctx->url)) {
         /* FOLLOWER/READ-ONLY: redirect FIRST, regardless of local persistence */
-        if (HA_READ_ONLY || HA_ROLE_FOLLOWER) {
+        if (HA_READ_ONLY || HA_HTTP_IS_FOLLOWER) {
             if (HA_LEADER_URL[0]) {
                 char loc[1600];
                 int loc_len = snprintf(loc, sizeof(loc), "%s%s", HA_LEADER_URL, ctx->url);
@@ -1626,3 +1638,12 @@ void http_server_shutdown(void) {
     uv_timer_stop(&stats_timer);
     // Event loop will exit naturally
 }
+
+
+
+
+
+
+
+
+

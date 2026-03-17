@@ -2,7 +2,7 @@
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
-#include <bits/pthreadtypes.h>
+#include <pthread.h>
 
 #define RF_MAX_TOPIC_LEN     64
 #define RF_MAX_GROUP_LEN     64
@@ -17,13 +17,46 @@
 #define AOF_REC_IDEMP_INDEX 0xB10C1003u
 #define AOF_REC_BROKER_TRUNCATE 0x4254 /* 'BT' */
 #define AOF_REC_HA_FORWARD 0xA0F00D  /* arbitrary new bus record id */
+#define AOF_REC_HA_MEMBERSHIP_FORWARD 0xA0F00E /* agent->worker0 membership control */
+#define AOF_REC_HA_READ_BARRIER 0xA0F00F /* linearizable read-index barrier */
+
 typedef struct {
     uint32_t type;   /* e.g. AOF_REC_BROKER_MSG or _BATCH */
     uint32_t size;   /* payload bytes */
     /* uint8_t data[size] follows */
 } ha_fwd_rec_t;
 
+typedef enum {
+    HA_MEM_FWD_OP_ADD = 1,
+    HA_MEM_FWD_OP_PROMOTE = 2,
+    HA_MEM_FWD_OP_REMOVE = 3,
+    HA_MEM_FWD_OP_READ_BARRIER = 4
+} ha_mem_fwd_op_t;
+
+typedef struct {
+    uint64_t req_id;
+    uint32_t op;            /* ha_mem_fwd_op_t */
+    uint32_t timeout_ms;
+    int32_t priority;
+    int32_t reserved;
+    char node_id[64];
+    char advertise_addr[256];
+    char http_addr[256];
+} __attribute__((packed)) ha_mem_fwd_req_t;
+
+typedef struct {
+    uint64_t req_id;
+    int32_t rc;
+    int32_t out_index;
+} __attribute__((packed)) ha_mem_fwd_rsp_t;
+
+typedef struct {
+    uint64_t req_id;
+    uint64_t issued_us;
+} __attribute__((packed)) ha_read_barrier_rec_t;
+
 int ha_fwd_send(uint32_t type, const void *payload, uint32_t size);
+int rf_wait_ha_read_barrier(uint64_t req_id, uint32_t timeout_ms);
 
 #pragma pack(push,1)
 typedef struct {

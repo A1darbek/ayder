@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 #####################################################################
-# 1️⃣  BUILD STAGE – tool-chain + libuv 1.51 from source + RamForge
+# 1️⃣  BUILD STAGE – tool-chain + libuv 1.51 from source + ayder
 #####################################################################
 FROM ubuntu:22.04 AS build
 ARG DEBIAN_FRONTEND=noninteractive
@@ -11,7 +11,8 @@ RUN apt-get update -qq && \
     apt-get install -y --no-install-recommends \
         build-essential curl ca-certificates \
         autotools-dev automake libtool pkg-config \
-        dmsetup util-linux zlib1g-dev liburing-dev libcurl4-openssl-dev libssl-dev && \
+        dmsetup util-linux zlib1g-dev liburing-dev libcurl4-openssl-dev libssl-dev \
+        libevent-dev && \
     rm -rf /var/lib/apt/lists/*
 
 # ---- Build & install libuv 1.51 ----
@@ -24,8 +25,9 @@ RUN curl -fsSL https://dist.libuv.org/dist/v${LIBUV_VERSION}/libuv-v${LIBUV_VERS
     ldconfig && \
     rm -rf /tmp/libuv*
 
-# ---- Compile RamForge ----
+# ---- Compile ayder ----
 WORKDIR /app
+
 
 # Always ensure picohttpparser exists; overlay later if repo has it
 RUN mkdir -p deps/picohttpparser && \
@@ -49,11 +51,15 @@ RUN make clean && make
 # 2️⃣  RUNTIME STAGE – minimal libs + freshly-built libuv
 #####################################################################
 FROM ubuntu:22.04 AS runtime
+RUN mkdir -p /data
+
 ARG DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update -qq && \
     apt-get install -y --no-install-recommends \
-        dmsetup util-linux zlib1g liburing2 && \
+        dmsetup util-linux zlib1g liburing2 \
+        ca-certificates libcurl4 libssl3 libevent-2.1-7 \
+        iproute2 iptables curl && \
     rm -rf /var/lib/apt/lists/*
 
 # copy our glibc-compatible libuv
@@ -68,4 +74,4 @@ RUN chmod +x ./entrypoint.sh
 
 EXPOSE 1109
 ENTRYPOINT ["./entrypoint.sh"]
-CMD ["./ayder"]
+CMD ["./ayder", "--workers", "1"]

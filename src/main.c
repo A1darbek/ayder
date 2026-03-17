@@ -136,8 +136,7 @@ int main(int argc, char **argv) {
     const char *port_src = "default:1109";
 
     // 1) env first (so CLI can override)
-    int envp = 0;
-    if (detect_port_from_env(&http_port, &port_src) == 0) envp = 1;
+    detect_port_from_env(&http_port, &port_src);
 
     // 2) parse CLI (may override env/default)
     parse_arguments(argc, argv, &http_port, &port_src);

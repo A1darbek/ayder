@@ -57,7 +57,8 @@ typedef struct {
     _Atomic uint64_t zp_restore_last_success_unix; /* Unix ts of last success*/
     _Atomic uint64_t zp_restore_inflight;          /* 0|1 gauge              */
 } RAMForgeMetrics;
-static void metrics_buf_init(metrics_buffer_t* buf, char* buffer, size_t cap) {
+static inline __attribute__((unused))
+void metrics_buf_init(metrics_buffer_t* buf, char* buffer, size_t cap) {
     buf->buffer = buffer;
     buf->capacity = cap;
     buf->length = 0;
@@ -67,7 +68,8 @@ void ZeroPauseRDB_metrics_inc(uint64_t usec);
 void ZeroPauseRDB_restore_metrics_inc(uint64_t usec, int ok);
 void RAMForge_force_rotation(void);
 void RAMForge_record_crc_validation(int success);
-static int metrics_buf_printf(metrics_buffer_t* buf, const char* fmt, ...) {
+static inline __attribute__((unused))
+int metrics_buf_printf(metrics_buffer_t* buf, const char* fmt, ...) {
     if (!buf || buf->length >= buf->capacity)
         return 0;
     va_list args;

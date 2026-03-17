@@ -4,6 +4,7 @@
 #include "crc32c.h"
 #include "slab_alloc.h"
 #include "rf_broker.h"
+#include "ramforge_ha_integration.h"
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
@@ -19,9 +20,7 @@
 #include <poll.h>
 #include "ramforge_ha_tls.h"
 
-// ═══════════════════════════════════════════════════════════════════════════════
 // In-Memory Log Ring Buffer (Zero-Copy, Lock-Free)
-// ═══════════════════════════════════════════════════════════════════════════════
 
 #define LOG_RING_SIZE (1 << 22)     // 4M entries
 #define LOG_RING_MASK (LOG_RING_SIZE - 1)
@@ -51,6 +50,202 @@ static struct {
 static ha_config_t *g_config;
 static ha_runtime_t *g_runtime;
 
+static inline uint64_t now_us(void);
+
+static inline int ha_popcount_u64(uint64_t x) {
+#if defined(__GNUC__) || defined(__clang__)
+    return __builtin_popcountll(x);
+#else
+    int n = 0;
+    while (x) { x &= (x - 1); n++; }
+    return n;
+#endif
+}
+
+static inline int ha_majority_needed(uint64_t mask) {
+    int n = ha_popcount_u64(mask);
+    return n > 0 ? (n / 2) + 1 : 0;
+}
+
+static inline uint64_t ha_voters_old_mask(void) {
+    return atomic_load(&g_runtime->voters_old_mask);
+}
+
+static inline uint64_t ha_voters_new_mask(void) {
+    return atomic_load(&g_runtime->voters_new_mask);
+}
+
+static inline uint64_t ha_learners_mask(void) {
+    return atomic_load(&g_runtime->learners_mask);
+}
+
+static inline int ha_joint_active(void) {
+    return atomic_load(&g_runtime->joint_active);
+}
+
+static inline uint64_t ha_active_mask(void) {
+    return ha_voters_old_mask() | ha_voters_new_mask() | ha_learners_mask();
+}
+
+int HA_is_peer_active(int peer_index) {
+    if (!g_config || !g_runtime) return 0;
+    if (peer_index < 0 || peer_index >= HA_MAX_NODES) return 0;
+    if (!g_config->nodes[peer_index].node_id[0]) return 0;
+    return (ha_active_mask() & HA_NODE_MASK(peer_index)) ? 1 : 0;
+}
+
+int HA_local_is_voter(void) {
+    if (!g_config || !g_runtime) return 0;
+    int local = g_config->local_node_index;
+    if (local < 0 || local >= HA_MAX_NODES) return 0;
+    return (ha_voters_new_mask() & HA_NODE_MASK(local)) ? 1 : 0;
+}
+
+static int ha_count_match_in_mask(uint64_t mask, uint64_t index) {
+    if (!g_config || !g_runtime) return 0;
+    int c = 0;
+    int local = g_config->local_node_index;
+    for (int i = 0; i < HA_MAX_NODES; i++) {
+        uint64_t bit = HA_NODE_MASK(i);
+        if (!(mask & bit)) continue;
+        if (!HA_is_peer_active(i) && i != local) continue;
+        if (i == local) {
+            c++;
+        } else if (atomic_load(&g_runtime->match_index[i]) >= index) {
+            c++;
+        }
+    }
+    return c;
+}
+
+static int ha_has_commit_quorum_for(uint64_t index) {
+    uint64_t voters_new = ha_voters_new_mask();
+    int need_new = ha_majority_needed(voters_new);
+    if (need_new <= 0) return 0;
+
+    int have_new = ha_count_match_in_mask(voters_new, index);
+    if (have_new < need_new) return 0;
+
+    if (!ha_joint_active()) return 1;
+
+    uint64_t voters_old = ha_voters_old_mask();
+    int need_old = ha_majority_needed(voters_old);
+    if (need_old <= 0) return 0;
+
+    int have_old = ha_count_match_in_mask(voters_old, index);
+    return have_old >= need_old;
+}
+
+static uint64_t ha_fresh_window_us(void) {
+    const char *e = getenv("RF_HA_FRESH_QUORUM_MS");
+    uint64_t ms = 0;
+    if (e && *e) {
+        uint64_t v = strtoull(e, NULL, 10);
+        if (v > 0) ms = v;
+    }
+    if (ms == 0) {
+        uint64_t hb = g_config ? g_config->heartbeat_interval_ms : 100;
+        uint64_t et = g_config ? g_config->election_timeout_ms : 1000;
+        uint64_t a = hb * 6;
+        uint64_t b = et / 2;
+        ms = (a > b) ? a : b;
+    }
+    return ms * 1000ULL;
+}
+
+static int ha_count_fresh_in_mask(uint64_t mask, uint64_t now) {
+    if (!g_config || !g_runtime) return 0;
+    int local = g_config->local_node_index;
+    int c = 0;
+    uint64_t win = ha_fresh_window_us();
+
+    for (int i = 0; i < HA_MAX_NODES; i++) {
+        uint64_t bit = HA_NODE_MASK(i);
+        if (!(mask & bit)) continue;
+        if (!HA_is_peer_active(i) && i != local) continue;
+        if (i == local) {
+            c++;
+            continue;
+        }
+        uint64_t ack = atomic_load(&g_runtime->last_ack_us[i]);
+        if (ack && now >= ack && (now - ack) <= win) c++;
+    }
+    return c;
+}
+
+static int ha_has_fresh_quorum_now(uint64_t now) {
+    uint64_t new_mask = ha_voters_new_mask();
+    int need_new = ha_majority_needed(new_mask);
+    if (need_new <= 0) return 0;
+
+    int have_new = ha_count_fresh_in_mask(new_mask, now);
+    if (have_new < need_new) return 0;
+
+    if (!ha_joint_active()) return 1;
+
+    uint64_t old_mask = ha_voters_old_mask();
+    int need_old = ha_majority_needed(old_mask);
+    if (need_old <= 0) return 0;
+
+    int have_old = ha_count_fresh_in_mask(old_mask, now);
+    return have_old >= need_old;
+}
+
+int HA_has_fresh_quorum(void) {
+    if (!g_config || !g_runtime) return 0;
+    if (!HA_is_leader(g_runtime)) return 0;
+    if (!HA_local_is_voter()) return 0;
+
+    uint64_t now = now_us();
+    int raw = ha_has_fresh_quorum_now(now);
+
+    if (atomic_load(&g_runtime->bootstrap_gate_active)) {
+        if (raw) {
+            atomic_store(&g_runtime->bootstrap_gate_active, 0);
+            atomic_store(&g_runtime->bootstrap_quorum_confirmed, 1);
+            atomic_store(&g_runtime->last_quorum_ok_us, now);
+            atomic_store(&g_runtime->quorum_miss_streak, 0);
+            return 1;
+        }
+        return 0;
+    }
+
+    if (raw) {
+        atomic_store(&g_runtime->last_quorum_ok_us, now);
+        atomic_store(&g_runtime->quorum_miss_streak, 0);
+        return 1;
+    }
+
+    atomic_fetch_add(&g_runtime->quorum_miss_streak, 1);
+
+    uint64_t grace_ms = g_config->election_timeout_ms;
+    const char *g = getenv("RF_HA_QUORUM_GRACE_MS");
+    if (g && *g) {
+        uint64_t v = strtoull(g, NULL, 10);
+        if (v > 0) grace_ms = v;
+    }
+
+    uint32_t miss_limit = 3;
+    const char *m = getenv("RF_HA_QUORUM_MISS_STREAK");
+    if (m && *m) {
+        uint32_t v = (uint32_t)strtoul(m, NULL, 10);
+        if (v > 0) miss_limit = v;
+    }
+
+    uint64_t last_ok = atomic_load(&g_runtime->last_quorum_ok_us);
+    uint32_t miss = atomic_load(&g_runtime->quorum_miss_streak);
+
+    if (last_ok && now >= last_ok && (now - last_ok) <= (grace_ms * 1000ULL) && miss <= miss_limit) {
+        return 1;
+    }
+
+    return 0;
+}
+
+void HA_replication_bind(ha_config_t *config, ha_runtime_t *runtime) {
+    g_config = config;
+    g_runtime = runtime;
+}
 // Pre-allocated send buffer per thread to avoid stack issues
 static __thread uint8_t *t_send_buf = NULL;
 static __thread size_t t_send_buf_size = 0;
@@ -83,29 +278,14 @@ static uint64_t term_at(uint64_t idx) {
 static void leader_maybe_advance_commit(void) {
     uint64_t last_local = atomic_load(&g_log_ring.head) - 1;
     if (last_local == 0) return;
-    int n = g_config->node_count;
-    uint64_t arr[HA_MAX_NODES];
-    int m = 0;
 
-    /* leader counts as having replicated everything it has locally */
-    arr[m++] = last_local;
-    for (int i = 0; i < n; i++) {
-        if (i == g_config->local_node_index) continue;
-        arr[m++] = atomic_load(&g_runtime->match_index[i]);
-    }
-
-    /* nth_element-ish: small n, so O(n log n) sort is fine */
-    for (int i = 0; i < m; i++)
-        for (int j = i + 1; j < m; j++)
-            if (arr[j] < arr[i]) { uint64_t t = arr[i]; arr[i] = arr[j]; arr[j] = t; }
-
-    int majority = (n / 2) + 1;
-    uint64_t cand = arr[m - majority]; /* k-th largest */
-
-    /* Raft safety: only commit entries from current term */
-    if (cand > atomic_load(&g_runtime->commit_index) &&
-        term_at(cand) == atomic_load(&g_runtime->term)) {
-        atomic_store(&g_runtime->commit_index, cand);
+    uint64_t cur_commit = atomic_load(&g_runtime->commit_index);
+    for (uint64_t cand = last_local; cand > cur_commit; cand--) {
+        if (term_at(cand) != atomic_load(&g_runtime->term)) continue;
+        if (ha_has_commit_quorum_for(cand)) {
+            atomic_store(&g_runtime->commit_index, cand);
+            return;
+        }
     }
 }
 
@@ -122,9 +302,7 @@ int HA_leader_on_ack(int peer_index, uint64_t match_index) {
     return 0;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
 // Log Entry Management
-// ═══════════════════════════════════════════════════════════════════════════════
 
 static ha_log_entry_t* create_log_entry(uint64_t index, uint32_t type,
                                         const void *data, uint32_t size) {
@@ -158,9 +336,7 @@ static void release_log_entry(ha_log_entry_t *entry) {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
 // Network Layer (PATCHED v2: Robust Connection Handling)
-// ═══════════════════════════════════════════════════════════════════════════════
 
 typedef struct {
     int fd;
@@ -219,7 +395,8 @@ static void cleanup_peer_connection_locked(peer_conn_t *conn) {
 static int connect_to_peer(int peer_index) {
     if (!g_config) return -1;
     if (peer_index == g_config->local_node_index) return -1;
-    if (peer_index < 0 || peer_index >= g_config->node_count) return -1;
+    if (peer_index < 0 || peer_index >= HA_MAX_NODES) return -1;
+    if (!HA_is_peer_active(peer_index)) return -1;
 
     peer_conn_t *conn = &g_peer_conns[peer_index];
 
@@ -377,7 +554,8 @@ static void cleanup_peer_connection(int peer_index, int expected_fd) {
 int send_message(int peer_index, ha_msg_header_t *header,
                  const void *payload, size_t payload_size) {
     if (!g_config) return -1;
-    if (peer_index < 0 || peer_index >= g_config->node_count) return -1;
+    if (peer_index < 0 || peer_index >= HA_MAX_NODES) return -1;
+    if (!HA_is_peer_active(peer_index)) return -1;
 
     int fd = connect_to_peer(peer_index);
     if (fd < 0) return -1;
@@ -481,9 +659,7 @@ int send_message(int peer_index, ha_msg_header_t *header,
     return -1;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
 // Leader Election & Heartbeats
-// ═══════════════════════════════════════════════════════════════════════════════
 
 /* helper: copy up to N entries starting at index 'from' into a flat buffer */
 static size_t pack_entries(uint64_t from, uint32_t max,
@@ -529,12 +705,12 @@ static void send_heartbeat_with_entries(void) {
     // CHANGE 2: Larger batch size for catchup
     uint32_t batch_size = g_config->replication_batch_size ?: 256;
 
-    int n = g_config->node_count;
     int local = g_config->local_node_index;
     uint64_t last_local = atomic_load(&g_log_ring.head) - 1;
 
-    for (int peer = 0; peer < n; peer++) {
+    for (int peer = 0; peer < HA_MAX_NODES; peer++) {
         if (peer == local) continue;
+        if (!HA_is_peer_active(peer)) continue;
 
         uint64_t match = atomic_load(&g_runtime->match_index[peer]);
         uint64_t next = atomic_load(&g_runtime->next_index[peer]);
@@ -553,7 +729,6 @@ static void send_heartbeat_with_entries(void) {
         for (int batch = 0; batch < batches_this_peer; batch++) {
             if (budget_us && (now_us() - start) > budget_us) break;
 
-            next = atomic_load(&g_runtime->next_index[peer]);
             if (next > last_local) break;  // Caught up
 
             ha_append_entries_t *ae = (ha_append_entries_t *)buf;
@@ -574,7 +749,10 @@ static void send_heartbeat_with_entries(void) {
                         .term = atomic_load(&g_runtime->term)
                 };
                 if (send_message(peer, &h, buf, sizeof(*ae) + payload_sz) == 0 && last_sent) {
-                    atomic_store(&g_runtime->next_index[peer], last_sent + 1);
+                    /* Advance only local send cursor; global next_index moves on follower ACK. */
+                    next = last_sent + 1;
+                } else {
+                    break;  // Send failed, retry from same next index on next tick
                 }
             } else {
                 break;  // No more entries to pack
@@ -594,6 +772,7 @@ static void send_heartbeat_with_entries(void) {
 
 static void start_election(void) {
     if (!g_runtime || !g_config) return;
+    if (!HA_local_is_voter()) return;
 
     pthread_rwlock_wrlock(&g_runtime->state_lock);
     uint64_t new_term = atomic_fetch_add(&g_runtime->term, 1) + 1;
@@ -604,9 +783,14 @@ static void start_election(void) {
     atomic_fetch_add(&g_runtime->elections_started, 1);
     pthread_rwlock_unlock(&g_runtime->state_lock);
 
-    printf("🗳️  Starting election for term %lu\n", new_term);
+    printf("Starting election for term %lu\n", new_term);
 
-    int votes_needed = (g_config->node_count / 2) + 1;
+    uint64_t voter_mask = ha_voters_new_mask();
+    int votes_needed = ha_majority_needed(voter_mask);
+    if (votes_needed <= 0) {
+        atomic_store(&g_runtime->role, HA_ROLE_FOLLOWER);
+        return;
+    }
 
     uint64_t last_index = atomic_load(&g_log_ring.head);
     uint64_t last_term = 0;
@@ -617,9 +801,10 @@ static void start_election(void) {
         if (entry) last_term = entry->term;
     }
 
-    for (int i = 0; i < g_config->node_count; i++) {
+    for (int i = 0; i < HA_MAX_NODES; i++) {
         if (i == g_config->local_node_index) continue;
-        if (!g_config->nodes[i].is_voter) continue;
+        if (!(voter_mask & HA_NODE_MASK(i))) continue;
+        if (!HA_is_peer_active(i)) continue;
 
         ha_msg_header_t header = {
                 .type = HA_MSG_VOTE_REQUEST,
@@ -655,7 +840,7 @@ static void start_election(void) {
                     atomic_store(&g_runtime->match_index[i], 0);
                 }
 
-                printf("✅ Won election, now LEADER for term %lu\n", new_term);
+                printf("âœ… Won election, now LEADER for term %lu\n", new_term);
             }
 
             pthread_rwlock_unlock(&g_runtime->state_lock);
@@ -667,7 +852,7 @@ static void start_election(void) {
     }
 
     atomic_store(&g_runtime->role, HA_ROLE_FOLLOWER);
-    printf("⏱️  Election timeout for term %lu\n", new_term);
+    printf("Election timeout for term %lu\n", new_term);
 }
 
 int HA_start_election(void) {
@@ -675,13 +860,10 @@ int HA_start_election(void) {
     return 0;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
 // Public API Implementation
-// ═══════════════════════════════════════════════════════════════════════════════
 
 int HA_replication_init(ha_config_t *config, ha_runtime_t *runtime) {
-    g_config = config;
-    g_runtime = runtime;
+    HA_replication_bind(config, runtime);
 
     memset(&g_log_ring, 0, sizeof(g_log_ring));
     atomic_store(&g_log_ring.head, 1);
@@ -701,7 +883,7 @@ int HA_replication_init(ha_config_t *config, ha_runtime_t *runtime) {
         pthread_mutex_init(&g_peer_conns[i].lock, NULL);
     }
 
-    printf("✅ HA replication engine initialized\n");
+    printf("HA replication engine initialized\n");
     return 0;
 }
 
@@ -734,7 +916,7 @@ void HA_replication_shutdown(void) {
     g_config = NULL;
     g_runtime = NULL;
 
-    printf("✅ HA replication engine shutdown complete\n");
+    printf("HA replication engine shutdown complete\n");
 }
 
 uint64_t HA_append_local_entry(uint32_t type, const void *data, uint32_t size) {
@@ -785,28 +967,19 @@ int HA_wait_for_replication(uint64_t index, uint32_t timeout_ms) {
     if (!HA_is_leader(g_runtime)) return -1;
 
     uint64_t start = now_us();
-    uint64_t timeout_us = timeout_ms * 1000;
-
-    int required_acks = g_config->write_concern;
+    uint64_t timeout_us = timeout_ms * 1000ULL;
 
     while ((now_us() - start) < timeout_us) {
-        int acks = 1;
-
-        for (int i = 0; i < g_config->node_count; i++) {
-            if (i == g_config->local_node_index) continue;
-
-            uint64_t match = atomic_load(&g_runtime->match_index[i]);
-            if (match >= index) {
-                acks++;
-            }
-        }
-
-        if (acks >= required_acks) {
+        /* Commit index is the authoritative completion signal. */
+        if (atomic_load(&g_runtime->commit_index) >= index) {
             atomic_fetch_add(&g_runtime->writes_replicated, 1);
             return 0;
         }
-
-        usleep(100);
+        if (ha_has_commit_quorum_for(index)) {
+            atomic_fetch_add(&g_runtime->writes_replicated, 1);
+            return 0;
+        }
+        usleep(200);
     }
 
     atomic_fetch_add(&g_runtime->writes_failed, 1);
@@ -828,6 +1001,10 @@ int HA_apply_committed_entries(void) {
         }
 
         ha_log_entry_t *entry = slot->entry;
+        if (entry->type == HA_LOG_CFG_CHANGE || entry->type == AOF_REC_HA_MEMBERSHIP) {
+            /* Keep leader membership/runtime state in sync with committed cfg records. */
+            (void)RAMForge_HA_replay_record(entry->type, entry->data, entry->size);
+        }
         (void)rf_bus_publish((int)entry->type, entry->data, entry->size);
         atomic_store(&g_runtime->applied_index, idx);
     }
@@ -840,3 +1017,174 @@ void HA_get_log_stats(uint64_t *last_index, uint64_t *committed, uint64_t *appli
     if (committed) *committed = atomic_load(&g_runtime->commit_index);
     if (applied) *applied = atomic_load(&g_runtime->applied_index);
 }
+
+
+
+
+
+
+
+
+
+void HA_leader_on_nack(int peer_index, uint64_t follower_index) {
+    if (!g_runtime || !g_config) return;
+    if (!HA_is_leader(g_runtime)) return;
+    if (peer_index < 0 || peer_index >= HA_MAX_NODES) return;
+
+    uint64_t want = follower_index + 1;
+    uint64_t cur = atomic_load(&g_runtime->next_index[peer_index]);
+    if (want < cur) {
+        atomic_store(&g_runtime->next_index[peer_index], want);
+    }
+}
+
+static int ha_recalc_node_count_locked(void) {
+    int highest = -1;
+    uint64_t active = ha_active_mask();
+    for (int i = 0; i < HA_MAX_NODES; i++) {
+        if ((active & HA_NODE_MASK(i)) && g_config->nodes[i].node_id[0]) highest = i;
+    }
+    g_config->node_count = (highest >= 0) ? (highest + 1) : 0;
+    if (g_config->node_count < 1 && g_config->local_node_index >= 0) {
+        g_config->node_count = g_config->local_node_index + 1;
+    }
+    return g_config->node_count;
+}
+
+int HA_get_membership_view(ha_membership_view_t *out) {
+    if (!out || !g_config || !g_runtime) return -1;
+    memset(out, 0, sizeof(*out));
+
+    pthread_rwlock_rdlock(&g_runtime->membership_lock);
+    out->epoch = atomic_load(&g_runtime->config_epoch);
+    out->voters_old_mask = atomic_load(&g_runtime->voters_old_mask);
+    out->voters_new_mask = atomic_load(&g_runtime->voters_new_mask);
+    out->learners_mask = atomic_load(&g_runtime->learners_mask);
+    out->joint_active = (uint32_t)atomic_load(&g_runtime->joint_active);
+    out->node_count = (uint32_t)g_config->node_count;
+    memcpy(out->nodes, g_config->nodes, sizeof(out->nodes));
+    pthread_rwlock_unlock(&g_runtime->membership_lock);
+    return 0;
+}
+
+int HA_apply_membership_snapshot(const ha_membership_record_t *rec) {
+    if (!rec || !g_config || !g_runtime) return -1;
+
+    pthread_rwlock_wrlock(&g_runtime->membership_lock);
+
+    memcpy(g_config->nodes, rec->nodes, sizeof(g_config->nodes));
+    g_config->node_count = (int)((rec->node_count <= HA_MAX_NODES) ? rec->node_count : HA_MAX_NODES);
+
+    uint64_t voters_old = rec->voters_old_mask;
+    uint64_t voters_new = rec->voters_new_mask;
+    uint64_t learners = rec->learners_mask;
+
+    atomic_store(&g_runtime->voters_old_mask, voters_old);
+    atomic_store(&g_runtime->voters_new_mask, voters_new);
+    atomic_store(&g_runtime->learners_mask, learners);
+    atomic_store(&g_runtime->joint_active, rec->joint_active ? 1 : 0);
+    atomic_store(&g_runtime->config_epoch, rec->epoch ? rec->epoch : 1);
+
+    for (int i = 0; i < HA_MAX_NODES; i++) {
+        if (!g_config->nodes[i].node_id[0]) continue;
+        g_config->nodes[i].is_voter = (voters_new & HA_NODE_MASK(i)) ? 1 : 0;
+    }
+
+    ha_recalc_node_count_locked();
+    pthread_rwlock_unlock(&g_runtime->membership_lock);
+    return 0;
+}
+
+int HA_apply_cfg_change_entry(const void *data, uint32_t size) {
+    if (!data || size < sizeof(ha_cfg_change_t) || !g_config || !g_runtime) return -1;
+    const ha_cfg_change_t *chg = (const ha_cfg_change_t *)data;
+
+    if (chg->node_index >= HA_MAX_NODES) return -1;
+
+    pthread_rwlock_wrlock(&g_runtime->membership_lock);
+
+    uint64_t epoch = atomic_load(&g_runtime->config_epoch);
+    if (chg->expected_epoch && chg->expected_epoch != epoch) {
+        pthread_rwlock_unlock(&g_runtime->membership_lock);
+        return 0;
+    }
+
+    uint64_t voters_old = atomic_load(&g_runtime->voters_old_mask);
+    uint64_t voters_new = atomic_load(&g_runtime->voters_new_mask);
+    uint64_t learners = atomic_load(&g_runtime->learners_mask);
+    int joint = atomic_load(&g_runtime->joint_active);
+
+    int idx = (int)chg->node_index;
+    uint64_t bit = HA_NODE_MASK(idx);
+    int rc = 0;
+
+    switch (chg->op) {
+        case HA_CFG_OP_ADD_LEARNER:
+            if (!g_config->nodes[idx].node_id[0]) {
+                g_config->nodes[idx] = chg->member;
+            }
+            g_config->nodes[idx].is_voter = 0;
+            learners |= bit;
+            voters_old &= ~bit;
+            voters_new &= ~bit;
+            joint = 0;
+            break;
+
+        case HA_CFG_OP_PROMOTE_VOTER_JOINT_BEGIN:
+            if (!g_config->nodes[idx].node_id[0] && chg->member.node_id[0]) {
+                g_config->nodes[idx] = chg->member;
+            }
+            learners &= ~bit;
+            voters_old = voters_new;
+            voters_new |= bit;
+            joint = 1;
+            g_config->nodes[idx].is_voter = 1;
+            break;
+
+        case HA_CFG_OP_PROMOTE_VOTER_FINALIZE:
+            learners &= ~bit;
+            voters_new |= bit;
+            voters_old = voters_new;
+            joint = 0;
+            g_config->nodes[idx].is_voter = 1;
+            break;
+
+        case HA_CFG_OP_REMOVE_MEMBER_JOINT_BEGIN:
+            voters_old = voters_new;
+            voters_new &= ~bit;
+            learners &= ~bit;
+            joint = 1;
+            break;
+
+        case HA_CFG_OP_REMOVE_MEMBER_FINALIZE:
+            voters_new &= ~bit;
+            voters_old = voters_new;
+            learners &= ~bit;
+            joint = 0;
+            memset(&g_config->nodes[idx], 0, sizeof(g_config->nodes[idx]));
+            break;
+
+        default:
+            rc = -1;
+            break;
+    }
+
+    if (rc == 0) {
+        atomic_store(&g_runtime->voters_old_mask, voters_old);
+        atomic_store(&g_runtime->voters_new_mask, voters_new);
+        atomic_store(&g_runtime->learners_mask, learners);
+        atomic_store(&g_runtime->joint_active, joint ? 1 : 0);
+        atomic_store(&g_runtime->config_epoch, epoch + 1);
+        ha_recalc_node_count_locked();
+    }
+
+    pthread_rwlock_unlock(&g_runtime->membership_lock);
+    return rc;
+}
+
+
+
+
+
+
+

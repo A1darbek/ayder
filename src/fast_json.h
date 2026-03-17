@@ -414,7 +414,10 @@ static int parse_value(json_parser_t* p, json_value_t* out) {
 
         // Check if it's a floating-point number
         char* dot_pos = strchr(p->ptr, '.');
-        while (p->ptr < p->end && (*p->ptr >= '0' && *p->ptr <= '9' || *p->ptr == '.' || *p->ptr == 'e' || *p->ptr == 'E' || *p->ptr == '+' || *p->ptr == '-')) {
+        while (p->ptr < p->end &&
+               (((*p->ptr >= '0') && (*p->ptr <= '9')) ||
+                (*p->ptr == '.') || (*p->ptr == 'e') || (*p->ptr == 'E') ||
+                (*p->ptr == '+') || (*p->ptr == '-'))) {
             p->ptr++;
         }
 

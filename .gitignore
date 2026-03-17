@@ -40,3 +40,18 @@ target/
 
 # (Optional) Ignore everything in /tests/ except source files
 # /tests/*.log
+
+# Local runtime and artifact outputs (safe-sync exclusions)
+.vscode/
+artifacts/
+cmake-build-debug/
+WSL2-Linux-Kernel/
+worker0
+append.aof.sealed
+cluster/node*/append.aof.sealed
+cluster/node*/append.aof.sealed.lock
+tests/jepsen/artifacts/
+tests/jepsen/results/
+tests/jepsen/.lein-failurestests/jepsen/.toolchain/
+tests/jepsen/target/
+tests/jepsen/store/tests/jepsen/tests/

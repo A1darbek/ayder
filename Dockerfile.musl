@@ -1,0 +1,64 @@
+# Dockerfile.musl (Alpine/musl build + runtime)
+# Usage:
+#   docker build -f Dockerfile.musl -t ayder:musl .
+#   docker run --rm -it --shm-size=256m -e RF_SHARED_ENTRIES=262144 -p 1109:1109 ayder:musl
+
+############################
+# 1) BUILD (musl)
+############################
+FROM alpine:3.20 AS build
+
+RUN apk add --no-cache \
+    build-base linux-headers \
+    ca-certificates curl \
+    pkgconf \
+    libuv-dev libevent-dev \
+    liburing-dev \
+    curl-dev openssl-dev zlib-dev
+
+WORKDIR /app
+
+# Copy repo
+COPY . .
+
+# Ensure picohttpparser exists (in case repo doesn't include it)
+RUN mkdir -p deps/picohttpparser && \
+    if [ ! -f deps/picohttpparser/picohttpparser.c ]; then \
+      curl -fsSL https://raw.githubusercontent.com/h2o/picohttpparser/master/picohttpparser.c \
+        -o deps/picohttpparser/picohttpparser.c ; \
+    fi && \
+    if [ ! -f deps/picohttpparser/picohttpparser.h ]; then \
+      curl -fsSL https://raw.githubusercontent.com/h2o/picohttpparser/master/picohttpparser.h \
+        -o deps/picohttpparser/picohttpparser.h ; \
+    fi
+
+RUN make clean && make
+
+############################
+# 2) RUNTIME (musl)
+############################
+FROM alpine:3.20 AS runtime
+
+RUN apk add --no-cache \
+    ca-certificates \
+    libuv libevent \
+    liburing \
+    curl openssl zlib
+
+WORKDIR /app
+RUN mkdir -p /data
+
+# Copy binary (+ optional entrypoint if you have it)
+COPY --from=build /app/ayder ./ayder
+# If your repo has entrypoint.sh, keep it; otherwise this is harmless to remove.
+COPY --from=build /app/entrypoint.sh ./entrypoint.sh
+RUN if [ -f ./entrypoint.sh ]; then chmod +x ./entrypoint.sh; fi
+
+EXPOSE 1109
+
+# If you have entrypoint.sh and want it:
+ENTRYPOINT ["./entrypoint.sh"]
+# Otherwise, comment ENTRYPOINT above and use:
+# ENTRYPOINT ["./ayder"]
+
+CMD ["./ayder", "--workers", "4"]
