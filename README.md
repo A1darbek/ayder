@@ -6,7 +6,7 @@ Ayder is designed to be simple to run and serious about correctness: one binary,
 
 You can start with `curl` on a single node and scale to multi-node deployments without switching protocols or client stacks.
 
-## Real Jepsen Result (Strict Claim)
+## Jepsen Result (Strict Claim)
 
 Public correctness claim:
 - strictly linearizable under mixed faults: 45/45 pass in the latest full `hn-ready` matrix
