@@ -20,9 +20,7 @@
 #include <poll.h>
 #include "ramforge_ha_tls.h"
 
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // In-Memory Log Ring Buffer (Zero-Copy, Lock-Free)
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 #define LOG_RING_SIZE (1 << 22)     // 4M entries
 #define LOG_RING_MASK (LOG_RING_SIZE - 1)
@@ -304,9 +302,7 @@ int HA_leader_on_ack(int peer_index, uint64_t match_index) {
     return 0;
 }
 
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // Log Entry Management
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 static ha_log_entry_t* create_log_entry(uint64_t index, uint32_t type,
                                         const void *data, uint32_t size) {
@@ -340,9 +336,7 @@ static void release_log_entry(ha_log_entry_t *entry) {
     }
 }
 
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // Network Layer (PATCHED v2: Robust Connection Handling)
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 typedef struct {
     int fd;
@@ -665,9 +659,7 @@ int send_message(int peer_index, ha_msg_header_t *header,
     return -1;
 }
 
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // Leader Election & Heartbeats
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 /* helper: copy up to N entries starting at index 'from' into a flat buffer */
 static size_t pack_entries(uint64_t from, uint32_t max,
@@ -737,7 +729,6 @@ static void send_heartbeat_with_entries(void) {
         for (int batch = 0; batch < batches_this_peer; batch++) {
             if (budget_us && (now_us() - start) > budget_us) break;
 
-            next = atomic_load(&g_runtime->next_index[peer]);
             if (next > last_local) break;  // Caught up
 
             ha_append_entries_t *ae = (ha_append_entries_t *)buf;
@@ -758,7 +749,10 @@ static void send_heartbeat_with_entries(void) {
                         .term = atomic_load(&g_runtime->term)
                 };
                 if (send_message(peer, &h, buf, sizeof(*ae) + payload_sz) == 0 && last_sent) {
-                    atomic_store(&g_runtime->next_index[peer], last_sent + 1);
+                    /* Advance only local send cursor; global next_index moves on follower ACK. */
+                    next = last_sent + 1;
+                } else {
+                    break;  // Send failed, retry from same next index on next tick
                 }
             } else {
                 break;  // No more entries to pack
@@ -789,7 +783,7 @@ static void start_election(void) {
     atomic_fetch_add(&g_runtime->elections_started, 1);
     pthread_rwlock_unlock(&g_runtime->state_lock);
 
-    printf("ðŸ—³ï¸  Starting election for term %lu\n", new_term);
+    printf("Starting election for term %lu\n", new_term);
 
     uint64_t voter_mask = ha_voters_new_mask();
     int votes_needed = ha_majority_needed(voter_mask);
@@ -858,7 +852,7 @@ static void start_election(void) {
     }
 
     atomic_store(&g_runtime->role, HA_ROLE_FOLLOWER);
-    printf("â±ï¸  Election timeout for term %lu\n", new_term);
+    printf("Election timeout for term %lu\n", new_term);
 }
 
 int HA_start_election(void) {
@@ -866,9 +860,7 @@ int HA_start_election(void) {
     return 0;
 }
 
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // Public API Implementation
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 int HA_replication_init(ha_config_t *config, ha_runtime_t *runtime) {
     HA_replication_bind(config, runtime);
@@ -891,7 +883,7 @@ int HA_replication_init(ha_config_t *config, ha_runtime_t *runtime) {
         pthread_mutex_init(&g_peer_conns[i].lock, NULL);
     }
 
-    printf("âœ… HA replication engine initialized\n");
+    printf("HA replication engine initialized\n");
     return 0;
 }
 
@@ -924,7 +916,7 @@ void HA_replication_shutdown(void) {
     g_config = NULL;
     g_runtime = NULL;
 
-    printf("âœ… HA replication engine shutdown complete\n");
+    printf("HA replication engine shutdown complete\n");
 }
 
 uint64_t HA_append_local_entry(uint32_t type, const void *data, uint32_t size) {

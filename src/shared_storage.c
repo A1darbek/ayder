@@ -288,6 +288,42 @@ int shared_storage_set(SharedStorage *ss, int key, const void *data, size_t sz) 
     return -1;
 }
 
+int shared_storage_try_get_fast(SharedStorage *ss, int key, void *out, size_t out_sz) {
+    if (!ss || !out || key == 0) return 0;
+
+    uint32_t h = hash_key_fast(key);
+    uint32_t cap = capacity_load(ss);
+    uint32_t idx = h % cap;
+    uint32_t start_idx = idx;
+    uint32_t distance = 0;
+    uint32_t max_distance = cap / 8;
+
+    while (distance < max_distance) {
+        uint64_t version_before = atomic_load(&ss->entries[idx].version);
+        int existing_key = atomic_load(&ss->entries[idx].key);
+
+        if (existing_key == key) {
+            uint32_t size = atomic_load(&ss->entries[idx].size);
+            if (out_sz < size) return 0;
+
+            memcpy(out, ss->entries[idx].data, size);
+            uint64_t version_after = atomic_load(&ss->entries[idx].version);
+            if (version_before == version_after) {
+                atomic_fetch_add(&ss->read_ops, 1);
+                return 1;
+            }
+            return 0;
+        } else if (existing_key == 0) {
+            return 0;
+        }
+
+        idx = (idx + 1) % cap;
+        distance++;
+        if (idx == start_idx) break;
+    }
+
+    return 0;
+}
 int shared_storage_get_fast(SharedStorage *ss, int key, void *out, size_t out_sz) {
     if (!ss || !out || key == 0) return 0;
 

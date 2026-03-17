@@ -1,4 +1,4 @@
-pkill -f ramforge || true
+pkill -f ayder || true
 sleep 0.5
 wait 2>/dev/null || true
 sleep 0.5

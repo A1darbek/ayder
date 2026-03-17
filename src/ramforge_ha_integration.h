@@ -33,6 +33,7 @@ int RAMForge_HA_get_redirect_status(void);
 int RAMForge_HA_get_retry_after(void);
 int RAMForge_HA_is_follower(void);
 int RAMForge_HA_replicate_write(uint32_t record_type, const void *data, uint32_t size);
+int RAMForge_HA_linearizable_read_barrier(uint64_t barrier_id, uint32_t timeout_ms);
 const char* RAMForge_HA_get_local_node_id(void);
 const char* RAMForge_HA_get_leader_node_id(void);
 

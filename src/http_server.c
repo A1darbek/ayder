@@ -158,6 +158,7 @@ uint64_t RAMForge_http_total(void){ return total_requests; }
 static int    RL_DEFAULT_RPS        = 50;     // tokens per second
 static int    RL_DEFAULT_BURST      = 100;    // bucket capacity
 static uint64_t RL_DEFAULT_DAILY    = 100000; // daily requests
+static int    RL_ENABLED            = 1;      // set RF_HTTP_DISABLE_RL=1 to disable
 
 static size_t BP_MAX_SEALED_Q       = 4096;   // backpressure if sealed queue > this
 static size_t BP_MAX_ACTIVE_CONNS   = 32768;  // backpressure if active conns > this
@@ -342,7 +343,11 @@ static void load_auth_env_overrides(void){
     if ((e=getenv("BP_MAX_SEALED_Q")))    BP_MAX_SEALED_Q    = (size_t)strtoull(e,NULL,10)?:BP_MAX_SEALED_Q;
     if ((e=getenv("BP_MAX_ACTIVE_CONNS")))BP_MAX_ACTIVE_CONNS= (size_t)strtoull(e,NULL,10)?:BP_MAX_ACTIVE_CONNS;
     if ((e=getenv("BP_RETRY_AFTER_SEC"))) BP_RETRY_AFTER_SEC = atoi(e)>0?atoi(e):BP_RETRY_AFTER_SEC;
+    if ((e=getenv("RF_HTTP_DISABLE_RL"))) RL_ENABLED = (e[0] == '0') ? 1 : 0;
 
+    if (!RL_ENABLED) {
+        fprintf(stderr, "[AUTH] Rate limiting disabled via RF_HTTP_DISABLE_RL\n");
+    }
 
 }
 
@@ -1056,17 +1061,21 @@ static void process_request(connection_ctx_t* ctx) {
             // 2) Rate-limit + daily quota
 
 
-            uint32_t lim=0, rem=0; uint64_t reset=0; int wait_s=0;
-            int rl = rl_take_one(cfg, tok, toklen, &lim, &rem, &reset, &wait_s);
-            if (rl > 0) {
-                if (wait_s < 1) wait_s = 1;
-                send_rate_limited(ctx, wait_s, lim, rem, reset);
-                goto cleanup;
+            if (RL_ENABLED) {
+                uint32_t lim=0, rem=0; uint64_t reset=0; int wait_s=0;
+                int rl = rl_take_one(cfg, tok, toklen, &lim, &rem, &reset, &wait_s);
+                if (rl > 0) {
+                    if (wait_s < 1) wait_s = 1;
+                    send_rate_limited(ctx, wait_s, lim, rem, reset);
+                    goto cleanup;
+                } else {
+                    ctx->rl_limit = lim;
+                    ctx->rl_remaining = rem;
+                    ctx->rl_reset_epoch_s = reset;
+                    ctx->rl_have = 1;
+                }
             } else {
-                ctx->rl_limit = lim;
-                ctx->rl_remaining = rem;
-                ctx->rl_reset_epoch_s = reset;
-                ctx->rl_have = 1;
+                ctx->rl_have = 0;
             }
         }
     }
@@ -1629,6 +1638,12 @@ void http_server_shutdown(void) {
     uv_timer_stop(&stats_timer);
     // Event loop will exit naturally
 }
+
+
+
+
+
+
 
 
 

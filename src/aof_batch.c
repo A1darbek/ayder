@@ -1,4 +1,4 @@
-/* aof_batch.c ultra-fast io_uring AOF with batching + CRC32C + non-blocking rewrite */
+/* aof_batch.c ??? ultra-fast io_uring AOF with batching + CRC32C + non-blocking rewrite */
 #define _GNU_SOURCE
 #include <pthread.h>
 #include <stdlib.h>
@@ -91,7 +91,7 @@ static sealed_aof_t g_opt_sealed = {0};
 
 static uint64_t local_generation = 0;
 
-/*  Enhanced configuration for io_uring */
+/* ????????? Enhanced configuration for io_uring ????????? */
 #define DEFAULT_RING_CAP (1 << 16)            /* 64K entries */
 #define BUFFER_POOL_SIZE 2048                 /* Pre-allocated buffers */
 #define MAX_BUFFER_SIZE 8192                  /* Max size per buffer */
@@ -119,7 +119,7 @@ typedef _Atomic(uint64_t) atomic_uint64_t;
 static inline int running_under_valgrind(void) { return RUNNING_ON_VALGRIND; }
 
 
-/*  io_uring optimized structures  */
+/* ????????? io_uring optimized structures ????????? */
 typedef struct {
     struct io_uring ring;
     struct io_uring_cqe *cqes[URING_QUEUE_DEPTH];
@@ -139,7 +139,7 @@ typedef struct {
     uint64_t sequence;
 } write_batch_t;
 
-/* Write-ahead logging buffer */
+/* ????????? Write-ahead logging buffer ????????? */
 typedef struct {
     char *buffer;
     size_t size;
@@ -149,7 +149,7 @@ typedef struct {
     pthread_mutex_t lock;
 } wal_buffer_t;
 
-/*  Improved Buffer pool for zero-malloc AOF_append */
+/* ????????? Improved Buffer pool for zero-malloc AOF_append ????????? */
 typedef struct buffer_node {
     void *data;
     size_t capacity;
@@ -197,7 +197,7 @@ static inline uint64_t rf_fetch_add_u64_relaxed(_Atomic uint64_t *obj, uint64_t 
 
 
 
-/*types / globals */
+/* ????????? types / globals ????????????????????????????????????????????????????????????????????????????????? */
 typedef struct {
     int id;
     uint32_t sz;
@@ -250,7 +250,7 @@ static pthread_t      uring_worker;
 static atomic_bool    running = ATOMIC_VAR_INIT(false);
 static atomic_uint64_t write_sequence = ATOMIC_VAR_INIT(0);
 
-/*  Non-blocking rewrite state*/
+/* ????????? Non-blocking rewrite state ????????????????????????????????????????????? */
 static atomic_bool    rewrite_active = ATOMIC_VAR_INIT(false);
 static pthread_t      rewrite_thread;
 static aof_cmd_t     *rewrite_buffer;
@@ -354,7 +354,7 @@ static uint32_t sealed_reserve_contiguous(size_t aligned_size) {
         uint32_t out_off = off;
 
         if ((uint64_t) off + (uint64_t) aligned_size > g_opt_sealed.mmap_size) {
-            /* not enough space to keep record contiguous pad to end, wrap */
+            /* not enough space to keep record contiguous ??? pad to end, wrap */
             uint64_t pad = (uint64_t) g_opt_sealed.mmap_size - off;
             advance += pad;
             out_off = 0; /* actual record starts at 0 after padding */
@@ -514,7 +514,7 @@ static inline void sealed_wait_space(void) {
         uint64_t h = atomic_load_explicit(&g_opt_sealed.slot_head, memory_order_acquire);
         uint64_t t = atomic_load_explicit(&g_opt_sealed.slot_tail, memory_order_acquire);
         if (h - t < MAX_SEALED_BATCHES) return;
-        struct timespec ts = {0, 100000}; // 100s
+        struct timespec ts = {0, 100000}; // 100??s
         nanosleep(&ts, NULL);
     }
 }
@@ -584,7 +584,7 @@ int AOF_sealed_wait(uint64_t batch_id) {
     while (!atomic_load(&g_opt_sealed.shutdown)) {
         uint64_t last = atomic_load_explicit(&g_opt_sealed.last_synced_batch_id, memory_order_acquire);
         if (last >= batch_id) return 0;
-        struct timespec ts = {0, 100000}; // 100s
+        struct timespec ts = {0, 100000}; // 100??s
         nanosleep(&ts, NULL);
     }
     return -1;
@@ -771,7 +771,7 @@ size_t AOF_sealed_replay(const char *aof_path) {
     }
 
     if (applied || bad || skipped) {
-        printf(" PID %d sealed replay: applied=%zu, skipped=%zu, bad=%zu (file=%s, %zu bytes)\n",
+        printf("???? PID %d sealed replay: applied=%zu, skipped=%zu, bad=%zu (file=%s, %zu bytes)\n",
                getpid(), applied, skipped, bad, path, fsz);
     }
 
@@ -788,7 +788,7 @@ static void init_tls_fd_cache(void) {
     tls_fd_cache.generation = 0;
 }
 
-/*  Safe fd acquisition with generation check */
+/* ????????? Safe fd acquisition with generation check ????????? */
 static int get_valid_fd_for_write(void) {
     pthread_once(&tls_init_once, init_tls_fd_cache);
 
@@ -833,10 +833,10 @@ static int get_valid_fd_for_write(void) {
     return new_fd;
 }
 
-/*  io_uring initialization  */
+/* ????????? io_uring initialization ????????????????????????????????????????????????????????? */
 static int init_io_uring(void) {
     if (running_under_valgrind()) {
-        printf(" Valgrind detected disabling io_uring for this run\n");
+        printf("??????  Valgrind detected ??? disabling io_uring for this run\n");
         atomic_store(&g_uring_ctx.initialized, false);
         return -1; // NOTE: Aidarbek eger baska error shyksa onda return -1 ge ornyna keltir
     }
@@ -879,11 +879,11 @@ static void destroy_io_uring(void) {
         pthread_mutex_destroy(&g_uring_ctx.submit_lock);
         io_uring_queue_exit(&g_uring_ctx.ring);
         atomic_store(&g_uring_ctx.initialized, false);
-        printf(" io_uring destroyed\n");
+        printf("??? io_uring destroyed\n");
     }
 }
 
-/*  Write-ahead buffer initialization */
+/* ????????? Write-ahead buffer initialization ????????????????????????????????? */
 static int init_wal_buffer(void) {
     g_wal_buffer.buffer = mmap(NULL, WRITE_AHEAD_BUFFER_SIZE,
                                PROT_READ | PROT_WRITE,
@@ -911,11 +911,11 @@ static void destroy_wal_buffer(void) {
         pthread_mutex_destroy(&g_wal_buffer.lock);
         munmap(g_wal_buffer.buffer, WRITE_AHEAD_BUFFER_SIZE);
         g_wal_buffer.buffer = NULL;
-        printf(" WAL buffer destroyed\n");
+        printf("??? WAL buffer destroyed\n");
     }
 }
 
-/*  Enhanced buffer pool with lock-free operations */
+/* ????????? Enhanced buffer pool with lock-free operations ????????? */
 static int init_buffer_pool(void) {
     memset(&g_buffer_pool, 0, sizeof(g_buffer_pool));
 
@@ -1018,7 +1018,7 @@ static void return_buffer_to_pool(void *data, size_t size) {
 }
 
 static void destroy_buffer_pool(void) {
-    printf("  Destroying buffer pool...\n");
+    printf("???????  Destroying buffer pool...\n");
 
     atomic_store(&g_buffer_pool.shutdown_flag, true);
 
@@ -1040,7 +1040,7 @@ static void destroy_buffer_pool(void) {
     pthread_mutex_unlock(&g_buffer_pool.lock);
     pthread_mutex_destroy(&g_buffer_pool.lock);
 
-    printf(" Buffer pool destroyed\n");
+    printf("??? Buffer pool destroyed\n");
 }
 
 static inline bool is_fd_valid(int check_fd) {
@@ -1092,7 +1092,7 @@ static int submit_uring_write(const void *buffer, size_t size) {
     /* Get a validated fd */
     int write_fd = get_valid_fd_for_write();
     if (write_fd < 0) {
-        fprintf(stderr, " Failed to get valid fd for write\n");
+        fprintf(stderr, "??? Failed to get valid fd for write\n");
         return -1;
     }
 
@@ -1123,7 +1123,7 @@ static int submit_uring_write(const void *buffer, size_t size) {
         pthread_mutex_unlock(&g_uring_ctx.submit_lock);
         free(batch->buffer);
         free(batch);
-        fprintf(stderr, " fd became invalid during submission preparation\n");
+        fprintf(stderr, "??? fd became invalid during submission preparation\n");
         return -1;
     }
 
@@ -1153,7 +1153,7 @@ static int submit_uring_write(const void *buffer, size_t size) {
     }
 }
 
-/*  Fast record writing with CRC  */
+/* ????????? Fast record writing with CRC ????????????????????????????????????????????? */
 static inline size_t write_record_to_buffer(char *buf, int id, const void *data, uint32_t size) {
     char *ptr = buf;
 
@@ -1173,7 +1173,7 @@ static inline size_t write_record_to_buffer(char *buf, int id, const void *data,
     return ptr - buf;
 }
 
-/*  io_uring worker thread */
+/* ????????? io_uring worker thread ????????????????????????????????????????????????????????? */
 static void *uring_worker_thread(void *arg) {
     (void)arg;
     if (!atomic_load(&g_uring_ctx.initialized)) {
@@ -1204,10 +1204,10 @@ static void *uring_worker_thread(void *arg) {
                     /* This is expected during rotation - log at debug level only */
                     uint64_t current_gen = atomic_load(&g_fd_state.master_generation);
                     if (batch->generation < current_gen) {
-                        printf(" Expected EBADF during rotation (gen %" PRIu64 " -> %" PRIu64 ")\n",
+                        printf("???? Expected EBADF during rotation (gen %" PRIu64 " -> %" PRIu64 ")\n",
                                batch->generation, current_gen);
                     } else {
-                        fprintf(stderr, " Unexpected EBADF (same generation %" PRIu64 ")\n",
+                        fprintf(stderr, "??????  Unexpected EBADF (same generation %" PRIu64 ")\n",
                                 current_gen);
                     }
                 } else {
@@ -1227,7 +1227,7 @@ static void *uring_worker_thread(void *arg) {
         io_uring_cqe_seen(&g_uring_ctx.ring, cqe);
     }
 
-    printf(" Enhanced io_uring worker thread exiting\n");
+    printf("???? Enhanced io_uring worker thread exiting\n");
     return NULL;
 }
 
@@ -1244,7 +1244,7 @@ static void cleanup_ring_entry(aof_cmd_t *c) {
     atomic_store(&c->written, false);
 }
 
-/*  Enhanced background writer with io_uring batching */
+/* ????????? Enhanced background writer with io_uring batching ????????? */
 static void *writer_thread(void *arg) {
     (void)arg;
 
@@ -1321,7 +1321,7 @@ static void *writer_thread(void *arg) {
                                 ssize_t w = write(fd, batch_buffer, total_batch_size);
                                 if (w != (ssize_t) total_batch_size) {
                                     if (errno == EBADF) {
-                                        fprintf(stderr, "  Write failed due to bad fd - attempting recovery\n");
+                                        fprintf(stderr, "??????  Write failed due to bad fd - attempting recovery\n");
                                         AOF_reopen_if_needed();
                                     } else {
                                         perror("AOF sync write fallback");
@@ -1336,7 +1336,7 @@ static void *writer_thread(void *arg) {
                             ssize_t w = write(fd, batch_buffer, total_batch_size);
                             if (w != (ssize_t) total_batch_size) {
                                 if (errno == EBADF) {
-                                    fprintf(stderr, " Sync write failed due to bad fd\n");
+                                    fprintf(stderr, "??????  Sync write failed due to bad fd\n");
                                     AOF_reopen_if_needed();
                                 } else {
                                     perror("AOF write");
@@ -1356,11 +1356,11 @@ static void *writer_thread(void *arg) {
             }
 
     pthread_cleanup_pop(1);
-    printf(" Enhanced writer thread exiting\n");
+    printf("???? Enhanced writer thread exiting\n");
     return NULL;
 }
 
-/* Segment rewrite (unchanged but optimized) */
+/* ????????? Segment rewrite (unchanged but optimized) ????????????????????????????????? */
 static void dump_record_cb(int id, const void *data, size_t sz, void *ud) {
     int out_fd  = (int)(intptr_t)ud;
 
@@ -1377,7 +1377,7 @@ static void dump_record_cb(int id, const void *data, size_t sz, void *ud) {
 static void *segment_rewrite_thread_func(void *arg) {
     rewrite_task_t *task = (rewrite_task_t*)arg;
 
-    printf("Starting segment rewrite: %s\n", task->source_path);
+    printf("???? Starting segment rewrite: %s\n", task->source_path);
 
     char tmp_path[1024];
     snprintf(tmp_path, sizeof(tmp_path), "%s.compact", task->output_path);
@@ -1452,7 +1452,7 @@ static void *segment_rewrite_thread_func(void *arg) {
         perror("segment_rewrite: rename failed");
         unlink(tmp_path);
     } else {
-        printf("Segment rewrite complete: %s\n", task->output_path);
+        printf("??? Segment rewrite complete: %s\n", task->output_path);
     }
 
     storage_destroy(&temp_storage);
@@ -1465,10 +1465,10 @@ static void *segment_rewrite_thread_func(void *arg) {
     return NULL;
 }
 
-/* Rest of the segment rewrite functions (unchanged)*/
+/* ????????? Rest of the segment rewrite functions (unchanged) ????????? */
 int AOF_begin_rewrite(const char *source_path) {
     if (atomic_load(&segment_rewrite_active)) {
-        printf(" Segment rewrite already in progress\n");
+        printf("??????  Segment rewrite already in progress\n");
         return -1;
     }
 
@@ -1508,11 +1508,11 @@ int AOF_segment_rewrite_in_progress(void) {
 }
 
 
-/*  Non-blocking rewrite thread (enhanced) */
+/* ????????? Non-blocking rewrite thread (enhanced) ????????????????????????????????? */
 static void *rewrite_thread_func(void *arg) {
     Storage *st = (Storage*)arg;
 
-    printf(" Starting non-blocking AOF rewrite...\n");
+    printf("???? Starting non-blocking AOF rewrite...\n");
 
     char tmp[512];
     snprintf(tmp, sizeof tmp, "%s.rewrite", g_path);
@@ -1526,7 +1526,7 @@ static void *rewrite_thread_func(void *arg) {
     storage_iterate(st, dump_record_cb, (void*)(intptr_t)fd_tmp);
 
     pthread_mutex_lock(&rewrite_lock);
-    printf(" Applying %zu buffered operations...\n",
+    printf("???? Applying %zu buffered operations...\n",
            (rewrite_buf_head - rewrite_buf_tail) & rewrite_buf_mask);
 
     while (rewrite_buf_tail != rewrite_buf_head) {
@@ -1586,11 +1586,11 @@ static void *rewrite_thread_func(void *arg) {
     pthread_mutex_unlock(&lock);
 
     atomic_store(&rewrite_active, false);
-    printf("Non-blocking AOF rewrite complete!\n");
+    printf("??? Non-blocking AOF rewrite complete!\n");
     return NULL;
 }
 
-/* Public API (enhanced) */
+/* ????????? Public API (enhanced) ????????????????????????????????????????????????????????????????????? */
 void AOF_init(const char *path, size_t ring_capacity, unsigned interval_ms) {
 
 
@@ -1680,7 +1680,7 @@ void AOF_init(const char *path, size_t ring_capacity, unsigned interval_ms) {
     atexit(AOF_shutdown);
 }
 
-/*  AOF_append with pool allocation */
+/* ????????? AOF_append with pool allocation ????????? */
 void AOF_append(int id, const void *data, size_t sz) {
     if (!atomic_load(&running)) return;
     AOF_reopen_if_needed();
@@ -1757,14 +1757,27 @@ void AOF_append(int id, const void *data, size_t sz) {
     pthread_mutex_unlock(&lock);
 }
 
-/* AOF_load function */
+//int AOF_fs_stats(uint64_t *bytes_total, uint64_t *bytes_free, uint64_t *inodes_total, uint64_t *inodes_free){
+//    if (!g_fd_state.file_path) return -1;
+//    char pathcpy[1024]; strncpy(pathcpy, g_fd_state.file_path, sizeof(pathcpy)-1); pathcpy[sizeof(pathcpy)-1]=0;
+//    char *dir = dirname(pathcpy); if (!dir) dir = ".";
+//    struct statvfs s;
+//    if (statvfs(dir, &s) != 0) return -1;
+//    if (bytes_total)  *bytes_total  = (uint64_t)s.f_frsize * (uint64_t)s.f_blocks;
+//    if (bytes_free)   *bytes_free   = (uint64_t)s.f_frsize * (uint64_t)s.f_bfree;
+//    if (inodes_total) *inodes_total = (uint64_t)s.f_files;
+//    if (inodes_free)  *inodes_free  = (uint64_t)s.f_ffree;
+//    return 0;
+//}
+
+/* ????????? AOF_load function ????????? */
 void AOF_load(Storage *st) {
     if (!g_path || !st) return;
 
     int fd_load = open(g_path, O_RDONLY | O_CLOEXEC);
     if (fd_load < 0) {
         if (errno == ENOENT) {
-            printf(" AOF file not found, starting fresh\n");
+            printf("???? AOF file not found, starting fresh\n");
             return;
         }
         perror("AOF_load: open");
@@ -1825,10 +1838,10 @@ void AOF_load(Storage *st) {
 
     close(fd_load);
 }
-/* AOF_rewrite function  */
+/* ????????? AOF_rewrite function ????????? */
 void AOF_rewrite(Storage *st) {
     if (atomic_load(&rewrite_active)) {
-        printf("  AOF rewrite already in progress\n");
+        printf("??????  AOF rewrite already in progress\n");
         return;
     }
 
@@ -1841,12 +1854,12 @@ void AOF_rewrite(Storage *st) {
     }
 
     pthread_detach(rewrite_thread);
-    printf(" AOF rewrite started in background\n");
+    printf("???? AOF rewrite started in background\n");
 }
 
-/* AOF_shutdown function  */
+/* ????????? AOF_shutdown function ????????? */
 void AOF_shutdown(void) {
-    printf(" AOF shutdown initiated...\n");
+    printf("???? AOF shutdown initiated...\n");
 
     atomic_store(&g_opt_sealed.shutdown, true);
 
@@ -1873,17 +1886,17 @@ void AOF_shutdown(void) {
     /* Wait for threads to finish */
     if (writer) {
         pthread_join(writer, NULL);
-        printf(" Writer thread joined\n");
+        printf("??? Writer thread joined\n");
     }
 
     if (atomic_load(&g_uring_ctx.initialized)) {
         pthread_join(uring_worker, NULL);
-        printf(" io_uring worker thread joined\n");
+        printf("??? io_uring worker thread joined\n");
     }
 
     /* Wait for any active rewrite to complete */
     if (atomic_load(&rewrite_active)) {
-        printf(" Waiting for rewrite to complete...\n");
+        printf("??? Waiting for rewrite to complete...\n");
         while (atomic_load(&rewrite_active)) {
             usleep(100000); /* 100ms */
         }
@@ -1911,10 +1924,10 @@ void AOF_shutdown(void) {
     pthread_cond_destroy(&cond);
     pthread_mutex_destroy(&rewrite_lock);
 
-    printf(" AOF shutdown complete\n");
+    printf("??? AOF shutdown complete\n");
 }
 
-/*  Status functions  */
+/* ????????? Status functions ????????? */
 int AOF_rewrite_in_progress(void) {
     return atomic_load(&rewrite_active);
 }
@@ -1931,7 +1944,7 @@ size_t AOF_pending_writes(void) {
 }
 
 void AOF_prepare_for_rotation(void) {
-    printf("Preparing AOF for rotation...\n");
+    printf("???? Preparing AOF for rotation...\n");
 
     /* Wait for all pending writes to complete */
     while (AOF_pending_writes() > 0) {
@@ -1941,18 +1954,18 @@ void AOF_prepare_for_rotation(void) {
     /* Ensure everything is flushed to disk */
     AOF_sync();
 
-    printf(" AOF prepared for rotation\n");
+    printf("??? AOF prepared for rotation\n");
 }
 
 /* Atomically rotate the AOF file */
 int AOF_rotate_file(const char *new_path) {
-    printf(" Starting safe AOF rotation...\n");
+    printf("???? Starting safe AOF rotation...\n");
 
     /* Acquire write lock to block all new fd acquisitions */
     pthread_rwlock_wrlock(&g_fd_state.rotation_rwlock);
 
     /* Wait for all pending io_uring operations to drain */
-    printf(" Draining %d pending io_uring operations...\n",
+    printf("??? Draining %d pending io_uring operations...\n",
            atomic_load(&g_uring_ctx.pending_writes));
 
     int timeout_ms = 5000; /* 5 second timeout */
@@ -1973,7 +1986,7 @@ int AOF_rotate_file(const char *new_path) {
     }
 
     if (atomic_load(&g_uring_ctx.pending_writes) > 0) {
-        printf("  Timeout waiting for pending writes, forcing rotation\n");
+        printf("??????  Timeout waiting for pending writes, forcing rotation\n");
     }
 
     /* Close master fd if open */
@@ -1981,7 +1994,7 @@ int AOF_rotate_file(const char *new_path) {
     if (old_master_fd >= 0) {
         fsync(old_master_fd);
         close(old_master_fd);
-        printf(" Closed master AOF fd\n");
+        printf("???? Closed master AOF fd\n");
     }
 
     /* Perform the rotation */
@@ -2009,13 +2022,13 @@ int AOF_rotate_file(const char *new_path) {
     /* Increment generation to invalidate all cached fds */
     uint64_t new_gen = atomic_fetch_add(&g_fd_state.master_generation, 1) + 1;
 
-    printf(" New AOF file opened: %s (fd=%d, generation=%" PRIu64 ")\n",
+    printf("???? New AOF file opened: %s (fd=%d, generation=%" PRIu64 ")\n",
            g_fd_state.file_path, new_master_fd, new_gen);
 
     /* Release write lock - workers can now acquire new fds */
     pthread_rwlock_unlock(&g_fd_state.rotation_rwlock);
 
-    printf(" Safe AOF rotation complete\n");
+    printf("??? Safe AOF rotation complete\n");
     return 0;
 }
 
@@ -2112,7 +2125,7 @@ static void *aof_live_tail_loop(void *arg) {
                 if (!RAMForge_HA_replay_record((uint32_t)id, buf + cons + 8, sz))
                     rf_broker_replay_aof((int)id, buf + cons + 8, sz);
             } else {
-                // Incomplete/torn record  rewind unread tail to re-read later
+                // Incomplete/torn record ??? rewind unread tail to re-read later
                 off -= (have - cons);
                 have = cons;
                 break;
@@ -2155,7 +2168,7 @@ void AOF_live_follow_stop(void) {
     atomic_store(&g_live_tail_started, false);
 }
 
-/* Sync function for critical operations */
+/* ????????? Sync function for critical operations ????????? */
 void AOF_sync(void) {
     if (fd >= 0) {
         fsync(fd);

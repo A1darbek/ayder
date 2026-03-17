@@ -40,6 +40,9 @@
 
 #define AOF_REC_BROKER_MSG_BATCH 0x4242
 #define IDEMP_BUCKETS 1024
+#define RF_SLOT_FLAG_VALID 0x1u
+#define RF_SLOT_FLAG_LARGE 0x2u
+#define RF_SLOT_FLAG_TOMBSTONE 0x4u
 
 
 
@@ -71,6 +74,7 @@ static rf_bus_t *g_bus;             /* shared, MAP_SHARED, inherited by fork */
 static pthread_t g_promoter;
 static _Thread_local uint64_t tls_read_seq = 0;
 static int g_worker_id = -1;
+static _Atomic uint64_t g_last_ha_read_barrier_req = 0;
 
 static inline void init_worker_id_from_env(void) {
     if (g_worker_id >= 0) return;
@@ -81,6 +85,17 @@ static inline uint64_t now_us(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000ULL + ts.tv_nsec / 1000;
+}
+
+int rf_wait_ha_read_barrier(uint64_t req_id, uint32_t timeout_ms) {
+    if (req_id == 0) return -1;
+    uint64_t start = now_us();
+    uint64_t timeout_us = ((uint64_t)(timeout_ms ? timeout_ms : 3000u)) * 1000ULL;
+    for (;;) {
+        if (atomic_load_explicit(&g_last_ha_read_barrier_req, memory_order_acquire) >= req_id) return 0;
+        if ((now_us() - start) >= timeout_us) return -1;
+        usleep(200);
+    }
 }
 
 #define RF_TS_FLAG_WALL   0x0001u
@@ -548,7 +563,17 @@ static inline void seed_shared_next_offset(uint32_t topic_id, int part, uint64_t
 static inline uint64_t alloc_offset_shared(rf_topic_t *t, rf_partition_t *p, int partition) {
     if (g_shared_storage) {
         int skey = offset_skey(t->id, partition);
-        return shared_storage_atomic_inc_u64(g_shared_storage, skey);
+        uint64_t off = shared_storage_atomic_inc_u64(g_shared_storage, skey);
+        uint64_t floor = atomic_load_explicit(&p->write_head, memory_order_acquire);
+        uint64_t next_local = atomic_load_explicit(&p->next_offset, memory_order_acquire);
+        if (next_local > floor) floor = next_local;
+        if (off < floor) {
+            uint64_t delta = floor - off;
+            uint64_t prev = shared_storage_atomic_add_u64(g_shared_storage, skey, delta);
+            off = prev + delta;
+            if (off < floor) off = floor;
+        }
+        return off;
     }
     // Fallback for single-process mode without shared storage
     return fetch_add_u64(&p->next_offset, 1, memory_order_acq_rel);
@@ -629,6 +654,53 @@ static inline void atomic_max_u64(_Atomic uint64_t *dst, uint64_t val) {
            !atomic_compare_exchange_weak_explicit(dst, &cur, val,
                                                   memory_order_acq_rel, memory_order_acquire)) {
         /* keep trying */
+    }
+}
+
+static inline void rf_advance_write_head_after_publish_relaxed(rf_partition_t *p, uint64_t offset) {
+    uint64_t spins = 0;
+    uint64_t start = now_us();
+    for (;;) {
+        uint64_t wh = atomic_load_explicit(&p->write_head, memory_order_acquire);
+        if (wh > offset) return;
+        if (wh == offset) {
+            uint64_t expect = offset;
+            if (atomic_compare_exchange_weak_explicit(&p->write_head, &expect, offset + 1,
+                                                      memory_order_acq_rel, memory_order_acquire)) {
+                return;
+            }
+            continue;
+        }
+        /* fail-open after 500ms to avoid wedging producers behind a permanently missing offset */
+        if ((now_us() - start) > 500000ULL) {
+            atomic_max_u64(&p->write_head, offset + 1);
+            return;
+        }
+        if ((++spins & 0x3FFu) == 0) sched_yield();
+        else cpu_relax();
+    }
+}
+
+/*
+ * Strict publication path for successful appends:
+ * do not skip missing predecessor offsets, so successful appends are observed
+ * in contiguous offset order.
+ */
+static inline void rf_advance_write_head_after_publish_strict(rf_partition_t *p, uint64_t offset) {
+    uint64_t spins = 0;
+    for (;;) {
+        uint64_t wh = atomic_load_explicit(&p->write_head, memory_order_acquire);
+        if (wh > offset) return;
+        if (wh == offset) {
+            uint64_t expect = offset;
+            if (atomic_compare_exchange_weak_explicit(&p->write_head, &expect, offset + 1,
+                                                      memory_order_acq_rel, memory_order_acquire)) {
+                return;
+            }
+            continue;
+        }
+        if ((++spins & 0x3FFu) == 0) sched_yield();
+        else cpu_relax();
     }
 }
 
@@ -971,60 +1043,61 @@ int rf_produce_sealed(const char *topic, int partition,
     if (partition >= t->partitions) return -3;
 
     rf_partition_t *p = &t->parts[partition];
-
     if (rf_partition_ensure_ring(p) != 0) return -4;
 
     rf_msg_slot_t *ring = atomic_load_explicit(&p->ring, memory_order_acquire);
     if (!ring) return -4;
-    // Lock-free slot allocation
+
     uint64_t offset = alloc_offset_shared(t, p, partition);
     uint64_t slot_idx = offset & p->capacity_mask;
     rf_msg_slot_t *slot = &ring[slot_idx];
     rf_slot_evict_if_needed(p, slot, offset);
-    /* ring is addressed by offset; write_head trails logical "next free" */
     atomic_max_u64(&p->next_offset, offset + 1);
-    atomic_max_u64(&p->write_head, offset + 1);
 
     size_t total_size = key_len + val_len;
     uint64_t ts_wall = wall_us_raw();
+    int inline_payload = (total_size <= sizeof(slot->inline_data));
 
-    // Zero-copy storage in ring buffer
-    if (total_size <= sizeof(slot->inline_data)) {
-        // Inline storage
-        if (key && key_len) {
-            memcpy(slot->inline_data, key, key_len);
-        }
-        if (val && val_len) {
-            memcpy(slot->inline_data + key_len, val, val_len);
-        }
+    if (inline_payload) {
+        if (key && key_len) memcpy(slot->inline_data, key, key_len);
+        if (val && val_len) memcpy(slot->inline_data + key_len, val, val_len);
         slot->blob = slot->inline_data;
     } else {
-        // Large message
         void *blob = slab_alloc(total_size);
-        if (!blob) return -4;
+        if (!blob) {
+            slot->blob = NULL;
+            atomic_store_explicit(&slot->offset, offset, memory_order_release);
+            atomic_store_explicit(&slot->ts_us, ts_wall, memory_order_release);
+            atomic_store_explicit(&slot->key_len, 0, memory_order_release);
+            atomic_store_explicit(&slot->val_len, 0, memory_order_release);
+            atomic_store_explicit(&slot->partition, partition, memory_order_release);
+            atomic_store_explicit(&slot->flags, RF_SLOT_FLAG_TOMBSTONE, memory_order_release);
+            rf_advance_write_head_after_publish_relaxed(p, offset);
+            return -4;
+        }
         if (key && key_len) memcpy(blob, key, key_len);
-        if (val && val_len) memcpy((uint8_t*)blob + key_len, val, val_len);
+        if (val && val_len) memcpy((uint8_t *)blob + key_len, val, val_len);
         slot->blob = blob;
     }
 
-    // Store metadata atomically
-    atomic_store_explicit(&slot->offset, offset, memory_order_release);
-    atomic_store_explicit(&slot->ts_us, ts_wall, memory_order_release);
-    atomic_store_explicit(&slot->key_len, key_len, memory_order_release);
-    atomic_store_explicit(&slot->val_len, val_len, memory_order_release);
-    atomic_store_explicit(&slot->partition, partition, memory_order_release);
-    atomic_store_explicit(&slot->flags, (total_size <= sizeof(slot->inline_data)) ? 1 : 3, memory_order_release);
-
-    /* size accounting + opportunistic sweep */
-    atomic_fetch_add_explicit(&p->live_bytes, (uint64_t)total_size, memory_order_relaxed);
-    rf_size_sweep_maybe(p);
-
-    // SEALED: Build AOF record for immediate durability
     size_t aof_size = sizeof(aof_msg_rec_t) + total_size;
     void *sealed_buffer = slab_alloc(aof_size);
-    if (!sealed_buffer) return -5;
+    if (!sealed_buffer) {
+        if (!inline_payload && slot->blob) {
+            slab_free(slot->blob);
+            slot->blob = NULL;
+        }
+        atomic_store_explicit(&slot->offset, offset, memory_order_release);
+        atomic_store_explicit(&slot->ts_us, ts_wall, memory_order_release);
+        atomic_store_explicit(&slot->key_len, 0, memory_order_release);
+        atomic_store_explicit(&slot->val_len, 0, memory_order_release);
+        atomic_store_explicit(&slot->partition, partition, memory_order_release);
+        atomic_store_explicit(&slot->flags, RF_SLOT_FLAG_TOMBSTONE, memory_order_release);
+        rf_advance_write_head_after_publish_relaxed(p, offset);
+        return -5;
+    }
 
-    aof_msg_rec_t *aof_rec = (aof_msg_rec_t*)sealed_buffer;
+    aof_msg_rec_t *aof_rec = (aof_msg_rec_t *)sealed_buffer;
     aof_rec->topic_id = t->id;
     aof_rec->partition = (uint16_t)partition;
     aof_rec->reserved = RF_TS_FLAG_WALL;
@@ -1032,42 +1105,57 @@ int rf_produce_sealed(const char *topic, int partition,
     aof_rec->ts_us = ts_wall;
     aof_rec->key_len = key_len;
     aof_rec->val_len = val_len;
+    memcpy((uint8_t *)sealed_buffer + sizeof(aof_msg_rec_t), slot->blob, total_size);
 
-    // Copy data to sealed buffer
-    memcpy((uint8_t*)sealed_buffer + sizeof(aof_msg_rec_t), slot->blob, total_size);
+    if (RAMForge_HA_is_enabled()) {
+        int hrc = RAMForge_HA_replicate_write(AOF_REC_BROKER_MSG, sealed_buffer, (uint32_t)aof_size);
+        if (hrc != 0) {
+            slab_free(sealed_buffer);
+            if (!inline_payload && slot->blob) {
+                slab_free(slot->blob);
+                slot->blob = NULL;
+            }
+            atomic_store_explicit(&slot->offset, offset, memory_order_release);
+            atomic_store_explicit(&slot->ts_us, ts_wall, memory_order_release);
+            atomic_store_explicit(&slot->key_len, 0, memory_order_release);
+            atomic_store_explicit(&slot->val_len, 0, memory_order_release);
+            atomic_store_explicit(&slot->partition, partition, memory_order_release);
+            atomic_store_explicit(&slot->flags, RF_SLOT_FLAG_TOMBSTONE, memory_order_release);
+            rf_advance_write_head_after_publish_relaxed(p, offset);
+            return -6;
+        }
+    }
 
-    /* === ROCKET SWITCH ===
-       RF_ROCKET unset/0  -> durable sealed append (existing behavior)
-       RF_ROCKET set(!=0) -> in-memory broadcast to all workers via rf_bus_publish(),
-                             batch_id=0 (non-durable) */
     uint64_t out_bid = 0;
     const char *rocket_env = getenv("RF_ROCKET");
     const int rocket_on = (rocket_env && rocket_env[0] != '\0' && rocket_env[0] != '0');
-
     if (rocket_on) {
-        /* fast cross-worker promotion; no disk/fsync on the hot path */
-        /* NOTE: rf_bus_publish() should be best-effort; if you prefer a fallback to durable path
-                 on error, check its return and call AOF_append_sealed() instead. */
-        (void)rf_bus_publish(AOF_REC_BROKER_MSG, sealed_buffer, (uint32_t)aof_size);
-        out_bid = 0; /* signals "not durable" to callers */
+        out_bid = 0;
     } else {
-        /* original sealed (durable) path */
         out_bid = AOF_append_sealed(AOF_REC_BROKER_MSG, sealed_buffer, aof_size);
-
-
-        (void)rf_bus_publish(AOF_REC_BROKER_MSG, sealed_buffer, (uint32_t)aof_size);
     }
+    (void)rf_bus_publish(AOF_REC_BROKER_MSG, sealed_buffer, (uint32_t)aof_size);
 
-    if (RAMForge_HA_is_enabled()) {
-        RAMForge_HA_replicate_write(AOF_REC_BROKER_MSG, sealed_buffer, aof_size);
-    }
+    atomic_store_explicit(&slot->offset, offset, memory_order_release);
+    atomic_store_explicit(&slot->ts_us, ts_wall, memory_order_release);
+    atomic_store_explicit(&slot->key_len, key_len, memory_order_release);
+    atomic_store_explicit(&slot->val_len, val_len, memory_order_release);
+    atomic_store_explicit(&slot->partition, partition, memory_order_release);
+    atomic_store_explicit(&slot->flags,
+                          inline_payload ? RF_SLOT_FLAG_VALID : (RF_SLOT_FLAG_VALID | RF_SLOT_FLAG_LARGE),
+                          memory_order_release);
 
-    if (batch_id)   *batch_id   = out_bid;
+    atomic_fetch_add_explicit(&p->live_bytes, (uint64_t)total_size, memory_order_relaxed);
+    rf_size_sweep_maybe(p);
+    rf_advance_write_head_after_publish_strict(p, offset);
+
+    if (batch_id) *batch_id = out_bid;
     if (out_offset) *out_offset = offset;
 
     slab_free(sealed_buffer);
     return 0;
 }
+
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Lock-Free High-Performance Consumer
@@ -1089,18 +1177,18 @@ size_t rf_consume(const char *topic, const char *group, int partition,
         if (!ring) return 0;
     }
 
-    /* Upper bound must be the set of offsets that have been assigned. */
-    uint64_t assigned_tail = atomic_load_explicit(&p->next_offset, memory_order_acquire);
+    /* Bound reads to offsets that are currently published. */
+    uint64_t visible_tail = atomic_load_explicit(&p->write_head, memory_order_acquire);
     uint64_t current_offset = from_exclusive + 1;
     /* live window lower bound due to capacity */
-    uint64_t min_available = (assigned_tail > p->capacity) ? (assigned_tail - p->capacity) : 0;
+    uint64_t min_available = (visible_tail > p->capacity) ? (visible_tail - p->capacity) : 0;
     if (current_offset < min_available) current_offset = min_available;
 
     /* NEW: skip any offsets below the delete floor */
     uint64_t floor = atomic_load_explicit(&p->delete_floor, memory_order_acquire);
     if (current_offset < floor) current_offset = floor;
 
-    uint64_t avail = (assigned_tail > current_offset) ? (assigned_tail - current_offset) : 0;
+    uint64_t avail = (visible_tail > current_offset) ? (visible_tail - current_offset) : 0;
     size_t cap = (out_cap < max_msgs ? out_cap : max_msgs);
 
     /* TTL cutoff (rolling): expire if ts_us < now - window */
@@ -1115,16 +1203,21 @@ size_t rf_consume(const char *topic, const char *group, int partition,
     uint64_t scanned = 0;
 
     while (produced < cap && scanned < avail) {
+        uint64_t wh = atomic_load_explicit(&p->write_head, memory_order_acquire);
+        uint64_t oldest = (wh > p->capacity) ? (wh - p->capacity) : 0;
         uint64_t slot_idx = current_offset & p->capacity_mask;
         rf_msg_slot_t *slot = &ring[slot_idx];
 
         uint16_t flags = atomic_load_explicit(&slot->flags, memory_order_acquire);
         uint64_t so    = atomic_load_explicit(&slot->offset, memory_order_acquire);
 
-        if ((flags & 1) && so == current_offset) {
-            uint64_t wh = atomic_load_explicit(&p->write_head, memory_order_acquire);
-            uint64_t oldest = (wh > p->capacity) ? (wh - p->capacity) : 0;
+        if ((flags & RF_SLOT_FLAG_TOMBSTONE) && so == current_offset) {
+            current_offset++;
+            scanned++;
+            continue;
+        }
 
+        if ((flags & RF_SLOT_FLAG_VALID) && so == current_offset) {
             if (so < oldest) {
                 current_offset++;
                 scanned++;
@@ -1133,7 +1226,7 @@ size_t rf_consume(const char *topic, const char *group, int partition,
             if (cutoff) {
                 uint64_t ts = atomic_load_explicit(&slot->ts_us, memory_order_acquire);
                 if (ts && ts < cutoff) {
-                    /* expired → invalidate and skip without producing (also updates live_bytes) */
+                    /* expired -> invalidate and skip without producing (also updates live_bytes) */
                     rf_invalidate_slot(p, slot);
                     current_offset++; scanned++;
                     continue;
@@ -1156,16 +1249,12 @@ size_t rf_consume(const char *topic, const char *group, int partition,
             current_offset++;
             scanned++;
         } else {
-            /* Decide what kind of "hole" this is. */
-            if (so != current_offset) {
-                /* Definitely not our logical slot (evicted/overwritten/tombstoned) → skip it. */
+            if (current_offset < oldest || so == UINT64_MAX) {
                 current_offset++;
                 scanned++;
                 continue;
             }
-            /* so == current_offset but not valid yet:
-   either still being published or has just been invalidated.
-   If it’s still being published, skipping would drop it → stop here. */
+            /* Preserve ordering: stop at unpublished/future offsets. */
             break;
         }
     }
@@ -1173,6 +1262,7 @@ size_t rf_consume(const char *topic, const char *group, int partition,
     if (next_offset_out) *next_offset_out = current_offset;
     return produced;
 }
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // Optimized Offset Management
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1308,6 +1398,14 @@ static void rf_broker_replay_aof_batch(uint32_t rec_id, const void *data, size_t
 }
 
 void rf_broker_replay_aof(uint32_t rec_id, const void *data, size_t sz) {
+    if (rec_id == AOF_REC_HA_READ_BARRIER) {
+        if (sz >= sizeof(ha_read_barrier_rec_t)) {
+            const ha_read_barrier_rec_t *rb = (const ha_read_barrier_rec_t *)data;
+            atomic_max_u64(&g_last_ha_read_barrier_req, rb->req_id);
+        }
+        return;
+    }
+
     if (rec_id == AOF_REC_KV_PUT) {
         /* payload: aof_kv_put_t + value bytes */
         if (sz < sizeof(aof_kv_put_t)) return;
@@ -1722,7 +1820,11 @@ int rf_produce_batch_sealed(const char *topic, int partition,
 
     /* Clean up */
     if (RAMForge_HA_is_enabled()) {
-        RAMForge_HA_replicate_write(AOF_REC_BROKER_MSG_BATCH, sealed_batch_buffer, total_aof_size);
+        int hrc = RAMForge_HA_replicate_write(AOF_REC_BROKER_MSG_BATCH, sealed_batch_buffer, total_aof_size);
+        if (hrc != 0) {
+            slab_free(sealed_batch_buffer);
+            return -6;
+        }
     }
     slab_free(sealed_batch_buffer);
 
@@ -1735,67 +1837,81 @@ int rf_produce_sealed_idemp(const char *topic, int partition,
                             const void *val, size_t val_len,
                             const void *idemp_key, size_t idemp_key_len,
                             uint64_t *out_offset, uint64_t *batch_id, int *is_duplicate) {
-    *is_duplicate = 0;
+    if (is_duplicate) *is_duplicate = 0;
+    if (!topic || (!val && val_len) || !idemp_key || idemp_key_len == 0) return -1;
+
     rf_topic_ensure(topic, 0);
     rf_topic_t *t = find_topic_lockfree(topic, rf_topic_id(topic));
     if (!t) return -2;
-    if (partition < 0) partition = simd_hash_djb2(topic, strlen(topic)) & (t->partitions - 1);
+
+    if (partition < 0) {
+        partition = simd_hash_djb2(topic, strlen(topic)) & (t->partitions - 1);
+    }
     if (partition >= t->partitions) return -3;
 
-    /* fast pre-check in shmem (cross-worker) */
     uint64_t fp64 = idemp_fp64(topic, partition, idemp_key, idemp_key_len);
     uint64_t existing_off = 0;
     if (idemp_get(topic, partition, idemp_key, idemp_key_len, fp64, &existing_off)) {
         if (out_offset) *out_offset = existing_off;
-        *is_duplicate = 1;
-        return 0; /* Early return - no offset consumed */
+        if (is_duplicate) *is_duplicate = 1;
+        return 0;
     }
 
-    /* Produce into ring + build sealed payload that ALSO carries fp64 */
     rf_partition_t *p = &t->parts[partition];
     if (rf_partition_ensure_ring(p) != 0) return -4;
     rf_msg_slot_t *ring = atomic_load_explicit(&p->ring, memory_order_acquire);
     if (!ring) return -4;
+
     uint64_t offset = alloc_offset_shared(t, p, partition);
     uint64_t slot_idx = offset & p->capacity_mask;
-
     rf_msg_slot_t *slot = &ring[slot_idx];
     rf_slot_evict_if_needed(p, slot, offset);
+    atomic_max_u64(&p->next_offset, offset + 1);
 
     size_t total = key_len + val_len;
     uint64_t ts_wall = wall_us_raw();
+    int inline_payload = (total <= sizeof(slot->inline_data));
 
-    if (total <= sizeof(slot->inline_data)) {
+    if (inline_payload) {
         if (key && key_len) memcpy(slot->inline_data, key, key_len);
         if (val && val_len) memcpy(slot->inline_data + key_len, val, val_len);
         slot->blob = slot->inline_data;
     } else {
         void *blob = slab_alloc(total);
-        if (!blob) return -4;
+        if (!blob) {
+            slot->blob = NULL;
+            atomic_store_explicit(&slot->offset, offset, memory_order_release);
+            atomic_store_explicit(&slot->ts_us, ts_wall, memory_order_release);
+            atomic_store_explicit(&slot->key_len, 0, memory_order_release);
+            atomic_store_explicit(&slot->val_len, 0, memory_order_release);
+            atomic_store_explicit(&slot->partition, partition, memory_order_release);
+            atomic_store_explicit(&slot->flags, RF_SLOT_FLAG_TOMBSTONE, memory_order_release);
+            rf_advance_write_head_after_publish_relaxed(p, offset);
+            return -4;
+        }
         if (key && key_len) memcpy(blob, key, key_len);
-        if (val && val_len) memcpy((uint8_t*)blob + key_len, val, val_len);
+        if (val && val_len) memcpy((uint8_t *)blob + key_len, val, val_len);
         slot->blob = blob;
     }
 
-    atomic_store_explicit(&slot->offset, offset, memory_order_release);
-    atomic_store_explicit(&slot->ts_us, ts_wall, memory_order_release);
-    atomic_store_explicit(&slot->key_len, key_len, memory_order_release);
-    atomic_store_explicit(&slot->val_len, val_len, memory_order_release);
-    atomic_store_explicit(&slot->partition, partition, memory_order_release);
-    atomic_store_explicit(&slot->flags, (total <= sizeof(slot->inline_data)) ? 1 : 3, memory_order_release);
-
-    atomic_max_u64(&p->next_offset, offset + 1);
-    atomic_max_u64(&p->write_head, offset + 1);
-
-    atomic_fetch_add_explicit(&p->live_bytes, (uint64_t) total, memory_order_relaxed);
-    rf_size_sweep_maybe(p);
-
-    /* Build sealed record: [aof_msg_rec_t][kv][uint64_t fp64] */
     size_t aof_sz = sizeof(aof_msg_rec_t) + total + sizeof(uint64_t);
     void *buf = slab_alloc(aof_sz);
-    if (!buf) return -5;
+    if (!buf) {
+        if (!inline_payload && slot->blob) {
+            slab_free(slot->blob);
+            slot->blob = NULL;
+        }
+        atomic_store_explicit(&slot->offset, offset, memory_order_release);
+        atomic_store_explicit(&slot->ts_us, ts_wall, memory_order_release);
+        atomic_store_explicit(&slot->key_len, 0, memory_order_release);
+        atomic_store_explicit(&slot->val_len, 0, memory_order_release);
+        atomic_store_explicit(&slot->partition, partition, memory_order_release);
+        atomic_store_explicit(&slot->flags, RF_SLOT_FLAG_TOMBSTONE, memory_order_release);
+        rf_advance_write_head_after_publish_relaxed(p, offset);
+        return -5;
+    }
 
-    aof_msg_rec_t *r = (aof_msg_rec_t*)buf;
+    aof_msg_rec_t *r = (aof_msg_rec_t *)buf;
     r->topic_id = t->id;
     r->partition = (uint16_t)partition;
     r->reserved = RF_TS_FLAG_WALL;
@@ -1804,28 +1920,58 @@ int rf_produce_sealed_idemp(const char *topic, int partition,
     r->key_len = key_len;
     r->val_len = val_len;
 
-    uint8_t *w = (uint8_t*)buf + sizeof(*r);
-    if (total <= sizeof(slot->inline_data)) memcpy(w, slot->inline_data, total);
-    else memcpy(w, slot->blob, total);
+    uint8_t *w = (uint8_t *)buf + sizeof(*r);
+    memcpy(w, slot->blob, total);
     memcpy(w + total, &fp64, sizeof(fp64));
 
-    uint64_t bid = AOF_append_sealed(AOF_REC_BROKER_MSG_IDEMP, buf, aof_sz);
+    if (RAMForge_HA_is_enabled()) {
+        int hrc = RAMForge_HA_replicate_write(AOF_REC_BROKER_MSG_IDEMP, buf, (uint32_t)aof_sz);
+        if (hrc != 0) {
+            slab_free(buf);
+            if (!inline_payload && slot->blob) {
+                slab_free(slot->blob);
+                slot->blob = NULL;
+            }
+            atomic_store_explicit(&slot->offset, offset, memory_order_release);
+            atomic_store_explicit(&slot->ts_us, ts_wall, memory_order_release);
+            atomic_store_explicit(&slot->key_len, 0, memory_order_release);
+            atomic_store_explicit(&slot->val_len, 0, memory_order_release);
+            atomic_store_explicit(&slot->partition, partition, memory_order_release);
+            atomic_store_explicit(&slot->flags, RF_SLOT_FLAG_TOMBSTONE, memory_order_release);
+            rf_advance_write_head_after_publish_relaxed(p, offset);
+            return -6;
+        }
+    }
+
+    uint64_t out_bid = 0;
+    const char *rocket_env = getenv("RF_ROCKET");
+    const int rocket_on = (rocket_env && rocket_env[0] != '\0' && rocket_env[0] != '0');
+    if (!rocket_on) {
+        out_bid = AOF_append_sealed(AOF_REC_BROKER_MSG_IDEMP, buf, aof_sz);
+    }
 
     (void)rf_bus_publish(AOF_REC_BROKER_MSG_IDEMP, buf, (uint32_t)aof_sz);
 
-    if (RAMForge_HA_is_enabled()) {
-        RAMForge_HA_replicate_write(AOF_REC_BROKER_MSG_IDEMP, buf, aof_sz);
-    }
-    slab_free(buf);
+    atomic_store_explicit(&slot->offset, offset, memory_order_release);
+    atomic_store_explicit(&slot->ts_us, ts_wall, memory_order_release);
+    atomic_store_explicit(&slot->key_len, key_len, memory_order_release);
+    atomic_store_explicit(&slot->val_len, val_len, memory_order_release);
+    atomic_store_explicit(&slot->partition, partition, memory_order_release);
+    atomic_store_explicit(&slot->flags,
+                          inline_payload ? RF_SLOT_FLAG_VALID : (RF_SLOT_FLAG_VALID | RF_SLOT_FLAG_LARGE),
+                          memory_order_release);
 
-    if (batch_id) *batch_id = bid;
+    atomic_fetch_add_explicit(&p->live_bytes, (uint64_t)total, memory_order_relaxed);
+    rf_size_sweep_maybe(p);
+    rf_advance_write_head_after_publish_strict(p, offset);
+
+    if (batch_id) *batch_id = out_bid;
     if (out_offset) *out_offset = offset;
 
-    /* Best-effort insert immediately so concurrent retries dedupe; crash-safe rebuild happens via sealed replay anyway. */
     idemp_put(topic, partition, idemp_key, idemp_key_len, fp64, offset);
+    slab_free(buf);
     return 0;
 }
-
 int rf_produce_batch_sealed_idemp(const char *topic, int partition, const rf_msg_view_t *messages, size_t count,
                                   const void *idemp_key, size_t idemp_key_len, uint64_t *first_offset,
                                   uint64_t *batch_id, int *is_duplicate) {

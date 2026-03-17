@@ -208,7 +208,7 @@ int HA_init_from_env(ha_config_t *config, ha_runtime_t *runtime) {
     config->replication_batch_size = atoi(env);
   }
 
-  config->sync_mode = 0;
+  config->sync_mode = 1;
   if ((env = getenv("RF_HA_SYNC_MODE"))) {
     config->sync_mode = atoi(env);
   }

@@ -58,7 +58,8 @@ ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update -qq && \
     apt-get install -y --no-install-recommends \
         dmsetup util-linux zlib1g liburing2 \
-        ca-certificates libcurl4 libssl3 libevent-2.1-7 && \
+        ca-certificates libcurl4 libssl3 libevent-2.1-7 \
+        iproute2 iptables curl && \
     rm -rf /var/lib/apt/lists/*
 
 # copy our glibc-compatible libuv
