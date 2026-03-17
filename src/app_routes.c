@@ -16,11 +16,13 @@
 #include "ramforge_ha_integration.h"
 #include "http_timing.h"
 #include <stdarg.h>
+#include <stdatomic.h>
 
 #define JOUT_LIT(o, s) jout_try_mem((o), (s), sizeof(s) - 1)
 
 
 extern App *g_app;
+static _Atomic uint64_t g_consume_barrier_seq = 1;
 
 typedef struct {
     char *p;
@@ -286,7 +288,7 @@ static int wait_synced_until(uint64_t batch_id, int timeout_ms) {
         if (AOF_sealed_last_synced_id() >= batch_id) return 1;
         if ((now_us_monotonic() - start) / 1000ULL >= (uint64_t)timeout_ms) return 0;
         /* small sleep to avoid busy spin; adjust as you like */
-        usleep(50);  /* 50s */
+        usleep(50);  /* 50??s */
     }
 }
 
@@ -331,6 +333,159 @@ static int qs_u64(const char *qs, const char *name, uint64_t *out){
     return 0;
 }
 
+static uint32_t broker_consume_linearizable_timeout_ms(const Request *req) {
+    uint64_t q = 0;
+    if (req && req->query_string) {
+        if (qs_u64(req->query_string, "linearizable_timeout_ms", &q) && q > 0 && q <= 0xFFFFFFFFULL) {
+            return (uint32_t)q;
+        }
+        if (qs_u64(req->query_string, "timeout_ms", &q) && q > 0 && q <= 0xFFFFFFFFULL) {
+            return (uint32_t)q;
+        }
+    }
+
+    const char *e = getenv("RF_HA_READ_INDEX_TIMEOUT_MS");
+    if (e && *e) {
+        uint64_t v = strtoull(e, NULL, 10);
+        if (v > 0 && v <= 0xFFFFFFFFULL) return (uint32_t)v;
+    }
+
+    return 3000;
+}
+
+static uint64_t broker_consume_next_barrier_id(void) {
+    uint64_t seq = atomic_fetch_add(&g_consume_barrier_seq, 1);
+    uint64_t t = rf_monotonic_us();
+    return (t << 16) ^ seq;
+}
+
+static int broker_consume_send_ha_error(Response *res, int rc) {
+    const char *leader_url = RAMForge_HA_get_leader_url();
+    int has_leader = (leader_url && *leader_url);
+
+    if (rc == -4) {
+        if (has_leader) {
+            int n = snprintf(res->buffer, RESPONSE_BUFFER_SIZE,
+                             "{\"ok\":false,\"error\":\"not_leader\",\"message\":\"Linearizable consume is leader-only\",\"leader_url\":\"%s\"}",
+                             leader_url);
+            res->buffer[(n > 0 && n < (int)RESPONSE_BUFFER_SIZE) ? n : (RESPONSE_BUFFER_SIZE - 1)] = '\0';
+        } else {
+            send_error(res, &(error_response_t){
+                .error = "not_leader",
+                .message = "Linearizable consume is leader-only",
+                .docs = NULL
+            });
+        }
+        return -3;
+    }
+
+    if (rc == -3) {
+        if (has_leader) {
+            int n = snprintf(res->buffer, RESPONSE_BUFFER_SIZE,
+                             "{\"ok\":false,\"error\":\"no_quorum\",\"message\":\"Leader has no fresh quorum\",\"leader_url\":\"%s\"}",
+                             leader_url);
+            res->buffer[(n > 0 && n < (int)RESPONSE_BUFFER_SIZE) ? n : (RESPONSE_BUFFER_SIZE - 1)] = '\0';
+        } else {
+            send_error(res, &(error_response_t){
+                .error = "no_quorum",
+                .message = "Leader has no fresh quorum",
+                .docs = NULL
+            });
+        }
+        return -3;
+    }
+
+    if (rc == -5) {
+        send_error(res, &(error_response_t){
+            .error = "commit_timeout",
+            .message = "Linearizable consume timed out waiting for read-index barrier",
+            .docs = NULL
+        });
+        return -3;
+    }
+
+    send_error(res, &(error_response_t){
+        .error = "linearizable_read_failed",
+        .message = "Linearizable consume failed",
+        .docs = NULL
+    });
+    return -3;
+}
+static int broker_produce_send_ha_error(Response *res, int rc) {
+    const char *leader_url = RAMForge_HA_get_leader_url();
+    int has_leader = (leader_url && *leader_url);
+
+    if (rc == -4) {
+        if (has_leader) {
+            int n = snprintf(res->buffer, RESPONSE_BUFFER_SIZE,
+                             "{\"ok\":false,\"error\":\"not_leader\",\"message\":\"Linearizable produce is leader-only\",\"leader_url\":\"%s\"}",
+                             leader_url);
+            res->buffer[(n > 0 && n < (int)RESPONSE_BUFFER_SIZE) ? n : (RESPONSE_BUFFER_SIZE - 1)] = '\0';
+        } else {
+            send_error(res, &(error_response_t){
+                    .error = "not_leader",
+                    .message = "Linearizable produce is leader-only",
+                    .docs = NULL
+            });
+        }
+        return -3;
+    }
+
+    if (rc == -3) {
+        if (has_leader) {
+            int n = snprintf(res->buffer, RESPONSE_BUFFER_SIZE,
+                             "{\"ok\":false,\"error\":\"no_quorum\",\"message\":\"Leader has no fresh quorum\",\"leader_url\":\"%s\"}",
+                             leader_url);
+            res->buffer[(n > 0 && n < (int)RESPONSE_BUFFER_SIZE) ? n : (RESPONSE_BUFFER_SIZE - 1)] = '\0';
+        } else {
+            send_error(res, &(error_response_t){
+                    .error = "no_quorum",
+                    .message = "Leader has no fresh quorum",
+                    .docs = NULL
+            });
+        }
+        return -3;
+    }
+
+    if (rc == -5) {
+        send_error(res, &(error_response_t){
+                .error = "commit_timeout",
+                .message = "Linearizable produce timed out waiting for HA read barrier",
+                .docs = NULL
+        });
+        return -3;
+    }
+
+    send_error(res, &(error_response_t){
+            .error = "linearizable_produce_failed",
+            .message = "Linearizable produce failed",
+            .docs = NULL
+    });
+    return -3;
+}
+
+static int broker_produce_linearizable_gate(Request *req, Response *res) {
+    if (!RAMForge_HA_is_enabled()) return 0;
+
+    if (!RAMForge_HA_is_leader()) {
+        return broker_produce_send_ha_error(res, -4);
+    }
+    if (!RAMForge_HA_has_fresh_quorum()) {
+        return broker_produce_send_ha_error(res, -3);
+    }
+
+    uint32_t tmo_ms = broker_consume_linearizable_timeout_ms(req);
+    uint64_t barrier_id = broker_consume_next_barrier_id();
+    int brc = RAMForge_HA_linearizable_read_barrier(barrier_id, tmo_ms);
+    if (brc != 0) {
+        return broker_produce_send_ha_error(res, brc);
+    }
+    if (rf_wait_ha_read_barrier(barrier_id, tmo_ms) != 0) {
+        return broker_produce_send_ha_error(res, -5);
+    }
+
+    return 0;
+}
 static int qs_str(const char *qs, const char *name, const char **out, size_t *out_len){
     if (!qs) return 0;
     size_t nlen = strlen(name);
@@ -1382,6 +1537,11 @@ int broker_produce_raw(Request *req, Response *res) {
     size_t tlen=strlen(topic); if (tlen>=sizeof(topic_buf)) tlen=sizeof(topic_buf)-1;
     memcpy(topic_buf, topic, tlen); topic_buf[tlen]=0;
 
+    {
+        int grc = broker_produce_linearizable_gate(req, res);
+        if (grc != 0) return grc;
+    }
+
     uint64_t part_u64=UINT64_MAX; int has_part = qs_u64(req->query_string,"partition",&part_u64);
     int partition = has_part ? (int)part_u64 : -1;
 
@@ -1493,6 +1653,11 @@ int broker_produce_ndjson(Request *req, Response *res) {
     char topic_buf[RF_MAX_TOPIC_LEN];
     size_t tlen=strlen(topic); if (tlen>=sizeof(topic_buf)) tlen=sizeof(topic_buf)-1;
     memcpy(topic_buf, topic, tlen); topic_buf[tlen]=0;
+
+    {
+        int grc = broker_produce_linearizable_gate(req, res);
+        if (grc != 0) return grc;
+    }
 
     uint64_t part_u64=UINT64_MAX; int has_part = qs_u64(req->query_string,"partition",&part_u64);
     int partition = has_part ? (int)part_u64 : -1;
@@ -1655,6 +1820,26 @@ int broker_consume(Request *req, Response *res) {
 
     int want_b64 = (enc_q && enc_len==3 && !strncmp(enc_q,"b64",3)) ? 1 : 0;
 
+    if (RAMForge_HA_is_enabled()) {
+        uint32_t tmo_ms = broker_consume_linearizable_timeout_ms(req);
+
+        if (!RAMForge_HA_is_leader()) {
+            return broker_consume_send_ha_error(res, -4);
+        }
+        if (!RAMForge_HA_has_fresh_quorum()) {
+            return broker_consume_send_ha_error(res, -3);
+        }
+
+        uint64_t barrier_id = broker_consume_next_barrier_id();
+        int brc = RAMForge_HA_linearizable_read_barrier(barrier_id, tmo_ms);
+        if (brc != 0) {
+            return broker_consume_send_ha_error(res, brc);
+        }
+        if (rf_wait_ha_read_barrier(barrier_id, tmo_ms) != 0) {
+            return broker_consume_send_ha_error(res, -5);
+        }
+    }
+
     uint64_t committed = 0;
     int have_committed = rf_offset_load(topic_buf, group_buf, partition, &committed);
     if (!has_offset) from_exclusive = have_committed ? committed : (uint64_t)-1;
@@ -1720,7 +1905,7 @@ int broker_consume(Request *req, Response *res) {
     if (msgs!=stack_msgs) slab_free(msgs);
     return 0;
 }
-// POST /broker/commit commit consumer offset
+// POST /broker/commit ??? commit consumer offset
 int broker_commit_fast(Request *req, Response *res) {
     json_value_t* root = json_parse(req->body, req->body_len);
     if (!root || root->type != JSON_OBJECT) {
@@ -1791,7 +1976,7 @@ int broker_commit_fast(Request *req, Response *res) {
     return 0;
 }
 
-// POST /broker/topics  create topic (sub-100s)
+// POST /broker/topics ??? create topic (sub-100??s)
 int broker_create_topic_fast(Request *req, Response *res) {
     json_value_t* root = json_parse(req->body, req->body_len);
     if (!root || root->type != JSON_OBJECT) {
@@ -1918,7 +2103,7 @@ int broker_set_retention_fast(Request *req, Response *res) {
     int size_applied = 0;
     int have_any_retention = 0;
 
-    /* Build a single record well persist if either TTL or size was provided */
+    /* Build a single record we???ll persist if either TTL or size was provided */
     aof_ttl_rec_t rec = (aof_ttl_rec_t) {0};
 
     /* ----- TTL handling (apply locally) ----- */

@@ -104,7 +104,7 @@ static void ha_publish_to_shmem(void) {
 static int ha_load_from_shmem(ha_shmem_state_t *out) {
     if (!g_shared_storage || !out) return 0;
     ha_shmem_state_t s;
-    if (!shared_storage_get_fast(g_shared_storage, SHMEM_HA_KEY, &s, sizeof(s))) return 0;
+    if (!shared_storage_try_get_fast(g_shared_storage, SHMEM_HA_KEY, &s, sizeof(s))) return 0;
     *out = s;
     return 1;
 }
@@ -148,7 +148,7 @@ static void HA_publish_snapshot_tick(uint64_t now) {
 int RAMForge_HA_read_snapshot(ha_shared_snapshot_t *out) {
     if (!g_shared_storage || !out) return 0;
     ha_shared_snapshot_t tmp;
-    if (!shared_storage_get_fast(g_shared_storage, HA_SNAPSHOT_KEY, &tmp, sizeof(tmp))) return 0;
+    if (!shared_storage_try_get_fast(g_shared_storage, HA_SNAPSHOT_KEY, &tmp, sizeof(tmp))) return 0;
     *out = tmp;
     return 1;
 }
@@ -239,6 +239,27 @@ static void ha_replicate_membership_snapshot_async(void) {
     (void)HA_forward_append_and_replicate(AOF_REC_HA_MEMBERSHIP, &mv, sizeof(mv));
 }
 
+static void ha_rebroadcast_membership_local(uint64_t now) {
+    static uint64_t s_last_pub_us = 0;
+    static uint64_t s_last_epoch = 0;
+
+    uint64_t epoch = atomic_load(&g_ha_runtime.config_epoch);
+    if (epoch == 0) return;
+
+    /* Re-broadcast quickly after epoch changes, and periodically as anti-entropy. */
+    if (epoch == s_last_epoch && (now - s_last_pub_us) < 2000000ULL) {
+        return;
+    }
+
+    ha_membership_view_t mv;
+    if (HA_get_membership_view(&mv) != 0) return;
+
+    if (rf_bus_publish(AOF_REC_HA_MEMBERSHIP, &mv, sizeof(mv)) == 0) {
+        s_last_epoch = epoch;
+        s_last_pub_us = now;
+    }
+}
+
 static int ha_wait_forward_response(uint64_t req_id, int *out_rc, int *out_index, uint32_t timeout_ms) {
     if (!g_shared_storage) return -1;
     int key = ha_mem_rsp_key(req_id);
@@ -246,7 +267,7 @@ static int ha_wait_forward_response(uint64_t req_id, int *out_rc, int *out_index
 
     while (now_us() < deadline) {
         ha_mem_fwd_rsp_t rsp;
-        if (shared_storage_get_fast(g_shared_storage, key, &rsp, sizeof(rsp)) && rsp.req_id == req_id) {
+        if (shared_storage_try_get_fast(g_shared_storage, key, &rsp, sizeof(rsp)) && rsp.req_id == req_id) {
             if (out_rc) *out_rc = rsp.rc;
             if (out_index) *out_index = rsp.out_index;
             return 0;
@@ -264,8 +285,14 @@ static int ha_forward_membership_req(const ha_mem_fwd_req_t *req, int *out_index
     int rc = -5;
     int idx = -1;
     uint32_t timeout_ms = req->timeout_ms ? req->timeout_ms : 3000;
-    uint32_t factor = (req->op == HA_MEM_FWD_OP_PROMOTE || req->op == HA_MEM_FWD_OP_REMOVE) ? 5u : 3u;
-    uint64_t wait_ms64 = (uint64_t)timeout_ms * (uint64_t)factor + 2000ULL;
+    uint64_t wait_ms64;
+    if (req->op == HA_MEM_FWD_OP_READ_BARRIER) {
+        /* Keep read-barrier forwarding bounded by caller timeout (+small IPC slack). */
+        wait_ms64 = (uint64_t)timeout_ms + 500ULL;
+    } else {
+        uint32_t factor = (req->op == HA_MEM_FWD_OP_PROMOTE || req->op == HA_MEM_FWD_OP_REMOVE) ? 5u : 3u;
+        wait_ms64 = (uint64_t)timeout_ms * (uint64_t)factor + 2000ULL;
+    }
     uint32_t wait_ms = (wait_ms64 > 0xFFFFFFFFULL) ? 0xFFFFFFFFu : (uint32_t)wait_ms64;
     if (ha_wait_forward_response(req->req_id, &rc, &idx, wait_ms) != 0) {
         if (ha_mem_debug_enabled()) {
@@ -463,6 +490,59 @@ static int ha_membership_timeout_ms(void) {
     return (int)t;
 }
 
+static int ha_read_barrier_timeout_ms(void) {
+    const char *e = getenv("RF_HA_READ_INDEX_TIMEOUT_MS");
+    if (e && *e) {
+        uint32_t v = (uint32_t)strtoul(e, NULL, 10);
+        if (v > 0) return (int)v;
+    }
+    return ha_membership_timeout_ms();
+}
+
+static int ha_wait_applied_index(uint64_t index, uint32_t timeout_ms) {
+    uint64_t start = now_us();
+    uint64_t timeout_us = ((uint64_t)timeout_ms) * 1000ULL;
+    while ((now_us() - start) < timeout_us) {
+        if (!HA_is_leader(&g_ha_runtime)) return -4;
+        if (!HA_has_fresh_quorum()) return -3;
+        if (atomic_load(&g_ha_runtime.applied_index) >= index) return 0;
+        usleep(200);
+    }
+    return -5;
+}
+
+static int ha_linearizable_read_barrier_local(uint64_t barrier_id, uint32_t timeout_ms) {
+    if (!HA_is_leader(&g_ha_runtime)) return -4;
+    if (!HA_has_fresh_quorum()) return -3;
+
+    ha_read_barrier_rec_t rec;
+    rec.req_id = barrier_id ? barrier_id : ha_next_req_id();
+    rec.issued_us = now_us();
+
+    uint64_t idx = HA_append_local_entry(AOF_REC_HA_READ_BARRIER, &rec, (uint32_t)sizeof(rec));
+    if (idx == 0) return -1;
+
+    HA_request_catchup();
+
+    uint64_t start_us = now_us();
+    if (HA_wait_for_replication(idx, timeout_ms) != 0) {
+        if (ha_mem_debug_enabled()) {
+            fprintf(stderr, "[HA-MEM][TIMEOUT] op=%u idx=%lu phase=read_index_replicate commit=%lu applied=%lu role=%d\n",
+                    (unsigned)HA_MEM_FWD_OP_READ_BARRIER, (unsigned long)idx,
+                    (unsigned long)atomic_load(&g_ha_runtime.commit_index),
+                    (unsigned long)atomic_load(&g_ha_runtime.applied_index),
+                    atomic_load(&g_ha_runtime.role));
+        }
+        return -5;
+    }
+
+    {
+        uint64_t elapsed_ms = (now_us() - start_us) / 1000ULL;
+        uint32_t remain_ms = (elapsed_ms >= timeout_ms) ? 1u : (uint32_t)(timeout_ms - elapsed_ms);
+        return ha_wait_applied_index(idx, remain_ms);
+    }
+}
+
 static void* ha_worker_thread(void *arg) {
     (void)arg;
 
@@ -512,6 +592,7 @@ static void* ha_worker_thread(void *arg) {
             }
         }
 
+        ha_rebroadcast_membership_local(now);
         ha_publish_to_shmem();
         usleep(10000);
     }
@@ -688,6 +769,24 @@ int RAMForge_HA_replicate_write(uint32_t record_type, const void *data, uint32_t
     return HA_wait_for_replication(idx, g_ha_config.replication_timeout_ms);
 }
 
+int RAMForge_HA_linearizable_read_barrier(uint64_t barrier_id, uint32_t timeout_ms) {
+    if (!atomic_load(&g_ha_enabled)) return 0;
+
+    uint32_t tmo = timeout_ms ? timeout_ms : (uint32_t)ha_read_barrier_timeout_ms();
+    uint64_t req_id = barrier_id ? barrier_id : ha_next_req_id();
+
+    if (atomic_load(&g_ha_agent_only)) {
+        ha_mem_fwd_req_t req;
+        memset(&req, 0, sizeof(req));
+        req.req_id = req_id;
+        req.op = HA_MEM_FWD_OP_READ_BARRIER;
+        req.timeout_ms = tmo;
+        return ha_forward_membership_req(&req, NULL);
+    }
+
+    return ha_linearizable_read_barrier_local(req_id, tmo);
+}
+
 const char* RAMForge_HA_get_local_node_id(void) {
     if (!atomic_load(&g_ha_enabled)) return NULL;
     if (g_ha_config.local_node_index < 0 || g_ha_config.local_node_index >= g_ha_config.node_count) return NULL;
@@ -791,6 +890,9 @@ int RAMForge_HA_handle_membership_forward(const void *payload, uint32_t size) {
         rc = -1;
     } else if (atomic_load(&g_ha_agent_only)) {
         rc = -4;
+    } else if (req->op == HA_MEM_FWD_OP_READ_BARRIER) {
+        uint32_t tmo = req->timeout_ms ? req->timeout_ms : (uint32_t)ha_read_barrier_timeout_ms();
+        rc = ha_linearizable_read_barrier_local(req->req_id, tmo);
     } else {
         int inflight = ha_membership_change_begin();
         if (inflight != 0) {
@@ -886,6 +988,7 @@ void RAMForge_HA_export_metrics(char *buf, size_t cap) {
              snap.joint_active,
              snap.has_fresh_quorum);
 }
+
 
 
 

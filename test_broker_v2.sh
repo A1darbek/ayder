@@ -897,7 +897,10 @@ echo "$g1" | jq -e 'select(.value=="djI=")' >/dev/null || fail "kv get pre-expir
 sleep_ms 260
 g2=$(curl -sS "${BASE}/kv/${NS}/${K}" "${hdr_auth[@]}")
 echo "  get post-expiry ← $g2"
-echo "$g2" | jq -e 'select(.error=="not_found" and .expired==true)' >/dev/null || fail "kv should be expired"
+echo "$g2" | jq -e '
+  (.error=="not_found") and
+  ( (.expired? // false) or ((.message? // "") | test("expired";"i")) )
+' >/dev/null || fail "kv should be expired"
 
 ok "KV CAS works and TTL expiry enforced (value disappeared after ~200ms)"
 

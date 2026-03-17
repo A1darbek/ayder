@@ -60,6 +60,7 @@ SharedStorage* shared_storage_attach_named(const char *name);   /* attach existi
 
 int  shared_storage_set(SharedStorage *ss, int key, const void *data, size_t size);
 int  shared_storage_get(SharedStorage *ss, int key, void *out, size_t out_size);
+int  shared_storage_try_get_fast(SharedStorage *ss, int key, void *out, size_t out_size);
 int  shared_storage_get_fast(SharedStorage *ss, int key, void *out, size_t out_size);
 
 uint64_t shared_storage_atomic_inc_u64(SharedStorage *ss, int key);

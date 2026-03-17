@@ -1,0 +1,8 @@
+/.lein
+/.nrepl-port
+/checkouts
+/target
+/store
+/results
+/artifacts
+/.toolchain
