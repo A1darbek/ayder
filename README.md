@@ -167,14 +167,32 @@ Common strict path settings used in Jepsen campaigns:
 
 ## Project Documentation Map
 
-Use these docs by task:
-- `tests/README.md` - test docs entrypoint
-- `tests/demo/README.md` - practical local runbooks and strict command flow
-- `tests/jepsen/README.md` - Jepsen workload/checker internals and artifacts
-- `scripts/README.md` - chaos and benchmark helper scripts
-- `cluster/README.md` - local cluster ports/layout/start flow
+Core docs (in-repo):
+- docs/README.md - docs index
+- docs/quickstart.md - local start paths (single node + HA)
+- docs/api-reference.md - HTTP endpoint reference
+- docs/architecture.md - subsystem and HA model overview
+- docs/operations.md - runbook, readiness, Jepsen, incident basics
+- docs/faq.md - claim scope, limits, and common questions
+
+Comms and launch:
+- docs/comms/twitter_launch_kit.md - trust-first X/Twitter launch package
+- docs/comms/social_post_bank.md - reusable social copy and replies
+
+GitHub Wiki-ready pages:
+- wiki/Home.md
+- wiki/Quickstart.md
+- wiki/Architecture.md
+- wiki/Operations.md
+- wiki/Jepsen-Evidence.md
+- wiki/FAQ.md
+
+Testing and Jepsen internals:
+- tests/jepsen/README.md - workload/checker internals and artifact model
+- tests/demo/ha_broker_jepsen_gold.sh - strict claim wrapper command
 
 ## Limits and Non-Goals (Current State)
+
 
 - not Kafka protocol compatible
 - not a SQL database
