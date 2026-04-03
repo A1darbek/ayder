@@ -1,210 +1,171 @@
 # Ayder
 
-**HTTP-native durable event log and message bus, written in C.**
+**A durability-first event log that survives real failures.**
 
-Ayder is designed to be simple to run and serious about correctness: one binary, HTTP API, Raft-backed durability, and straightforward operational behavior under failure.
+Most systems optimize for throughput.
 
-You can start with `curl` on a single node and scale to multi-node deployments without switching protocols or client stacks.
+Ayder is built for something else:
+**correctness under crashes, partitions, and disk failures.**
 
-## Jepsen Result (Strict Claim)
+- Verified with Jepsen: **45/45 mixed-fault tests passed**
+- SIGKILL → restart → data still correct
+- Single binary, HTTP-native, Raft-backed durability
+
+👉 Try the live crash demo: https://ayder.xyz/invite
+
+---
+
+## What this solves
+
+In many real systems, failure handling is unclear:
+
+- what happens if the process crashes mid-write?
+- is acknowledged data actually durable?
+- how is recovery verified?
+
+In edge / IIoT environments, these are not edge cases — they are normal conditions.
+
+Ayder is designed to make these guarantees explicit and testable.
+
+---
+
+## What Ayder is (simple)
+
+Ayder is a log/message system where:
+
+- you send events via HTTP  
+- data is written to disk before acknowledgment  
+- if the process crashes, data is recovered via replay  
+- in HA mode, data is replicated using Raft  
+
+The goal:
+**predictable behavior under failure, not just performance under load.**
+
+---
+
+## Verified correctness under real failures (Jepsen)
 
 Public correctness claim:
-- strictly linearizable under mixed faults: 45/45 pass in the latest full `hn-ready` matrix
 
-Verified run (UTC date):
-- 2026-03-13
-- matrix dir: `tests/jepsen/results/gold_20260313T103615Z`
-- matrix summary: `tests/jepsen/results/gold_20260313T103615Z/cells.csv`
-- result: all 9 cells `exit_code=0` (45/45 total runs passed)
+- strictly linearizable under mixed faults  
+- **45/45 tests passed (latest full matrix)**
 
-Strict run command (mixed first):
+Test conditions include:
 
-```bash
-sudo -v
-sudo --preserve-env=STRICT_CLAIM,START_CLUSTER,TOKEN,AYDER_JEPSEN_WORKLOAD,AYDER_JEPSEN_PROFILE,AYDER_JEPSEN_MODES,AYDER_JEPSEN_DURATIONS,AYDER_JEPSEN_RUNS_PER_CELL,AYDER_JEPSEN_NEMESIS_STARTUP_SEC,AYDER_JEPSEN_MIXED_NEMESIS_STARTUP_SEC,AYDER_JEPSEN_PRE_READY_TIMEOUT_SEC \
-env STRICT_CLAIM=1 START_CLUSTER=1 TOKEN=dev \
-AYDER_JEPSEN_WORKLOAD=broker-log \
-AYDER_JEPSEN_PROFILE=hn-ready \
-AYDER_JEPSEN_MODES="mixed partition-only kill-only" \
-AYDER_JEPSEN_DURATIONS="120 300 600" \
-AYDER_JEPSEN_RUNS_PER_CELL=5 \
-AYDER_JEPSEN_NEMESIS_STARTUP_SEC=10 \
-AYDER_JEPSEN_MIXED_NEMESIS_STARTUP_SEC=15 \
-AYDER_JEPSEN_PRE_READY_TIMEOUT_SEC=180 \
-bash ./tests/demo/ha_broker_jepsen_gold.sh
-```
+- process crashes (SIGKILL)  
+- network partitions  
+- mixed fault scenarios  
+- disk recovery validation  
 
-Quick validation:
+This focuses on **behavior under failure**, not just benchmarks.
 
-```bash
-RESULT=tests/jepsen/results/gold_YYYYMMDDTHHMMSSZ
-cat "$RESULT/cells.csv"
-awk -F, 'NR>1 && $4!=0 {bad=1} END {exit bad}' "$RESULT/cells.csv" && echo "ALL CELLS PASS"
-```
+Full results and artifacts:
+- tests/jepsen/results/gold_20260313T103615Z
+- tests/jepsen/artifacts/gold_<run_id>.tar.gz
 
-Proof bundle format:
-- `tests/jepsen/artifacts/gold_<run_id>.tar.gz`
-- `tests/jepsen/artifacts/gold_<run_id>.tar.gz.sha256`
+---
 
-## See It Live
+## See it live
 
-**1-minute demo: SIGKILL -> restart -> data still there**  
+**Crash demo (1 min):**  
 https://www.youtube.com/watch?v=c-n0X5t-A9Y
 
-**Live durability sandbox: SIGKILL -> restart -> committed offsets still correct**  
-Per-visitor container + persisted `/data` volume: https://ayder.xyz/invite  
-On the sandbox page, click **Run double proof** to produce events, SIGKILL, restart, and get a JSON proof that includes:
-- last committed offset before kill
-- first consumed offset after restart
-- commit persistence across restart
+**Live durability sandbox:**  
+https://ayder.xyz/invite
 
-## Why This Project Exists
+Run:
 
-Most teams want three things at once:
-- operational simplicity
-- durable replicated writes
-- predictable behavior during node failures
+1. produce events  
+2. SIGKILL the process  
+3. restart  
+4. verify offsets and data consistency  
 
-Ayder is built for that intersection: Kafka-style durability goals with a much lighter operational footprint.
+Each visitor gets an isolated container with persistent `/data`.
 
-## Quick Start
+---
 
-### Docker Compose
+## Why not existing systems?
+
+- Kafka: strong durability, but operationally heavy  
+- Redis Streams: simple, but different durability/consensus model  
+- MQTT pipelines: lightweight, but often rely on best-effort buffering  
+
+Ayder explores a different point:
+
+**lightweight + explicit durability under failure**
+
+---
+
+## Performance snapshot
+
+Measured on HA (3-node, sync-majority):
+
+- ~49k msg/s (wrk2 rate-limited)  
+- p99 latency: ~3.46 ms  
+- p99.999 handler: ~1.2 ms  
+
+Recovery observation:
+
+- follower SIGKILL → catch-up ~40–50s (≈8M offsets)
+
+---
+
+## Quick start
 
 ```bash
 git clone https://github.com/A1darbek/ayder.git
 cd ayder
 docker compose up -d --build
-```
 
-### Build From Source
+Produce / consume:
 
-```bash
-# Debian/Ubuntu
-sudo apt-get update
-sudo apt-get install -y build-essential pkg-config \
-  libuv1-dev libevent-dev libcurl4-openssl-dev libssl-dev zlib1g-dev liburing-dev
-
-make clean && make
-./ayder --port 1109
-```
-
-## 60-Second API Walkthrough
-
-```bash
-# 1) Create topic
+# create topic
 curl -X POST localhost:1109/broker/topics \
   -H 'Authorization: Bearer dev' \
   -H 'Content-Type: application/json' \
   -d '{"name":"events","partitions":1}'
 
-# 2) Produce
+# produce
 curl -X POST 'localhost:1109/broker/topics/events/produce?partition=0' \
   -H 'Authorization: Bearer dev' \
   -d 'hello world'
 
-# 3) Consume
+# consume
 curl 'localhost:1109/broker/consume/events/mygroup/0?offset=0&limit=10&encoding=b64' \
   -H 'Authorization: Bearer dev'
 
-# 4) Commit offset
-curl -X POST 'localhost:1109/broker/commit/events/mygroup/0' \
-  -H 'Authorization: Bearer dev' \
-  -H 'Content-Type: application/json' \
-  -d '{"offset":0}'
-```
+Current scope
 
-## Why Ayder?
+Ayder is focused on:
 
-### Practical Positioning
+durable append-only log
+consumer groups + offsets
+crash recovery correctness
+Raft-based HA
 
-- Kafka: powerful and battle-tested, but operationally heavy for small/medium teams.
-- Redis Streams: very easy to start, but durability/consensus semantics differ from a replicated consensus log.
-- Ayder: single-binary ergonomics with Raft-based replicated durability.
+Not goals (yet):
 
-### At-a-Glance Comparison
+Kafka protocol compatibility
+full database semantics
+exactly-once without client discipline
+Looking for real-world feedback
 
-| | Kafka | Redis Streams | Ayder |
-|---|---|---|---|
-| Protocol | Kafka binary protocol | RESP | HTTP |
-| Operational model | JVM + cluster tuning | simple, topology-dependent | single binary + HA mode |
-| Replication semantics | replicated log | topology-dependent | Raft consensus |
-| First message time | typically higher setup | very fast | very fast |
+I’m currently trying to understand where this matters most.
 
-## Performance Snapshot
+If you're working on edge / IIoT / distributed systems:
 
-Measured on real-network HA runs (3-node, sync-majority):
-- wrk2 rate-limited throughput: 49,871 msg/s
-- client p99 latency: 3.46 ms
-- server p99.999 handler: 1.219 ms
-- max-throughput wrk run: 93,807 msg/s
+have you seen data loss after crashes?
+how do you recover today?
 
-Recovery observation from documented runbooks:
-- follower SIGKILL and catch-up to healthy cluster in about 40-50 seconds (around 8M offsets in tested setup)
+Would value your perspective.
 
-## HA Model and Write Semantics
+Author
 
-Ayder supports 3/5/7 node Raft clusters.
+Aidarbek Romanuly
+GitHub: https://github.com/A1darbek
 
-Write concern guidance:
-- `RF_HA_WRITE_CONCERN=1`: leader-local ack, lowest latency, weakest durability
-- `RF_HA_WRITE_CONCERN=majority`: recommended for strong durability
-- `RF_HA_WRITE_CONCERN=all`: strongest ack rule, higher tail latency
+Email: aidarbekromanuly@gmail.com
 
-Common strict path settings used in Jepsen campaigns:
-- `RF_HA_SYNC_MODE=1`
-- majority write concern for voter count
-- mixed fault modes (`partition-only`, `kill-only`, `mixed`)
-
-## Features
-
-- Append-only broker topics with per-partition offsets
-- Consumer groups with committed offsets
-- Durable storage with crash recovery
-- Raft HA replication with dynamic membership flows
-- KV with CAS and TTL
-- Built-in stream processing (filters, aggregates, joins)
-
-## Project Documentation Map
-
-Core docs (in-repo):
-- docs/README.md - docs index
-- docs/quickstart.md - local start paths (single node + HA)
-- docs/api-reference.md - HTTP endpoint reference
-- docs/architecture.md - subsystem and HA model overview
-- docs/operations.md - runbook, readiness, Jepsen, incident basics
-- docs/faq.md - claim scope, limits, and common questions
-
-Comms and launch:
-- docs/comms/twitter_launch_kit.md - trust-first X/Twitter launch package
-- docs/comms/social_post_bank.md - reusable social copy and replies
-
-GitHub Wiki-ready pages:
-- wiki/Home.md
-- wiki/Quickstart.md
-- wiki/Architecture.md
-- wiki/Operations.md
-- wiki/Jepsen-Evidence.md
-- wiki/FAQ.md
-
-Testing and Jepsen internals:
-- tests/jepsen/README.md - workload/checker internals and artifact model
-- tests/demo/ha_broker_jepsen_gold.sh - strict claim wrapper command
-
-## Limits and Non-Goals (Current State)
-
-
-- not Kafka protocol compatible
-- not a SQL database
-- exactly-once still requires client idempotency discipline
-
-## Author
-
-Built by Aydarbek Romanuly.
-
-- GitHub: [@A1darbek](https://github.com/A1darbek)
-- Email: aidarbekromanuly@gmail.com
-
-## License
+License
 
 MIT
