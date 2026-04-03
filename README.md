@@ -61,7 +61,7 @@ This focuses on **behavior under failure**, not just benchmarks.
 
 Full results and artifacts:
 - tests/jepsen/results/gold_20260313T103615Z
-- tests/jepsen/artifacts/gold_<run_id>.tar.gz
+- tests/jepsen/artifacts/gold_20260313T103615Z.tar.gz
 
 ---
 
