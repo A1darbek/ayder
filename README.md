@@ -23,7 +23,7 @@ In many real systems, failure handling is unclear:
 - is acknowledged data actually durable?
 - how is recovery verified?
 
-In edge / IIoT environments, these are not edge cases — they are normal conditions.
+In edge / IIoT environments, these are not edge cases they are normal conditions.
 
 Ayder is designed to make these guarantees explicit and testable.
 
@@ -116,56 +116,62 @@ Recovery observation:
 git clone https://github.com/A1darbek/ayder.git
 cd ayder
 docker compose up -d --build
+```
 
-Produce / consume:
-
-# create topic
+```bash
+# Create a topic
 curl -X POST localhost:1109/broker/topics \
   -H 'Authorization: Bearer dev' \
   -H 'Content-Type: application/json' \
   -d '{"name":"events","partitions":1}'
 
-# produce
+# Produce an event
 curl -X POST 'localhost:1109/broker/topics/events/produce?partition=0' \
   -H 'Authorization: Bearer dev' \
   -d 'hello world'
 
-# consume
+# Consume
 curl 'localhost:1109/broker/consume/events/mygroup/0?offset=0&limit=10&encoding=b64' \
   -H 'Authorization: Bearer dev'
+```
 
-Current scope
+---
 
-Ayder is focused on:
+## Current scope
 
-durable append-only log
-consumer groups + offsets
-crash recovery correctness
-Raft-based HA
+**What Ayder does today:**
+- durable append-only log
+- Consumer groups with committed offsets
+- Raft-based HA replication
+- Jepsen-verified correctness
 
-Not goals (yet):
+**Not on the roadmap yet:**
+- Kafka protocol compatibility
+- Full database semantics
+- Exactly-once delivery without client-side discipline
 
-Kafka protocol compatibility
-full database semantics
-exactly-once without client discipline
-Looking for real-world feedback
+---
+
+## Looking for feedback
 
 I’m currently trying to understand where this matters most.
 
 If you're working on edge / IIoT / distributed systems:
-
-have you seen data loss after crashes?
-how do you recover today?
+- Have you seen silent data loss after crashes?
+- how do you recover today?
 
 Would value your perspective.
 
-Author
+---
 
-Aidarbek Romanuly
+## Author
+
+**Aidarbek Romanuly**
 GitHub: https://github.com/A1darbek
-
 Email: aidarbekromanuly@gmail.com
 
-License
+---
+
+## License
 
 MIT
