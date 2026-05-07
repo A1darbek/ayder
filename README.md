@@ -87,8 +87,8 @@ Faults included:
 - disk replay validation
 
 Artifacts:
-- tests/jepsen/results/gold_20260313T103615Z
-- tests/jepsen/artifacts/gold_20260313T103615Z.tar.gz
+- `tests/jepsen/results/gold_20260313T103615Z`
+- `tests/jepsen/artifacts/gold_20260313T103615Z.tar.gz`
 
 ---
 
@@ -127,7 +127,7 @@ Ayder does not claim magical global exactly-once semantics across arbitrary syst
 Instead, Ayder demonstrates a reproducible recovery discipline that preserves business correctness under real failures.
 
 Artifacts:
-- artifacts/e2e_exactly_once/e2e_eos_20260507T164110Z
+- `artifacts/e2e_exactly_once/e2e_eos_20260507T164110Z`
 
 ---
 
@@ -193,35 +193,61 @@ Ayder focuses on making recovery behavior explicit, testable, and reproducible.
 git clone https://github.com/A1darbek/ayder.git
 cd ayder
 docker compose up -d --build
+```
 
-Create topic:
-curl -X POST localhost:1109/broker/topics \  -H 'Authorization: Bearer dev' \  -H 'Content-Type: application/json' \  -d '{"name":"events","partitions":1}'
-Produce:
-curl -X POST \'localhost:1109/broker/topics/events/produce?partition=0' \-H 'Authorization: Bearer dev' \-d 'hello world'
-Consume:
-curl \'localhost:1109/broker/consume/events/mygroup/0?offset=0&limit=10&encoding=b64' \-H 'Authorization: Bearer dev'
+**Create topic:**
+```bash
+curl -X POST localhost:1109/broker/topics \
+  -H 'Authorization: Bearer dev' \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"events","partitions":1}'
+```
 
-Looking For Design Partners
+**Produce:**
+```bash
+curl -X POST 'localhost:1109/broker/topics/events/produce?partition=0' \
+  -H 'Authorization: Bearer dev' \
+  -d 'hello world'
+```
+
+**Consume:**
+```bash
+curl 'localhost:1109/broker/consume/events/mygroup/0?offset=0&limit=10&encoding=b64' \
+  -H 'Authorization: Bearer dev'
+```
+
+---
+
+# Looking For Design Partners
+
 Currently exploring use cases in:
-edge / IIoT
-industrial systems
-fleet infrastructure
-unreliable network environments
-operationally sensitive event pipelines
+
+- edge / IIoT
+- industrial systems
+- fleet infrastructure
+- unreliable network environments
+- operationally sensitive event pipelines
+
 Especially interested in teams dealing with:
-replay ambiguity
-crash recovery pain
-duplicate processing
-operational debugging after failures
-If this sounds familiar, I’d value connecting.
 
-Author
-Aidarbek Romanuly
-GitHub:
-https://github.com/A1darbek
-Email:
-aidarbekromanuly@gmail.com
+- replay ambiguity
+- crash recovery pain
+- duplicate processing
+- operational debugging after failures
 
-License
+If this sounds familiar, I'd value connecting.
+
+---
+
+# Author
+
+**Aidarbek Romanuly**
+
+- GitHub: [https://github.com/A1darbek](https://github.com/A1darbek)
+- Email: [aidarbekromanuly@gmail.com](mailto:aidarbekromanuly@gmail.com)
+
+---
+
+# License
+
 MIT
-
