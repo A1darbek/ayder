@@ -1,177 +1,227 @@
 # Ayder
 
-**A durability-first event log that survives real failures.**
+## Recovery-first event infrastructure for systems where failures are normal.
 
-Most systems optimize for throughput.
+Most event systems optimize for throughput on the happy path.
 
-Ayder is built for something else:
-**correctness under crashes, partitions, and disk failures.**
+Ayder is built for something different:
 
-- Verified with Jepsen: **45/45 mixed-fault tests passed**
-- SIGKILL → restart → data still correct
-- Single binary, HTTP-native, Raft-backed durability
+- power loss
+- process crashes
+- unstable networks
+- partial recovery
+- replay ambiguity
+- duplicated side effects
+- operational uncertainty after failure
 
-👉 Try the live crash demo: https://ayder.xyz/invite
-
----
-
-## What this solves
-
-In many real systems, failure handling is unclear:
-
-- what happens if the process crashes mid-write?
-- is acknowledged data actually durable?
-- how is recovery verified?
-
-In edge / IIoT environments, these are not edge cases they are normal conditions.
-
-Ayder is designed to make these guarantees explicit and testable.
+Ayder helps teams recover with confidence instead of spending weeks reconstructing what happened.
 
 ---
 
-## What Ayder is (simple)
+# The Problem
 
-Ayder is a log/message system where:
+Modern event systems expose failures through:
 
-- you send events via HTTP  
-- data is written to disk before acknowledgment  
-- if the process crashes, data is recovered via replay  
-- in HA mode, data is replicated using Raft  
+- lag
+- retries
+- metrics
+- logs
+- backpressure
 
-The goal:
-**predictable behavior under failure, not just performance under load.**
+But they rarely guarantee that the resulting business state is actually correct after recovery.
+
+In practice, teams often deal with:
+
+- duplicate processing
+- partial writes
+- replay uncertainty
+- offset drift
+- silently inconsistent downstream state
+- long debugging cycles after incidents
+
+Infrastructure may look healthy while reality diverges underneath.
+
+This becomes especially painful in:
+
+- edge / IIoT systems
+- unreliable networks
+- constrained hardware
+- multi-service event pipelines
+- operational environments where crashes are expected
 
 ---
 
-## Verified correctness under real failures (Jepsen)
+# What Ayder Does
 
-Public correctness claim:
+Ayder is a durability-first event log focused on recovery correctness.
 
-- strictly linearizable under mixed faults  
-- **45/45 tests passed (latest full matrix)**
+Core properties:
 
-Test conditions include:
+- disk-backed durability before acknowledgment
+- crash recovery via replay
+- Raft-based replication
+- HTTP-native interface
+- lightweight deployment model
+- explicit recovery behavior under failure
 
-- process crashes (SIGKILL)  
-- network partitions  
-- mixed fault scenarios  
-- disk recovery validation  
+The goal is not just storing events.
 
-This focuses on **behavior under failure**, not just benchmarks.
+The goal is ensuring systems recover predictably after failures.
 
-Full results and artifacts:
+---
+
+# Verified Failure Behavior
+
+## Jepsen verified
+
+Ayder passed:
+
+- 45/45 mixed-fault Jepsen tests
+
+Faults included:
+
+- SIGKILL crashes
+- network partitions
+- node restarts
+- mixed-failure scenarios
+- disk replay validation
+
+Artifacts:
 - tests/jepsen/results/gold_20260313T103615Z
 - tests/jepsen/artifacts/gold_20260313T103615Z.tar.gz
 
 ---
 
-## See it live
+# Exactly-Once Reference Harness
 
-**Crash demo (1 min):**  
-https://www.youtube.com/watch?v=c-n0X5t-A9Y
+Ayder includes a reproducible end-to-end recovery harness demonstrating:
 
-**Live durability sandbox:**  
-https://ayder.xyz/invite
+Ayder → consumer → Postgres
 
-Run:
+with:
 
-1. produce events  
-2. SIGKILL the process  
-3. restart  
-4. verify offsets and data consistency  
+- transactional dedupe
+- idempotent business effects
+- monotonic offset progression
+- replay-safe recovery semantics
 
-Each visitor gets an isolated container with persistent `/data`.
+Stress-tested under:
 
----
+- consumer crashes
+- network partitions
+- broker SIGKILL faults
+- retries
+- replay scenarios
 
-## Why not existing systems?
+Latest heavy verified run:
 
-- Kafka: strong durability, but operationally heavy  
-- Redis Streams: simple, but different durability/consensus model  
-- MQTT pipelines: lightweight, but often rely on best-effort buffering  
+- TOTAL_EVENTS=500
+- duplicate effects: 0
+- missing effects: 0
+- monotonic violations: 0
 
-Ayder explores a different point:
+This is intentionally scoped:
 
-**lightweight + explicit durability under failure**
+Ayder does not claim magical global exactly-once semantics across arbitrary systems.
 
----
+Instead, Ayder demonstrates a reproducible recovery discipline that preserves business correctness under real failures.
 
-## Performance snapshot
-
-Measured on HA (3-node, sync-majority):
-
-- ~49k msg/s (wrk2 rate-limited)  
-- p99 latency: ~3.46 ms  
-- p99.999 handler: ~1.2 ms  
-
-Recovery observation:
-
-- follower SIGKILL → catch-up ~40–50s (≈8M offsets)
+Artifacts:
+- artifacts/e2e_exactly_once/e2e_eos_20260507T164110Z
 
 ---
 
-## Quick start
+# Why This Matters
+
+Most systems recover operationally.
+
+Far fewer recover correctly.
+
+In production, teams often spend days or weeks answering questions like:
+
+- Did we lose data?
+- Was something processed twice?
+- Which offsets are trustworthy?
+- Did downstream systems diverge?
+- Can we replay safely?
+- Is recovery complete or only partial?
+
+Ayder is designed to reduce that uncertainty.
+
+---
+
+# Design Philosophy
+
+Ayder prioritizes:
+
+- recovery confidence over benchmark theater
+- operational simplicity over infrastructure sprawl
+- explicit guarantees over implicit assumptions
+- predictable failure behavior over happy-path throughput
+
+---
+
+# Current Capabilities
+
+- durable append-only event log
+- consumer groups + committed offsets
+- Raft-based HA replication
+- replay-based recovery
+- Jepsen-tested correctness
+- exactly-once reference harness
+
+---
+
+# Current Non-Goals
+
+Ayder is intentionally not trying to be:
+
+- a Kafka clone
+- a stream processing framework
+- a database
+- globally magical exactly-once infrastructure
+
+Exactly-once semantics still require disciplined downstream handling.
+
+Ayder focuses on making recovery behavior explicit, testable, and reproducible.
+
+---
+
+# Quick Start
 
 ```bash
 git clone https://github.com/A1darbek/ayder.git
 cd ayder
 docker compose up -d --build
-```
 
-```bash
-# Create a topic
-curl -X POST localhost:1109/broker/topics \
-  -H 'Authorization: Bearer dev' \
-  -H 'Content-Type: application/json' \
-  -d '{"name":"events","partitions":1}'
+Create topic:
+curl -X POST localhost:1109/broker/topics \  -H 'Authorization: Bearer dev' \  -H 'Content-Type: application/json' \  -d '{"name":"events","partitions":1}'
+Produce:
+curl -X POST \'localhost:1109/broker/topics/events/produce?partition=0' \-H 'Authorization: Bearer dev' \-d 'hello world'
+Consume:
+curl \'localhost:1109/broker/consume/events/mygroup/0?offset=0&limit=10&encoding=b64' \-H 'Authorization: Bearer dev'
 
-# Produce an event
-curl -X POST 'localhost:1109/broker/topics/events/produce?partition=0' \
-  -H 'Authorization: Bearer dev' \
-  -d 'hello world'
+Looking For Design Partners
+Currently exploring use cases in:
+edge / IIoT
+industrial systems
+fleet infrastructure
+unreliable network environments
+operationally sensitive event pipelines
+Especially interested in teams dealing with:
+replay ambiguity
+crash recovery pain
+duplicate processing
+operational debugging after failures
+If this sounds familiar, I’d value connecting.
 
-# Consume
-curl 'localhost:1109/broker/consume/events/mygroup/0?offset=0&limit=10&encoding=b64' \
-  -H 'Authorization: Bearer dev'
-```
+Author
+Aidarbek Romanuly
+GitHub:
+https://github.com/A1darbek
+Email:
+aidarbekromanuly@gmail.com
 
----
-
-## Current scope
-
-**What Ayder does today:**
-- durable append-only log
-- Consumer groups with committed offsets
-- Raft-based HA replication
-- Jepsen-verified correctness
-
-**Not on the roadmap yet:**
-- Kafka protocol compatibility
-- Full database semantics
-- Exactly-once delivery without client-side discipline
-
----
-
-## Looking for feedback
-
-I’m currently trying to understand where this matters most.
-
-If you're working on edge / IIoT / distributed systems:
-- Have you seen silent data loss after crashes?
-- how do you recover today?
-
-Would value your perspective.
-
----
-
-## Author
-
-**Aidarbek Romanuly**
-GitHub: https://github.com/A1darbek
-Email: aidarbekromanuly@gmail.com
-
----
-
-## License
-
+License
 MIT
+
