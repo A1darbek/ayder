@@ -1,0 +1,26 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ayder
+      POSTGRES_PASSWORD: ayder
+      POSTGRES_DB: paypal_demo
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ayder -d paypal_demo"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    volumes:
+      - paypal_demo_pg:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+volumes:
+  paypal_demo_pg:

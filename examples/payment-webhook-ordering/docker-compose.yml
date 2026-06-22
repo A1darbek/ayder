@@ -1,0 +1,17 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ayder
+      POSTGRES_PASSWORD: ayder
+      POSTGRES_DB: webhook_ordering_demo
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ayder -d webhook_ordering_demo"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    volumes:
+      - webhook_ordering_demo_pg:/var/lib/postgresql/data
+
+volumes:
+  webhook_ordering_demo_pg:
