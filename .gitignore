@@ -3,6 +3,7 @@
 *.a
 *.so
 *.exe
+ayder
 ramforge
 cmake-build-*/
 build/
@@ -47,9 +48,13 @@ artifacts/
 cmake-build-debug/
 WSL2-Linux-Kernel/
 worker0
+rf_crash_*.log
+append.aof
 append.aof.sealed
+append.aof.sealed.lock
 cluster/node*/append.aof.sealed
 cluster/node*/append.aof.sealed.lock
+cluster/certs/
 tests/jepsen/artifacts/
 tests/jepsen/results/
 tests/jepsen/.lein-failures
@@ -57,3 +62,7 @@ tests/jepsen/.toolchain/
 tests/jepsen/target/
 tests/jepsen/store/
 tests/jepsen/tests/
+
+# Private/local GTM workspace. Keep partner outreach lists and reply snapshots
+# outside the public repo; publish only deliberately sanitized material.
+gtm/
