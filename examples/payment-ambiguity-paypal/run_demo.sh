@@ -27,6 +27,9 @@ export SCENARIO ARTIFACT_DIR OUT_DIR="${ARTIFACT_DIR}/receipt"
 
 START_AYDER="${START_AYDER:-1}"
 AYDER_BIN="${AYDER_BIN:-${REPO_ROOT}/ayder}"
+AYDER_USE_DOCKER="${AYDER_USE_DOCKER:-0}"
+AYDER_DOCKER_IMAGE="${AYDER_DOCKER_IMAGE:-}"
+AYDER_DOCKER_CONTAINER="${AYDER_DOCKER_CONTAINER:-}"
 AYDER_WORKERS="${AYDER_WORKERS:-2}"
 AYDER_AOF="${AYDER_AOF-}"
 AYDER_PID_FILE="${ARTIFACT_DIR}/ayder.pid"
@@ -44,6 +47,9 @@ cleanup() {
     kill "$AYDER_MGR_PID" >/dev/null 2>&1 || true
     wait "$AYDER_MGR_PID" >/dev/null 2>&1 || true
   fi
+  if [[ -n "${AYDER_DOCKER_CONTAINER:-}" ]]; then
+    "$DOCKER_BIN" rm -f "$AYDER_DOCKER_CONTAINER" >/dev/null 2>&1 || true
+  fi
 }
 trap cleanup EXIT
 
@@ -56,7 +62,54 @@ wait_ayder() {
   return 1
 }
 
+ensure_ayder_runtime() {
+  [[ "$START_AYDER" == "1" ]] || return 0
+  [[ -x "$AYDER_BIN" ]] && return 0
+
+  if [[ "${BOOTSTRAP_AYDER_DOCKER:-1}" != "1" ]]; then
+    echo "ayder binary not executable: $AYDER_BIN" >&2
+    echo "Run 'make' or set BOOTSTRAP_AYDER_DOCKER=1 after 'docker compose up -d --build'." >&2
+    exit 1
+  fi
+
+  log "local ayder binary missing; using Docker image for demo broker"
+  AYDER_USE_DOCKER=1
+
+  AYDER_DOCKER_IMAGE="$(cd "$REPO_ROOT" && "$DOCKER_BIN" compose images -q ayder 2>/dev/null | head -n 1 || true)"
+  if [[ -z "$AYDER_DOCKER_IMAGE" ]]; then
+    log "building Docker Compose ayder image"
+    (cd "$REPO_ROOT" && "$DOCKER_BIN" compose build ayder >/dev/null)
+    AYDER_DOCKER_IMAGE="$(cd "$REPO_ROOT" && "$DOCKER_BIN" compose images -q ayder 2>/dev/null | head -n 1 || true)"
+  fi
+
+  if [[ -z "$AYDER_DOCKER_IMAGE" ]]; then
+    echo "could not find or build Docker image for service 'ayder'" >&2
+    exit 1
+  fi
+}
+
 start_ayder_manager() {
+  if [[ "$AYDER_USE_DOCKER" == "1" ]]; then
+    local cname
+    cname="ayder-paypal-${RUN_ID//[^A-Za-z0-9_.-]/-}"
+    AYDER_DOCKER_CONTAINER="$cname"
+    mkdir -p "${ARTIFACT_DIR}/ayder_data"
+    "$DOCKER_BIN" rm -f "$cname" >/dev/null 2>&1 || true
+    "$DOCKER_BIN" run -d --rm \
+      --name "$cname" \
+      --shm-size 2g \
+      --ipc shareable \
+      --ulimit memlock=-1:-1 \
+      --security-opt seccomp=unconfined \
+      -e RF_BEARER_TOKENS="${RF_BEARER_TOKENS:-dev@55555555555555:11111111111111111:111111111111111111111}" \
+      -e RF_HTTP_DISABLE_RL="${RF_HTTP_DISABLE_RL:-1}" \
+      -v "${ARTIFACT_DIR}/ayder_data:/data" \
+      -p "127.0.0.1:${AYDER_PORT}:1109" \
+      "$AYDER_DOCKER_IMAGE" >"$AYDER_PID_FILE"
+    log "started dockerized ayder container=${cname} host_port=${AYDER_PORT}"
+    return 0
+  fi
+
   [[ -x "$AYDER_BIN" ]] || { echo "ayder binary not executable: $AYDER_BIN" >&2; exit 1; }
   local ayder_dir="${ARTIFACT_DIR}/ayder_data"
   mkdir -p "$ayder_dir"
@@ -116,6 +169,7 @@ validate_final_receipt() {
 log "paypal ambiguity demo scenario=${SCENARIO} artifact_dir=${ARTIFACT_DIR}"
 
 if [[ "$START_AYDER" == "1" ]]; then
+  ensure_ayder_runtime
   start_ayder_manager
   wait_ayder || { echo "ayder did not become healthy at ${AYDER_BASE}" >&2; exit 1; }
 fi

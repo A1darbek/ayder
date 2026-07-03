@@ -14,6 +14,17 @@ Core rules:
 
 ## Run
 
+Docker-only evaluator path:
+
+```bash
+docker compose up -d --build
+SCENARIO=timeout_unknown ./examples/payment-ambiguity-paypal/run_demo.sh
+SCENARIO=redis_stale ./examples/payment-ambiguity-paypal/run_demo.sh
+```
+
+If a local `./ayder` binary exists, the demo uses it. If not, the demo starts a
+clean one-off Ayder container from the Docker Compose image for each scenario.
+
 Default unresolved timeout:
 
 ```bash
