@@ -1,0 +1,13 @@
+{
+  "event_type": "order.confirmed",
+  "event_id": "evt_order_001",
+  "order_id": "ord_123",
+  "customer_id": "cust_123",
+  "amount": "42.00",
+  "currency": "USD",
+  "expected_effects": [
+    "order_state_updated",
+    "ledger_entry_created",
+    "customer_notification_sent"
+  ]
+}
