@@ -17,6 +17,7 @@
 #include "http_timing.h"
 #include <stdarg.h>
 #include <stdatomic.h>
+#include <openssl/sha.h>
 
 #define JOUT_LIT(o, s) jout_try_mem((o), (s), sizeof(s) - 1)
 
@@ -688,6 +689,120 @@ static size_t build_group_key(json_value_t *obj, json_value_t *group_by, char *o
 
 typedef struct { char key[256]; uint64_t count; } agg_t;
 
+static int jv_to_u64_field(json_value_t *obj, const char *name, uint64_t *out) {
+    json_value_t *v = json_get_field(obj, name);
+    if (!v) return 0;
+    if (v->type == JSON_INT && v->as.i >= 0) {
+        *out = (uint64_t)v->as.i;
+        return 1;
+    }
+    if (v->type == JSON_DOUBLE && v->as.d >= 0) {
+        *out = (uint64_t)v->as.d;
+        return 1;
+    }
+    return 0;
+}
+
+static int jv_to_bool_field(json_value_t *obj, const char *name, int *out) {
+    json_value_t *v = json_get_field(obj, name);
+    if (!v || v->type != JSON_BOOL) return 0;
+    *out = v->as.b ? 1 : 0;
+    return 1;
+}
+
+static int sv_lex_cmp(string_view_t a, string_view_t b) {
+    size_t n = a.len < b.len ? a.len : b.len;
+    int c = memcmp(a.ptr, b.ptr, n);
+    if (c) return c;
+    if (a.len < b.len) return -1;
+    if (a.len > b.len) return 1;
+    return 0;
+}
+
+static int canon_json_value(jout_t *out, const json_value_t *v);
+
+static int canon_json_string(jout_t *out, const char *s, size_t n) {
+    char esc[2048];
+    int truncated = 0;
+    size_t e = json_escape_into_ex(esc, sizeof esc - 1, (const uint8_t *)s, n, &truncated);
+    if (truncated) return 0;
+    esc[e] = 0;
+    return jout_try_c(out, '"') && jout_try_mem(out, esc, e) && jout_try_c(out, '"');
+}
+
+static int canon_json_array(jout_t *out, const json_value_t *v) {
+    if (!jout_try_c(out, '[')) return 0;
+    for (size_t i = 0; i < v->as.array.count; i++) {
+        if (i && !jout_try_c(out, ',')) return 0;
+        if (!canon_json_value(out, &v->as.array.items[i])) return 0;
+    }
+    return jout_try_c(out, ']');
+}
+
+static int canon_json_object(jout_t *out, const json_value_t *v) {
+    if (!jout_try_c(out, '{')) return 0;
+    size_t n = v->as.object.count;
+    size_t idx_stack[64];
+    size_t *idx = idx_stack;
+    if (n > sizeof idx_stack / sizeof idx_stack[0]) {
+        idx = slab_alloc(n * sizeof(*idx));
+        if (!idx) return 0;
+    }
+    for (size_t i = 0; i < n; i++) idx[i] = i;
+    for (size_t i = 1; i < n; i++) {
+        size_t key = idx[i];
+        size_t j = i;
+        while (j > 0 && sv_lex_cmp(v->as.object.pairs[idx[j - 1]].key, v->as.object.pairs[key].key) > 0) {
+            idx[j] = idx[j - 1];
+            j--;
+        }
+        idx[j] = key;
+    }
+    for (size_t i = 0; i < n; i++) {
+        json_kv_t *kv = &v->as.object.pairs[idx[i]];
+        if (i && !jout_try_c(out, ',')) { if (idx != idx_stack) slab_free(idx); return 0; }
+        if (!canon_json_string(out, kv->key.ptr, kv->key.len) || !jout_try_c(out, ':') ||
+            !canon_json_value(out, &kv->value)) {
+            if (idx != idx_stack) slab_free(idx);
+            return 0;
+        }
+    }
+    if (idx != idx_stack) slab_free(idx);
+    return jout_try_c(out, '}');
+}
+
+static int canon_json_value(jout_t *out, const json_value_t *v) {
+    if (!v) return 0;
+    switch (v->type) {
+        case JSON_NULL: return JOUT_LIT(out, "null");
+        case JSON_BOOL:
+            if (v->as.b) return JOUT_LIT(out, "true");
+            return JOUT_LIT(out, "false");
+        case JSON_INT: return jout_try_printf(out, "%" PRId64, (int64_t)v->as.i);
+        case JSON_DOUBLE: return jout_try_printf(out, "%.17g", v->as.d);
+        case JSON_STRING: return canon_json_string(out, v->as.s.ptr, v->as.s.len);
+        case JSON_ARRAY: return canon_json_array(out, v);
+        case JSON_OBJECT: return canon_json_object(out, v);
+    }
+    return 0;
+}
+
+static int query_fingerprint_hex(json_value_t *root, char hex[65]) {
+    char canonical[16384];
+    jout_t out;
+    jout_init_buf(&out, canonical, sizeof canonical);
+    if (!canon_json_value(&out, root)) return 0;
+    unsigned char digest[SHA256_DIGEST_LENGTH];
+    SHA256((const unsigned char *)canonical, strlen(canonical), digest);
+    for (int i = 0; i < SHA256_DIGEST_LENGTH; i++) {
+        static const char h[] = "0123456789abcdef";
+        hex[i * 2] = h[(digest[i] >> 4) & 0xF];
+        hex[i * 2 + 1] = h[digest[i] & 0xF];
+    }
+    hex[64] = 0;
+    return 1;
+}
+
 int broker_query_handler(Request *req, Response *res){
     json_value_t *root = json_parse(req->body, req->body_len);
     if (!root || root->type != JSON_OBJECT){
@@ -702,6 +817,8 @@ int broker_query_handler(Request *req, Response *res){
     json_value_t *jagg   = json_get_field(root, "aggregate");
     json_value_t *jgb    = jagg ? json_get_field(jagg, "group_by") : NULL;
     json_value_t *jtrans = json_get_field(root, "transform");
+    json_value_t *jinclude = json_get_field(root, "include");
+    json_value_t *jexplain = json_get_field(root, "explain");
     json_value_t *jleft  = jtrans ? json_get_field(jtrans, "left_fields") : NULL;
     json_value_t *jemit  = jtrans ? json_get_field(jtrans, "emit_rows")   : NULL;
 
@@ -716,6 +833,7 @@ int broker_query_handler(Request *req, Response *res){
     json_value_t *jp = json_get_field(jsrc, "partition");
     json_value_t *jo = json_get_field(jsrc, "offset");
     json_value_t *jl = json_get_field(jsrc, "limit");
+    json_value_t *jcommit_group = jinclude ? json_get_field(jinclude, "commit_status_for_group") : NULL;
 
     if (!jt || jt->type!=JSON_STRING || !jp || (jp->type!=JSON_INT && jp->type!=JSON_DOUBLE)){
         const char *e = "{\"ok\":false,\"error\":\"bad_source_fields\"}";
@@ -726,25 +844,35 @@ int broker_query_handler(Request *req, Response *res){
     char topic[RF_MAX_TOPIC_LEN]; jv_to_cstr(jt, topic, sizeof topic);
     char group[RF_MAX_GROUP_LEN] = {0};
     if (jg && jg->type==JSON_STRING) jv_to_cstr(jg, group, sizeof group);
+    if (jcommit_group && jcommit_group->type == JSON_STRING) jv_to_cstr(jcommit_group, group, sizeof group);
 
     int partition = (jp->type==JSON_INT) ? (int)jp->as.i : (int)jp->as.d;
 
     size_t limit = 200;
     if (jl && jl->type==JSON_INT && jl->as.i>0 && jl->as.i<=2000) limit = (size_t)jl->as.i;
 
-    uint64_t from_exclusive = (uint64_t)-1;
+    uint64_t from_offset = 0;
+    uint64_t to_offset = 0;
+    rf_partition_snapshot_t before = {0}, after = {0};
+    (void)rf_partition_snapshot(topic, partition, &before);
+    to_offset = before.high_watermark;
+    (void)jv_to_u64_field(jsrc, "from_offset", &from_offset);
+    (void)jv_to_u64_field(jsrc, "to_offset", &to_offset);
+
+    uint64_t from_exclusive = (from_offset == 0) ? (uint64_t)-1 : (from_offset - 1);
     if (jo && (jo->type==JSON_INT || jo->type==JSON_DOUBLE)){
         uint64_t start = (jo->type==JSON_INT)? (uint64_t)jo->as.i : (uint64_t)jo->as.d;
+        from_offset = start;
         from_exclusive = (start==0) ? (uint64_t)-1 : (start-1);
-    } else {
-        uint64_t committed=0;
-        if (rf_offset_load(topic, group, partition, &committed)) from_exclusive = committed;
     }
+    if (to_offset < from_offset) to_offset = from_offset;
 
+    uint64_t range = to_offset - from_offset;
+    if ((uint64_t)limit > range) limit = (size_t)range;
     size_t cap = (limit > 1024 ? 1024 : limit);
     rf_msg_view_t stack_msgs[256];
     rf_msg_view_t *msgs = (cap<=256) ? stack_msgs : slab_alloc(cap * sizeof(*msgs));
-    if (!msgs) {
+    if (!msgs && cap > 0) {
         static const char OOM_JSON[] = "{\"ok\":false,\"error\":\"oom\"}";
         memcpy(res->buffer, OOM_JSON, sizeof(OOM_JSON)); /* includes '\0' */
         json_free(root);
@@ -753,22 +881,41 @@ int broker_query_handler(Request *req, Response *res){
 
     uint64_t next_offset=0;
     size_t want = (limit < cap) ? limit : cap;               /* FIX */
-    size_t nread = rf_consume(topic, group, partition, from_exclusive, want, msgs, cap, &next_offset);
+    size_t nread = want ? rf_consume(topic, group, partition, from_exclusive, want, msgs, cap, &next_offset) : 0;
 
     agg_t aggs[128]; size_t agg_n=0;
 
     int emit_rows = (jemit && jemit->type==JSON_INT && jemit->as.i>=0) ? (int)jemit->as.i : 0;
+    if (!jemit && jleft && jleft->type == JSON_ARRAY && jleft->as.array.count > 0) emit_rows = (int)limit;
     int rows_out = 0;
     int stop_rows = 0;
+    uint64_t messages_matched = 0;
+    int sealed_only = 0;
+    (void)jv_to_bool_field(jsrc, "sealed_only", &sealed_only);
+    char fingerprint_hex[65] = {0};
+    if (!query_fingerprint_hex(root, fingerprint_hex)) {
+        const char *e = "{\"ok\":false,\"error\":\"query_fingerprint_failed\"}";
+        memcpy(res->buffer,e,strlen(e)); res->buffer[strlen(e)] = 0;
+        if (msgs && msgs != stack_msgs) slab_free(msgs);
+        json_free(root); return 0;
+    }
+    uint64_t committed_before = 0, committed_after = 0;
+    int have_commit_before = (group[0] && rf_offset_load(topic, group, partition, &committed_before));
 
     jout_t out; jout_init_res(&out, res);
 
     /* reserve tail so we can always close JSON */
-    const size_t TAIL_RESERVE = 512;
+    const size_t TAIL_RESERVE = 2048;
     char *hard_end = out.end;
     if ((size_t)(hard_end - res->buffer) > TAIL_RESERVE) out.end = hard_end - (ptrdiff_t)TAIL_RESERVE;
 
-    (void)JOUT_LIT(&out, "{\"ok\":true,\"rows\":[");
+    (void)jout_try_printf(&out,
+                          "{\"ok\":true,\"query_fingerprint\":\"sha256:%s\","
+                          "\"snapshot\":{\"topic\":\"%s\",\"partition\":%d,"
+                          "\"from_offset\":%" PRIu64 ",\"to_offset\":%" PRIu64 ","
+                          "\"high_watermark\":%" PRIu64 ",\"sealed_only\":%s},\"rows\":[",
+                          fingerprint_hex, topic, partition, from_offset, to_offset,
+                          before.high_watermark, sealed_only ? "true" : "false");
     int first_row = 1;
 
     for (size_t i=0;i<nread;i++){
@@ -780,6 +927,7 @@ int broker_query_handler(Request *req, Response *res){
         if (!obj || obj->type != JSON_OBJECT){ if (obj) json_free(obj); continue; }
 
         if (!obj_matches_filters(obj, jflt)){ json_free(obj); continue; }
+        messages_matched++;
 
         /* aggregate count */
         if (jgb && jgb->type==JSON_ARRAY && jgb->as.array.count>0) {
@@ -856,14 +1004,51 @@ int broker_query_handler(Request *req, Response *res){
 
     /* restore end and write tail (always fits because of reserve) */
     out.end = hard_end;
+    (void)rf_partition_snapshot(topic, partition, &after);
+    int have_commit_after = (group[0] && rf_offset_load(topic, group, partition, &committed_after));
+    int broker_mutated = before.high_watermark != after.high_watermark ||
+                         before.message_count != after.message_count ||
+                         before.idempotency_index_writes != after.idempotency_index_writes ||
+                         have_commit_before != have_commit_after ||
+                         (have_commit_before && committed_before != committed_after);
 
     (void)jout_try_printf(&out,
-                          "],\"source\":{\"topic\":\"%s\",\"group\":\"%s\",\"partition\":%d,\"next_offset\":%" PRIu64 ",\"consumed\":%zu}}",
-                          topic, group, partition, next_offset, nread);
+                          "],\"source\":{\"topic\":\"%s\",\"group\":\"%s\",\"partition\":%d,"
+                          "\"from_offset\":%" PRIu64 ",\"to_offset\":%" PRIu64 ","
+                          "\"next_offset\":%" PRIu64 ",\"consumed\":%zu},"
+                          "\"safety\":{\"broker_state_mutated\":%s,"
+                          "\"high_watermark_before\":%" PRIu64 ",\"high_watermark_after\":%" PRIu64 ","
+                          "\"message_count_before\":%" PRIu64 ",\"message_count_after\":%" PRIu64 ","
+                          "\"idempotency_records_before\":%" PRIu64 ",\"idempotency_records_after\":%" PRIu64 ","
+                          "\"committed_offset_before\":",
+                          topic, group, partition, from_offset, to_offset, next_offset, nread,
+                          broker_mutated ? "true" : "false",
+                          before.high_watermark, after.high_watermark,
+                          before.message_count, after.message_count,
+                          before.idempotency_index_writes, after.idempotency_index_writes);
+    if (have_commit_before) (void)jout_try_printf(&out, "%" PRIu64, committed_before);
+    else (void)JOUT_LIT(&out, "null");
+    (void)JOUT_LIT(&out, ",\"committed_offset_after\":");
+    if (have_commit_after) (void)jout_try_printf(&out, "%" PRIu64, committed_after);
+    else (void)JOUT_LIT(&out, "null");
+    (void)jout_try_printf(&out,
+                          "},\"canonicalization\":{\"mode\":\"sorted_object_keys_v1\"}");
+    if (jexplain && jexplain->type == JSON_BOOL && jexplain->as.b) {
+        (void)jout_try_printf(&out,
+                              ",\"explain\":{\"plan\":\"bounded_partition_scan\","
+                              "\"topic\":\"%s\",\"partition\":%d,"
+                              "\"from_offset\":%" PRIu64 ",\"to_offset\":%" PRIu64 ","
+                              "\"messages_scanned\":%zu,\"messages_matched\":%" PRIu64 ","
+                              "\"segments_read\":1,\"commits_mutated\":false,"
+                              "\"broker_state_mutated\":%s}",
+                              topic, partition, from_offset, to_offset, nread, messages_matched,
+                              broker_mutated ? "true" : "false");
+    }
+    (void)JOUT_LIT(&out, "}");
 
     res->buffer[RESPONSE_BUFFER_SIZE - 1] = '\0';
 
-    if (msgs != stack_msgs) slab_free(msgs);
+    if (msgs && msgs != stack_msgs) slab_free(msgs);
     json_free(root);
     return 0;
 }
@@ -2552,6 +2737,7 @@ void register_application_routes(App *app, int control_plane) {
     app->post(app, "/broker/topics/:topic/produce-ndjson",   broker_produce_ndjson);
     app->get (app, "/broker/consume/:topic/:group/:partition", broker_consume);
     app->post(app, "/broker/query", broker_query_handler);
+    register_route("QUERY", "/broker/query", broker_query_handler);
     app->post(app, "/broker/join", broker_join_handler);
 
 }

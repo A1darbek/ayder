@@ -110,6 +110,13 @@ typedef struct {
     int         partition;
 } rf_msg_view_t;
 
+typedef struct {
+    uint64_t delete_floor;
+    uint64_t high_watermark;            /* next offset */
+    uint64_t message_count;             /* high_watermark - delete_floor */
+    uint64_t idempotency_index_writes;   /* monotonically increases on idempotency index writes */
+} rf_partition_snapshot_t;
+
 // ── Producer idempotency tuple
 typedef struct {
     uint64_t producer_id;   // 0 => idempotency disabled
@@ -305,6 +312,7 @@ void rf_broker_replay_aof(uint32_t rec_id, const void *data, size_t sz);
 /* Offset helpers (shared_storage) */
 int  rf_offset_load (const char *topic, const char *group, int partition, uint64_t *out);
 int  rf_offset_store(const char *topic, const char *group, int partition, uint64_t off);
+int  rf_partition_snapshot(const char *topic, int partition, rf_partition_snapshot_t *out);
 int rf_produce_batch_sealed(const char *topic, int partition,
                             const rf_msg_view_t *messages, size_t count,
                             uint64_t *first_offset, uint64_t *batch_id);
