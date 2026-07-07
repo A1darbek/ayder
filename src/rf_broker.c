@@ -490,6 +490,7 @@ static inline int simd_strcmp(const char *a, const char *b, size_t len) {
 #define MAX_TOPICS 1024
 static rf_topic_t g_topics[MAX_TOPICS] __attribute__((aligned(64)));
 static _Atomic int g_topic_count = 0;
+static _Atomic uint64_t g_idempotency_index_writes = 0;
 static int g_default_partitions = 8; // Increased for better parallelism
 static size_t g_ring_cap = 1048576;  // 1M slots, power of 2
 
@@ -620,7 +621,9 @@ static int idemp_put(const char *topic, int part, const void *unused_key, size_t
     if (!g_shared_storage) return 0;
     int skey = idemp_hash32_fp(topic, part, fp64_in);
     aof_idemp_val_t v = { .fp64 = fp64_in, .offset = offset };
-    return shared_storage_set(g_shared_storage, skey, &v, sizeof v);
+    int ok = shared_storage_set(g_shared_storage, skey, &v, sizeof v);
+    if (ok) atomic_fetch_add_explicit(&g_idempotency_index_writes, 1, memory_order_relaxed);
+    return ok;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1288,6 +1291,21 @@ int rf_offset_store(const char *topic, const char *group, int partition, uint64_
     if (!g_shared_storage) return 0;
     int k = offset_key_hash(topic, group, partition);
     return shared_storage_set(g_shared_storage, k, &off, sizeof(off));
+}
+
+int rf_partition_snapshot(const char *topic, int partition, rf_partition_snapshot_t *out) {
+    if (!topic || !out) return 0;
+    memset(out, 0, sizeof(*out));
+    rf_topic_t *t = find_topic_lockfree(topic, rf_topic_id(topic));
+    if (!t || partition < 0 || partition >= t->partitions) return 0;
+    rf_partition_t *p = &t->parts[partition];
+    uint64_t floor = atomic_load_explicit(&p->delete_floor, memory_order_acquire);
+    uint64_t high = atomic_load_explicit(&p->write_head, memory_order_acquire);
+    out->delete_floor = floor;
+    out->high_watermark = high;
+    out->message_count = (high >= floor) ? (high - floor) : 0;
+    out->idempotency_index_writes = atomic_load_explicit(&g_idempotency_index_writes, memory_order_relaxed);
+    return 1;
 }
 
 int rf_commit(const char *topic, const char *group, int partition, uint64_t offset) {

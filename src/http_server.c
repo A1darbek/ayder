@@ -417,6 +417,71 @@ static const char* get_bearer_from_headers(const connection_ctx_t *ctx, size_t *
     return v;
 }
 
+static int path_is_broker_query(const char *path){
+    if (!path) return 0;
+    return strcmp(path, "/broker/query") == 0 ||
+           strncmp(path, "/broker/query?", 14) == 0;
+}
+
+static int header_value_json_content_type(const struct phr_header *h){
+    if (!h) return 0;
+    const char *v = h->value;
+    size_t n = h->value_len;
+    while (n && isspace((unsigned char)*v)) { v++; n--; }
+    while (n && isspace((unsigned char)v[n - 1])) n--;
+
+    const char media[] = "application/json";
+    size_t media_len = sizeof(media) - 1;
+    if (n < media_len || strncasecmp(v, media, media_len) != 0) return 0;
+    if (n == media_len) return 1;
+    return v[media_len] == ';' || isspace((unsigned char)v[media_len]);
+}
+
+static int extract_query_fingerprint_hex(const char *json, size_t len, char hex[65]) {
+    static const char marker[] = "\"query_fingerprint\":\"sha256:";
+    const char *p = NULL;
+    if (!json || len < sizeof(marker)) return 0;
+    for (const char *cur = json; cur + sizeof(marker) - 1 <= json + len; cur++) {
+        if (memcmp(cur, marker, sizeof(marker) - 1) == 0) {
+            p = cur + sizeof(marker) - 1;
+            break;
+        }
+    }
+    if (!p || p + 64 > json + len) return 0;
+    for (int i = 0; i < 64; i++) {
+        unsigned char c = (unsigned char)p[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return 0;
+        hex[i] = (char)c;
+    }
+    hex[64] = 0;
+    return 1;
+}
+
+static void query_etag_from_hex(const char hex[65], char etag[96]) {
+    snprintf(etag, 96, "\"ayder-query-sha256-%s\"", hex);
+}
+
+static int if_none_match_has_etag(const connection_ctx_t *ctx, const char *etag) {
+    const struct phr_header *h = hdr_find(ctx, "If-None-Match");
+    if (!h || !etag) return 0;
+    const char *v = h->value;
+    size_t n = h->value_len;
+    while (n && isspace((unsigned char)*v)) { v++; n--; }
+    while (n && isspace((unsigned char)v[n - 1])) n--;
+    if (n == 1 && v[0] == '*') return 1;
+    size_t etag_len = strlen(etag);
+    const char *end = v + n;
+    while (v < end) {
+        while (v < end && (isspace((unsigned char)*v) || *v == ',')) v++;
+        const char *start = v;
+        while (v < end && *v != ',') v++;
+        const char *item_end = v;
+        while (item_end > start && isspace((unsigned char)item_end[-1])) item_end--;
+        if ((size_t)(item_end - start) == etag_len && memcmp(start, etag, etag_len) == 0) return 1;
+    }
+    return 0;
+}
+
 static int path_is_public(const char *path){
     if (has_skip_prefix(path)) return 1;  // runtime-configurable
     // allow these without auth/rate: tweak via RF_AUTH_SKIP_PATHS if you want
@@ -795,7 +860,7 @@ static void send_redirect_response(connection_ctx_t *ctx,
                            "Connection: %s\r\n"
                            "Cache-Control: no-store\r\n"
                            "Access-Control-Allow-Origin: *\r\n"
-                           "Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\n"
+                           "Access-Control-Allow-Methods: GET, POST, PUT, DELETE, QUERY, OPTIONS\r\n"
                            "Access-Control-Allow-Headers: Content-Type, Authorization\r\n"
                            "\r\n",
                            status_txt, cached_date, body_len, location, retry_after_s,
@@ -811,7 +876,7 @@ static void send_redirect_response(connection_ctx_t *ctx,
                            "Connection: %s\r\n"
                            "Cache-Control: no-store\r\n"
                            "Access-Control-Allow-Origin: *\r\n"
-                           "Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\n"
+                           "Access-Control-Allow-Methods: GET, POST, PUT, DELETE, QUERY, OPTIONS\r\n"
                            "Access-Control-Allow-Headers: Content-Type, Authorization\r\n"
                            "\r\n",
                            status_txt, cached_date, body_len, location,
@@ -854,8 +919,10 @@ static void send_response(connection_ctx_t* ctx, const char* json_data, size_t j
     buffer_reset(buf);
 
     const char *status_text = (status_code == 200) ? "200 OK" :
+                              (status_code == 304) ? "304 Not Modified" :
                               (status_code == 404) ? "404 Not Found" :
                               (status_code == 400) ? "400 Bad Request" :
+                              (status_code == 415) ? "415 Unsupported Media Type" :
                               (status_code == 503) ? "503 Service Unavailable" :
                               "500 Internal Server Error";
 
@@ -868,9 +935,9 @@ static void send_response(connection_ctx_t* ctx, const char* json_data, size_t j
                               "Connection: %s\r\n"
                               "Cache-Control: no-cache\r\n"
                               "Access-Control-Allow-Origin: *\r\n"
-                              "Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\n"
+                              "Access-Control-Allow-Methods: GET, POST, PUT, DELETE, QUERY, OPTIONS\r\n"
                               "Access-Control-Allow-Headers: Content-Type, Authorization\r\n",
-                              status_text, cached_date, json_len,
+                              status_text, cached_date, status_code == 304 ? 0 : json_len,
                               ctx->keep_alive ? "keep-alive" : "close");
 
     /* add optional headers BEFORE the blank line */
@@ -882,10 +949,25 @@ static void send_response(connection_ctx_t* ctx, const char* json_data, size_t j
                                ctx->rl_limit, ctx->rl_remaining, ctx->rl_reset_epoch_s);
         ctx->rl_have = 0;
     }
+    if (path_is_broker_query(ctx->url)) {
+        char fp_hex[65];
+        header_len += snprintf(buf->data + header_len, buf->capacity - header_len,
+                               "Accept-Query: application/json\r\n");
+        if (extract_query_fingerprint_hex(json_data, json_len, fp_hex)) {
+            char etag[96];
+            query_etag_from_hex(fp_hex, etag);
+            header_len += snprintf(buf->data + header_len, buf->capacity - header_len,
+                                   "ETag: %s\r\n"
+                                   "Content-Location: /broker/query-results/sha256:%s\r\n",
+                                   etag, fp_hex);
+        }
+        header_len += snprintf(buf->data + header_len, buf->capacity - header_len,
+                               "Access-Control-Expose-Headers: Accept-Query, ETag, Content-Location\r\n");
+    }
     /* end of headers */
     header_len += snprintf(buf->data + header_len, buf->capacity - header_len, "\r\n");
     /* body */
-    if (json_data && json_len > 0) {
+    if (status_code != 304 && json_data && json_len > 0) {
         memcpy(buf->data + header_len, json_data, json_len);
         buf->len = header_len + json_len;
     } else {
@@ -899,6 +981,7 @@ static void send_response(connection_ctx_t* ctx, const char* json_data, size_t j
     uv_write((uv_write_t*)wr, (uv_stream_t*)ctx->client, &uvb, 1, (uv_write_cb)write_complete_cb);
 
     if (status_code >= 200 && status_code < 300) atomic_fetch_add(&g_http_2xx, 1);
+    else if (status_code == 304) atomic_fetch_add(&g_http_3xx, 1);
     else if (status_code == 401) atomic_fetch_add(&g_http_401, 1), atomic_fetch_add(&g_http_4xx, 1);
     else if (status_code == 429) atomic_fetch_add(&g_http_429, 1), atomic_fetch_add(&g_http_4xx, 1);
     else if (status_code == 307) atomic_fetch_add(&g_http_3xx, 1);
@@ -1140,6 +1223,20 @@ static void process_request(connection_ctx_t* ctx) {
     }
     /* ──────────────────────────────────────────────────────────────────── */
 
+    if (strcmp(ctx->method_str, "QUERY") == 0 && path_is_broker_query(ctx->url)) {
+        const struct phr_header *ct = hdr_find(ctx, "Content-Type");
+        if (!ct) {
+            const char body[] = "{\"ok\":false,\"error\":\"missing_content_type\",\"accept_query\":\"application/json\"}";
+            send_response(ctx, body, sizeof(body) - 1, 400);
+            goto cleanup;
+        }
+        if (!header_value_json_content_type(ct)) {
+            const char body[] = "{\"ok\":false,\"error\":\"unsupported_query_media_type\",\"accept_query\":\"application/json\"}";
+            send_response(ctx, body, sizeof(body) - 1, 415);
+            goto cleanup;
+        }
+    }
+
     // Prepare response buffer (your existing code continues)
     char response_json[MAX_RESPONSE_SIZE];
     response_json[0] = '\0';
@@ -1147,6 +1244,18 @@ static void process_request(connection_ctx_t* ctx) {
     int result = route_request_len(ctx->method_str, ctx->url,
                                    ctx->body, ctx->body_len, response_json);
     size_t response_len = strlen(response_json);
+
+    if (result == 0 && strcmp(ctx->method_str, "QUERY") == 0 && path_is_broker_query(ctx->url)) {
+        char fp_hex[65];
+        char etag[96];
+        if (extract_query_fingerprint_hex(response_json, response_len, fp_hex)) {
+            query_etag_from_hex(fp_hex, etag);
+            if (if_none_match_has_etag(ctx, etag)) {
+                send_response(ctx, response_json, response_len, 304);
+                goto cleanup;
+            }
+        }
+    }
 
     if (result == 0 && strcmp(ctx->url, "/metrics") == 0) {
         send_raw(ctx, "text/plain; version=0.0.4", response_json, response_len, 200);

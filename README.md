@@ -36,6 +36,11 @@ make clean && make
 ./ayder --port 1109
 ```
 
+Full docs:
+
+- [Quick Start](docs/quickstart.md)
+- [API Reference](docs/api-reference.md)
+
 ## HTTP Walkthrough
 
 ```bash
@@ -90,6 +95,7 @@ See [examples/README.md](examples/README.md) for the design-review sequence.
 
 The `demos/` directory contains smaller scenario-specific receipts:
 
+- HTTP QUERY method support for safe broker queries with request bodies
 - provider timeout and financial indeterminism
 - ledger clearance and bank reconciliation
 - duplicate/out-of-order webhook suppression

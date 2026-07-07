@@ -13,7 +13,7 @@
 int route_request_len(const char *method, const char *path, const char *body, size_t body_len, char *response_buffer);
 
 // Supported methods
-static const char *methods[] = {"GET", "POST", "PUT", "DELETE", NULL};
+static const char *methods[] = {"GET", "POST", "PUT", "DELETE", "QUERY", NULL};
 
 /// Trie node representing one path segment (static or parameter).
 typedef struct TrieNode {
@@ -27,7 +27,7 @@ typedef struct TrieNode {
 } TrieNode;
 
 /// One root per HTTP method
-static TrieNode *method_roots[4];
+static TrieNode *method_roots[5];
 
 /// Map method string to index in method_roots
 static int method_index(const char *method) {
@@ -66,7 +66,7 @@ static TrieNode *create_node(const char *segment, bool is_param) {
 
 /// Initialize all method roots to NULL
 void router_init(void) {
-  for (int i = 0; i < 4; i++) {
+  for (int i = 0; methods[i]; i++) {
     method_roots[i] = NULL;
   }
 }
@@ -334,7 +334,7 @@ static void free_trie(TrieNode *n) {
 }
 
 void router_shutdown(void) {
-  for (int i = 0; i < 4; i++) {
+  for (int i = 0; methods[i]; i++) {
     if (method_roots[i]) {
       free_trie(method_roots[i]);
       method_roots[i] = NULL;
