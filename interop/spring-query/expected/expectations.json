@@ -1,0 +1,40 @@
+{
+  "schema_version": "0.1",
+  "row_ids": [
+    "core.native_query",
+    "core.accept_query_header",
+    "core.unsupported_content_type",
+    "core.missing_content_type",
+    "core.query_body_reaches_handler",
+    "core.post_compatibility_fallback",
+    "representation.first_bounded_query",
+    "representation.repeat_identical_query",
+    "representation.equivalent_json",
+    "representation.revalidation",
+    "representation.content_location",
+    "representation.expanded_query",
+    "safety.broker_state",
+    "safety.committed_offset",
+    "safety.bounded_after_append",
+    "safety.expanded_after_append",
+    "cache.forwarded_not_cache_proof",
+    "cache.collision_test"
+  ],
+  "expected": {
+    "core.native_query": 200,
+    "core.unsupported_content_type": 415,
+    "representation.revalidation": 304,
+    "representation.first_bounded_query_rows": 2,
+    "representation.expanded_query_rows": 4,
+    "safety.broker_state_mutated": false,
+    "safety.committed_offset_advanced": false
+  },
+  "statuses": [
+    "PASS",
+    "FAIL",
+    "NOT_SUPPORTED",
+    "NOT_APPLICABLE",
+    "UNVERIFIED",
+    "OBSERVED"
+  ]
+}
