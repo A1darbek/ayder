@@ -1,0 +1,33 @@
+services:
+  ayder:
+    build:
+      context: ../..
+    container_name: ayder-spring-query-ayder
+    shm_size: 2g
+    ports:
+      - "1119:1109"
+    ipc: shareable
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    security_opt:
+      - seccomp:unconfined
+    volumes:
+      - ayder_spring_query_data:/data
+    restart: unless-stopped
+
+  envoy:
+    image: envoyproxy/envoy:v1.31-latest
+    container_name: ayder-spring-query-envoy
+    depends_on:
+      - ayder
+    ports:
+      - "18080:18080"
+    volumes:
+      - ./envoy/envoy.yaml:/etc/envoy/envoy.yaml:ro
+    command: ["envoy", "-c", "/etc/envoy/envoy.yaml", "--log-level", "info"]
+    restart: unless-stopped
+
+volumes:
+  ayder_spring_query_data:
