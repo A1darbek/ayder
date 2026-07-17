@@ -41,6 +41,18 @@ interop/spring-query/receipts/ayder-envoy/receipt.json
 interop/spring-query/receipts/ayder-envoy/receipt.txt
 ```
 
+Sanitized example receipts are committed as:
+
+```text
+interop/spring-query/receipts/ayder-direct/example-receipt.json
+interop/spring-query/receipts/ayder-direct/example-receipt.txt
+interop/spring-query/receipts/ayder-envoy/example-receipt.json
+interop/spring-query/receipts/ayder-envoy/example-receipt.txt
+```
+
+Fresh runs overwrite `receipt.json` and `receipt.txt`; those generated files are
+ignored by Git.
+
 The host port for direct Ayder is `1119` to avoid colliding with the normal
 repository demo service on `1109`. Inside Docker, Ayder still listens on `1109`.
 
