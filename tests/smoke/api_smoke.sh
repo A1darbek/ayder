@@ -28,9 +28,11 @@ PASSES=0
 SKIPS=0
 RESP_BODY=""
 RESP_CODE=""
+RESP_HEADERS=""
 SERVER_PID=""
 SERVER_TMP=""
 ROUTE_COVERAGE="${ROUTE_COVERAGE:-1}"
+RATE_LIMIT_EXPECTATION="${RATE_LIMIT_EXPECTATION:-auto}"
 declare -A COVERED_ROUTES=()
 
 normalize_route_id() {
@@ -118,9 +120,11 @@ request() {
   local body="${3-}"
   local content_type="${4:-application/json}"
   local tmp
+  local headers
   tmp="$(mktemp)"
+  headers="$(mktemp)"
 
-  local curl_args=(-sS -o "$tmp" -w "%{http_code}" -X "$method")
+  local curl_args=(-sS -D "$headers" -o "$tmp" -w "%{http_code}" -X "$method")
   curl_args+=("${AUTH_ARGS[@]}")
   if [[ $# -ge 3 ]]; then
     curl_args+=(-H "Content-Type: ${content_type}" --data-binary "$body")
@@ -129,13 +133,119 @@ request() {
 
   RESP_CODE="$(curl "${curl_args[@]}" 2>"${tmp}.err" || printf '000')"
   RESP_BODY="$(cat "$tmp")"
+  RESP_HEADERS="$(cat "$headers")"
   local err
   err="$(cat "${tmp}.err")"
-  rm -f "$tmp" "${tmp}.err"
+  rm -f "$tmp" "$headers" "${tmp}.err"
 
   if [[ "$RESP_CODE" == "000" && -n "$err" ]]; then
     RESP_BODY="$err"
   fi
+}
+
+request_with_header() {
+  local method="$1"
+  local path="$2"
+  local body="$3"
+  local header="$4"
+  local content_type="${5:-application/json}"
+  local tmp
+  local headers
+  tmp="$(mktemp)"
+  headers="$(mktemp)"
+
+  local curl_args=(-sS -D "$headers" -o "$tmp" -w "%{http_code}" -X "$method")
+  curl_args+=("${AUTH_ARGS[@]}")
+  curl_args+=(-H "Content-Type: ${content_type}" -H "$header" --data-binary "$body")
+  curl_args+=("${BASE}${path}")
+
+  RESP_CODE="$(curl "${curl_args[@]}" 2>"${tmp}.err" || printf '000')"
+  RESP_BODY="$(cat "$tmp")"
+  RESP_HEADERS="$(cat "$headers")"
+  local err
+  err="$(cat "${tmp}.err")"
+  rm -f "$tmp" "$headers" "${tmp}.err"
+
+  if [[ "$RESP_CODE" == "000" && -n "$err" ]]; then
+    RESP_BODY="$err"
+  fi
+}
+
+header_value() {
+  local name="$1"
+  awk -v key="$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')" '
+    BEGIN { FS=":" }
+    {
+      h=tolower($1)
+      if (h == key) {
+        sub(/^[^:]*:[ \t]*/, "", $0)
+        sub(/\r$/, "", $0)
+        print $0
+        exit
+      }
+    }
+  ' <<<"$RESP_HEADERS"
+}
+
+header_absent() {
+  local label="$1"
+  local name="$2"
+  if [[ -z "$(header_value "$name")" ]]; then
+    pass "$label" "${name} absent"
+    return 0
+  fi
+  fail "$label" "unexpected ${name}: $(header_value "$name")"
+  return 1
+}
+
+header_present() {
+  local label="$1"
+  local name="$2"
+  if [[ -n "$(header_value "$name")" ]]; then
+    pass "$label" "${name}: $(header_value "$name")"
+    return 0
+  fi
+  fail "$label" "missing ${name}"
+  return 1
+}
+
+expect_query_rate_limit_headers() {
+  local label="$1"
+  local limit remaining reset
+  limit="$(header_value X-RateLimit-Limit)"
+  remaining="$(header_value X-RateLimit-Remaining)"
+  reset="$(header_value X-RateLimit-Reset)"
+
+  case "$RATE_LIMIT_EXPECTATION" in
+    disabled)
+      if [[ -z "$limit" && -z "$remaining" && -z "$reset" ]]; then
+        pass "$label" "disabled limiter emitted no X-RateLimit headers"
+      else
+        fail "$label" "disabled limiter emitted limit=${limit:-missing} remaining=${remaining:-missing} reset=${reset:-missing}"
+      fi
+      ;;
+    enabled)
+      if [[ "$limit" =~ ^[0-9]+$ && "$remaining" =~ ^[0-9]+$ && "$reset" =~ ^[0-9]+$ &&
+            "$limit" -gt 0 && "$remaining" -le "$limit" && "$reset" -gt 0 ]]; then
+        pass "$label" "limit=${limit} remaining=${remaining} reset=${reset}"
+      else
+        fail "$label" "invalid headers limit=${limit:-missing} remaining=${remaining:-missing} reset=${reset:-missing}"
+      fi
+      ;;
+    auto)
+      if [[ -z "$limit" && -z "$remaining" && -z "$reset" ]]; then
+        pass "$label" "rate-limit headers absent"
+      elif [[ "$limit" =~ ^[0-9]+$ && "$remaining" =~ ^[0-9]+$ && "$reset" =~ ^[0-9]+$ &&
+              "$limit" -gt 0 && "$remaining" -le "$limit" && "$reset" -gt 0 ]]; then
+        pass "$label" "limit=${limit} remaining=${remaining} reset=${reset}"
+      else
+        fail "$label" "invalid headers limit=${limit:-missing} remaining=${remaining:-missing} reset=${reset:-missing}"
+      fi
+      ;;
+    *)
+      fail "$label" "bad RATE_LIMIT_EXPECTATION=${RATE_LIMIT_EXPECTATION}"
+      ;;
+  esac
 }
 
 expect_2xx() {
@@ -220,7 +330,7 @@ if [[ "$START_SERVER" == "1" ]]; then
   (
     cd "$SERVER_TMP" || exit 1
     if [[ -n "$TOKEN" && -z "${RF_BEARER_TOKENS:-}" ]]; then
-      export RF_BEARER_TOKENS="${TOKEN}@55555555555555:11111111111111111:111111111111111111111"
+      export RF_BEARER_TOKENS="${TOKEN}@5000:5000:1000000"
     fi
     "$SERVER_BIN" --port "$PORT" --workers "$SERVER_WORKERS" >ayder-smoke.log 2>&1
   ) &
@@ -371,6 +481,34 @@ expect_json "POST /broker/query" '.ok==true and (.rows|length)>=2 and (.aggregat
 request QUERY /broker/query "$query_body"
 mark_route QUERY /broker/query
 expect_json "QUERY /broker/query" '.ok==true and (.rows|length)>=2 and (.aggregates|length)>=1 and .source.consumed>=2'
+query_etag="$(header_value ETag)"
+header_absent "QUERY no Content-Location" Content-Location
+if [[ "$(header_value Access-Control-Expose-Headers)" == *Content-Location* ]]; then
+  fail "QUERY expose headers" "unexpected Content-Location in $(header_value Access-Control-Expose-Headers)"
+else
+  pass "QUERY expose headers" "Content-Location not exposed"
+fi
+header_present "QUERY ETag" ETag
+expect_query_rate_limit_headers "QUERY rate-limit headers"
+
+if [[ "$RATE_LIMIT_EXPECTATION" == "enabled" ]]; then
+  first_remaining="$(header_value X-RateLimit-Remaining)"
+  request QUERY /broker/query "$query_body"
+  second_remaining="$(header_value X-RateLimit-Remaining)"
+  if [[ "$first_remaining" =~ ^[0-9]+$ && "$second_remaining" =~ ^[0-9]+$ &&
+        "$second_remaining" -le "$first_remaining" ]]; then
+    pass "QUERY rate-limit update" "remaining ${first_remaining}->${second_remaining}"
+  else
+    fail "QUERY rate-limit update" "unexpected remaining ${first_remaining:-missing}->${second_remaining:-missing}"
+  fi
+fi
+
+request_with_header QUERY /broker/query "$query_body" "If-None-Match: ${query_etag}"
+if [[ "$RESP_CODE" == "304" ]]; then
+  pass "QUERY If-None-Match" "HTTP 304"
+else
+  fail "QUERY If-None-Match" "expected HTTP 304, got ${RESP_CODE}: $(snippet "$RESP_BODY")"
+fi
 
 join_body="$(jq -nc \
   --arg left "$TOPIC" --arg right "$RIGHT_TOPIC" \
