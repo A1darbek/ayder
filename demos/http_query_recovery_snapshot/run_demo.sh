@@ -141,10 +141,12 @@ code_a="$(query_request "${ARTIFACT_DIR}/query_a.json" "$headers_a" "$body_a")"
 etag="$(header_value ETag "$headers_a")"
 accept_query="$(header_value Accept-Query "$headers_a")"
 content_location="$(header_value Content-Location "$headers_a")"
+expose_headers="$(header_value Access-Control-Expose-Headers "$headers_a")"
 
 [[ "$accept_query" == "application/json" ]] || { echo "missing Accept-Query header" >&2; cat "$headers_a" >&2; exit 1; }
 [[ "$etag" == \"ayder-query-sha256-*\" ]] || { echo "missing Ayder query ETag" >&2; cat "$headers_a" >&2; exit 1; }
-[[ "$content_location" == /broker/query-results/sha256:* ]] || { echo "missing Content-Location" >&2; cat "$headers_a" >&2; exit 1; }
+[[ -z "$content_location" ]] || { echo "unexpected Content-Location before result resources are retrievable" >&2; cat "$headers_a" >&2; exit 1; }
+[[ "$expose_headers" != *Content-Location* ]] || { echo "Access-Control-Expose-Headers must not expose Content-Location" >&2; cat "$headers_a" >&2; exit 1; }
 
 jq -e '
   .ok == true and
@@ -249,7 +251,6 @@ jq -n \
   --arg accept_query "$accept_query" \
   --arg query_fingerprint "$fingerprint_a" \
   --arg etag "$etag" \
-  --arg content_location "$content_location" \
   --argjson high_before "$(jq '.safety.high_watermark_before' "$body_a")" \
   --argjson high_after "$(jq '.safety.high_watermark_after' "$body_a")" \
   --argjson commit_before "$(jq '.safety.committed_offset_before' "$body_a")" \
@@ -265,7 +266,7 @@ jq -n \
       accept_query: $accept_query,
       query_fingerprint: $query_fingerprint,
       etag: $etag,
-      content_location: $content_location,
+      content_location_advertised: false,
       conditional_query_returned_304: true,
       unsupported_media_type_rejected: true,
       canonical_json_same_fingerprint: true
@@ -302,7 +303,7 @@ cat >"${ARTIFACT_DIR}/receipt.txt" <<EOF
  HTTP QUERY:
    accept_query: ${accept_query}
    etag: ${etag}
-   content_location: ${content_location}
+   content_location_advertised: false
    fingerprint: ${fingerprint_a}
    conditional_query_returned_304: true
    canonical_json_same_fingerprint: true

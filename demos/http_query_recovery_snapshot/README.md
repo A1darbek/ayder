@@ -9,7 +9,9 @@ It proves:
 - `QUERY` finds provider-ambiguous payments that are not safe to close.
 - `QUERY` does not mutate high watermarks, committed offsets, message counts, or
   idempotency evidence.
-- Ayder returns `Accept-Query`, `ETag`, and `Content-Location`.
+- Ayder returns `Accept-Query` and `ETag`.
+- Ayder does not advertise `Content-Location` until query result resources are
+  retrievable.
 - `If-None-Match` returns `304 Not Modified`.
 - Equivalent query JSON with different object key order gets the same
   fingerprint.

@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <errno.h>
 #include <uv.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -297,6 +298,18 @@ static inline uint64_t epoch_day_utc(void){
     time_t t=time(NULL); return (uint64_t)(t/86400);
 }
 
+static uint32_t parse_u32_token_field_or_default(const char **p, uint32_t fallback) {
+    errno = 0;
+    char *end = NULL;
+    unsigned long value = strtoul(*p, &end, 10);
+    if (end == *p || errno == ERANGE || value == 0 || value > UINT32_MAX) {
+        *p = end ? end : *p;
+        return fallback;
+    }
+    *p = end;
+    return (uint32_t)value;
+}
+
 static void parse_bearer_tokens_from_env(void){
     const char *env = getenv("RF_BEARER_TOKENS");
     if (!env || !*env) return;
@@ -319,8 +332,8 @@ static void parse_bearer_tokens_from_env(void){
 
         if (*p=='@'){ // @rps:burst:daily
             p++;
-            cfg.rps = (uint32_t)strtoul(p, (char**)&p, 10);
-            if (*p==':'){ p++; cfg.burst = (uint32_t)strtoul(p,(char**)&p,10); }
+            cfg.rps = parse_u32_token_field_or_default(&p, (uint32_t)RL_DEFAULT_RPS);
+            if (*p==':'){ p++; cfg.burst = parse_u32_token_field_or_default(&p, (uint32_t)RL_DEFAULT_BURST); }
             if (*p==':'){ p++; cfg.daily = (uint64_t)strtoull(p,(char**)&p,10); }
         }
         // skip to next ','
@@ -617,11 +630,23 @@ static void send_unauthorized(connection_ctx_t *ctx){
     atomic_fetch_add(&g_http_4xx, 1);
 }
 
+static int rate_limit_headers_valid(uint32_t limit, uint32_t remaining, uint64_t reset_epoch_s) {
+    return limit > 0 && remaining <= limit && reset_epoch_s > 0;
+}
+
 static void send_rate_limited(connection_ctx_t *ctx, int retry_after_s,
                               uint32_t limit, uint32_t remaining, uint64_t reset_epoch_s){
     char body[256];
+    char rl_headers[160] = {0};
     int bl = snprintf(body, sizeof(body),
                       "{\"error\":\"rate_limited\",\"retry_after\":%d}", retry_after_s);
+    if (rate_limit_headers_valid(limit, remaining, reset_epoch_s)) {
+        snprintf(rl_headers, sizeof(rl_headers),
+                 "X-RateLimit-Limit: %u\r\n"
+                 "X-RateLimit-Remaining: %u\r\n"
+                 "X-RateLimit-Reset: %" PRIu64 "\r\n",
+                 limit, remaining, reset_epoch_s);
+    }
     fast_buffer_t *buf = ctx->response_buf; buffer_reset(buf);
     int n = snprintf(buf->data, buf->capacity,
                      "HTTP/1.1 429 Too Many Requests\r\n"
@@ -630,14 +655,12 @@ static void send_rate_limited(connection_ctx_t *ctx, int retry_after_s,
                      "Content-Type: application/json\r\n"
                      "Content-Length: %d\r\n"
                      "Retry-After: %d\r\n"
-                     "X-RateLimit-Limit: %u\r\n"
-                     "X-RateLimit-Remaining: %u\r\n"
-                     "X-RateLimit-Reset: %" PRIu64 "\r\n"
+                     "%s"
                      "Connection: %s\r\n"
                      "Access-Control-Allow-Origin: *\r\n"
                      "Access-Control-Allow-Headers: Content-Type, Authorization\r\n"
                      "\r\n",
-                     cached_date, bl, retry_after_s, limit, remaining, reset_epoch_s,
+                     cached_date, bl, retry_after_s, rl_headers,
                      ctx->keep_alive?"keep-alive":"close");
     memcpy(buf->data+n, body, bl); buf->len = n + bl;
     write_req_t *wr = object_pool_get(write_pool); if(!wr) wr = slab_alloc(sizeof(*wr));
@@ -709,7 +732,7 @@ static int rl_take_one(const api_key_cfg_t *cfg, const char *tok, size_t toklen,
         time_t next_day_s = (now_s/86400 + 1) * 86400;
         int retry_s = (int)(next_day_s - now_s);
         if (retry_s < 1) retry_s = 1;
-        if (out_limit)      *out_limit      = (uint32_t)cfg->rps;
+        if (out_limit)      *out_limit      = cfg->burst;
         if (out_remaining)  *out_remaining  = 0;
         if (out_reset_epoch_s) *out_reset_epoch_s = (uint64_t)next_day_s;
         if (out_retry_after_s) *out_retry_after_s = retry_s;
@@ -720,7 +743,7 @@ static int rl_take_one(const api_key_cfg_t *cfg, const char *tok, size_t toklen,
     if (st.tokens == 0){
         // time until 1 token arrives
         int retry_s = (cfg->rps>0) ? 1 : 1;
-        if (out_limit)      *out_limit      = (uint32_t)cfg->rps;
+        if (out_limit)      *out_limit      = cfg->burst;
         if (out_remaining)  *out_remaining  = 0;
         if (out_reset_epoch_s) *out_reset_epoch_s = (uint64_t)(time(NULL)+retry_s);
         if (out_retry_after_s) *out_retry_after_s = retry_s;
@@ -732,7 +755,7 @@ static int rl_take_one(const api_key_cfg_t *cfg, const char *tok, size_t toklen,
     st.tokens--;
     st.daily_used++;
     shared_storage_set(g_shared_storage, skey, &st, sizeof(st));
-    if (out_limit)      *out_limit      = (uint32_t)cfg->rps;
+    if (out_limit)      *out_limit      = cfg->burst;
     if (out_remaining)  *out_remaining  = st.tokens;
     if (out_reset_epoch_s) *out_reset_epoch_s = (uint64_t)(time(NULL)+1); // reset tick in ~1s
     if (out_retry_after_s) *out_retry_after_s = 0;
@@ -941,7 +964,8 @@ static void send_response(connection_ctx_t* ctx, const char* json_data, size_t j
                               ctx->keep_alive ? "keep-alive" : "close");
 
     /* add optional headers BEFORE the blank line */
-    if (ctx->rl_have && status_code == 200) {
+    if (ctx->rl_have && status_code == 200 &&
+        rate_limit_headers_valid(ctx->rl_limit, ctx->rl_remaining, ctx->rl_reset_epoch_s)) {
         header_len += snprintf(buf->data + header_len, buf->capacity - header_len,
                                "X-RateLimit-Limit: %u\r\n"
                                "X-RateLimit-Remaining: %u\r\n"
@@ -957,12 +981,11 @@ static void send_response(connection_ctx_t* ctx, const char* json_data, size_t j
             char etag[96];
             query_etag_from_hex(fp_hex, etag);
             header_len += snprintf(buf->data + header_len, buf->capacity - header_len,
-                                   "ETag: %s\r\n"
-                                   "Content-Location: /broker/query-results/sha256:%s\r\n",
-                                   etag, fp_hex);
+                                   "ETag: %s\r\n",
+                                   etag);
         }
         header_len += snprintf(buf->data + header_len, buf->capacity - header_len,
-                               "Access-Control-Expose-Headers: Accept-Query, ETag, Content-Location\r\n");
+                               "Access-Control-Expose-Headers: Accept-Query, ETag\r\n");
     }
     /* end of headers */
     header_len += snprintf(buf->data + header_len, buf->capacity - header_len, "\r\n");
@@ -1145,7 +1168,9 @@ static void process_request(connection_ctx_t* ctx) {
 
 
             if (RL_ENABLED) {
-                uint32_t lim=0, rem=0; uint64_t reset=0; int wait_s=0;
+                uint32_t lim = 0, rem = 0;
+                uint64_t reset = 0;
+                int wait_s = 0;
                 int rl = rl_take_one(cfg, tok, toklen, &lim, &rem, &reset, &wait_s);
                 if (rl > 0) {
                     if (wait_s < 1) wait_s = 1;
@@ -1155,7 +1180,7 @@ static void process_request(connection_ctx_t* ctx) {
                     ctx->rl_limit = lim;
                     ctx->rl_remaining = rem;
                     ctx->rl_reset_epoch_s = reset;
-                    ctx->rl_have = 1;
+                    ctx->rl_have = rate_limit_headers_valid(lim, rem, reset);
                 }
             } else {
                 ctx->rl_have = 0;
