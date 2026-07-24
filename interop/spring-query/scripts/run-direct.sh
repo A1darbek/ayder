@@ -55,6 +55,19 @@ result_for() {
   fi
 }
 
+is_sha256_fingerprint() {
+  [[ "${1:-}" =~ ^sha256:[0-9a-f]{64}$ ]]
+}
+
+is_nonempty_etag() {
+  local value="${1:-}"
+  [[ -n "$value" && "$value" != "null" ]]
+}
+
+is_non_negative_integer() {
+  [[ "${1:-}" =~ ^[0-9]+$ ]]
+}
+
 append_status_row() {
   local id="$1"
   local result="$2"
@@ -137,6 +150,9 @@ accept_query="$(header_value Accept-Query "$headers_first")"
 etag_first="$(header_value ETag "$headers_first")"
 content_location="$(header_value Content-Location "$headers_first")"
 cors_methods="$(header_value Access-Control-Allow-Methods "$headers_first")"
+rate_limit_limit="$(header_value X-RateLimit-Limit "$headers_first")"
+rate_limit_remaining="$(header_value X-RateLimit-Remaining "$headers_first")"
+rate_limit_reset="$(header_value X-RateLimit-Reset "$headers_first")"
 fingerprint_first="$(jq -r '.query_fingerprint // ""' "$body_first")"
 rows_first="$(jq '.rows | length' "$body_first")"
 
@@ -153,14 +169,48 @@ jq -nc --arg result "$(result_for "$([[ "$cors_methods" == *QUERY* ]] && echo 1 
   --arg allow_methods "$cors_methods" \
   '{id:"cors.allow_methods_mentions_query",result:$result,access_control_allow_methods:$allow_methods,detail:"Ayder response CORS header advertises QUERY; Spring must still prove OPTIONS preflight separately."}' >>"$ROWS"
 
+rate_limit_result="FAIL"
+if is_non_negative_integer "$rate_limit_limit" \
+  && is_non_negative_integer "$rate_limit_remaining" \
+  && is_non_negative_integer "$rate_limit_reset" \
+  && (( rate_limit_limit > 0 )) \
+  && (( rate_limit_remaining <= rate_limit_limit )) \
+  && (( rate_limit_reset > 0 )); then
+  rate_limit_result="PASS"
+fi
+
+jq -nc \
+  --arg result "$rate_limit_result" \
+  --arg limit "$rate_limit_limit" \
+  --arg remaining "$rate_limit_remaining" \
+  --arg reset "$rate_limit_reset" \
+  '{
+    id: "ayder.rate_limit_headers_sane",
+    result: $result,
+    limit: (if ($limit | test("^[0-9]+$")) then ($limit | tonumber) else null end),
+    remaining: (if ($remaining | test("^[0-9]+$")) then ($remaining | tonumber) else null end),
+    reset: (if ($reset | test("^[0-9]+$")) then ($reset | tonumber) else null end)
+  }' >>"$ROWS"
+
 headers_repeat="${RAW_DIR}/repeat.headers"
 body_repeat="${RAW_DIR}/repeat.response.json"
 log "repeating identical bounded QUERY"
 code_repeat="$(query_request "${RAW_DIR}/bounded.json" "$headers_repeat" "$body_repeat")"
 fingerprint_repeat="$(jq -r '.query_fingerprint // ""' "$body_repeat")"
 etag_repeat="$(header_value ETag "$headers_repeat")"
+repeat_valid=0
+if [[ "$code_repeat" == "200" ]] \
+  && is_sha256_fingerprint "$fingerprint_first" \
+  && is_sha256_fingerprint "$fingerprint_repeat" \
+  && [[ "$fingerprint_repeat" == "$fingerprint_first" ]] \
+  && is_nonempty_etag "$etag_first" \
+  && is_nonempty_etag "$etag_repeat" \
+  && [[ "$etag_repeat" == "$etag_first" ]]; then
+  repeat_valid=1
+fi
+
 jq -nc \
-  --arg result "$(result_for "$([[ "$code_repeat" == "200" && "$fingerprint_repeat" == "$fingerprint_first" && "$etag_repeat" == "$etag_first" ]] && echo 1 || echo 0)")" \
+  --arg result "$(result_for "$repeat_valid")" \
   --argjson expected_status 200 \
   --argjson observed_status "$code_repeat" \
   --arg first_fingerprint "$fingerprint_first" \
@@ -174,24 +224,65 @@ body_equiv="${RAW_DIR}/equivalent.response.json"
 log "running equivalent reordered JSON QUERY"
 code_equiv="$(query_request "${RAW_DIR}/bounded-equivalent.json" "$headers_equiv" "$body_equiv")"
 fingerprint_equiv="$(jq -r '.query_fingerprint // ""' "$body_equiv")"
+rows_equiv="$(jq '.rows | length' "$body_equiv")"
+equivalent_valid=0
+if [[ "$code_equiv" == "200" ]] \
+  && is_sha256_fingerprint "$fingerprint_first" \
+  && is_sha256_fingerprint "$fingerprint_equiv" \
+  && [[ "$fingerprint_equiv" == "$fingerprint_first" ]]; then
+  equivalent_valid=1
+fi
+
 jq -nc \
-  --arg result "$(result_for "$([[ "$code_equiv" == "200" && "$fingerprint_equiv" == "$fingerprint_first" ]] && echo 1 || echo 0)")" \
+  --arg result "$(result_for "$equivalent_valid")" \
+  --argjson first_status "$code_first" \
+  --argjson equivalent_status "$code_equiv" \
+  --argjson first_rows "$rows_first" \
+  --argjson equivalent_rows "$rows_equiv" \
   --arg first_fingerprint "$fingerprint_first" \
   --arg equivalent_fingerprint "$fingerprint_equiv" \
-  '{id:"representation.equivalent_json",result:$result,first_fingerprint:$first_fingerprint,equivalent_fingerprint:$equivalent_fingerprint,detail:"Object key order and whitespace changed; array order preserved."}' >>"$ROWS"
+  '{id:"representation.equivalent_json",result:$result,first_status:$first_status,equivalent_status:$equivalent_status,first_rows:$first_rows,equivalent_rows:$equivalent_rows,first_fingerprint:$first_fingerprint,equivalent_fingerprint:$equivalent_fingerprint,detail:"Object key order and whitespace changed; array order preserved."}' >>"$ROWS"
 
 headers_304="${RAW_DIR}/revalidation.headers"
 body_304="${RAW_DIR}/revalidation.response"
 log "running If-None-Match revalidation"
 code_304="$(query_request "${RAW_DIR}/bounded.json" "$headers_304" "$body_304" -H "If-None-Match: ${etag_first}")"
-append_status_row "representation.revalidation" "$(result_for "$([[ "$code_304" == "304" ]] && echo 1 || echo 0)")" 304 "$code_304"
-
 jq -nc \
-  --arg result "$(result_for "$([[ "$content_location" == /broker/query-results/sha256:* ]] && echo 1 || echo 0)")" \
-  --arg content_location "$content_location" \
-  --arg etag "$etag_first" \
-  --arg fingerprint "$fingerprint_first" \
-  '{id:"representation.content_location",result:$result,content_location:$content_location,etag:$etag,fingerprint:$fingerprint}' >>"$ROWS"
+  --arg result "$(result_for "$([[ "$code_304" == "304" ]] && echo 1 || echo 0)")" \
+  --argjson expected_status 304 \
+  --argjson observed_status "$code_304" \
+  '{
+    id: "representation.revalidation",
+    result: $result,
+    expected_status: $expected_status,
+    observed_status: $observed_status,
+    scope: "unchanged selected representation",
+    does_not_prove: "validator invalidation after the selected representation changes",
+    tracked_issue: "https://github.com/A1darbek/ayder/issues/13"
+  }' >>"$ROWS"
+
+if [[ -z "$content_location" ]]; then
+  jq -nc \
+    --arg etag "$etag_first" \
+    --arg fingerprint "$fingerprint_first" \
+    '{
+      id: "representation.content_location",
+      result: "NOT_SUPPORTED",
+      etag: $etag,
+      fingerprint: $fingerprint,
+      reason: "Ayder does not advertise Content-Location until a retrievable authenticated result resource exists",
+      design_issue: "https://github.com/A1darbek/ayder/issues/11"
+    }' >>"$ROWS"
+else
+  jq -nc \
+    --arg content_location "$content_location" \
+    '{
+      id: "representation.content_location",
+      result: "FAIL",
+      content_location: $content_location,
+      reason: "Unexpected Content-Location advertised before retrievable result-resource support exists"
+    }' >>"$ROWS"
+fi
 
 unsupported_code="$(curl -sS -o "${RAW_DIR}/unsupported.response.json" -w '%{http_code}' \
   -X QUERY "${BASE}/broker/query" \
@@ -223,26 +314,50 @@ jq -nc \
   --arg etag "$etag_first" \
   '{id:"representation.first_bounded_query",result:$result,expected_status:$expected_status,observed_status:$observed_status,matched_rows:$rows,fingerprint:$fingerprint,etag:$etag}' >>"$ROWS"
 
-broker_mutated="$(jq -r '.safety.broker_state_mutated // true' "$body_first")"
-high_before="$(jq '.safety.high_watermark_before // -1' "$body_first")"
-high_after="$(jq '.safety.high_watermark_after // -1' "$body_first")"
-message_before="$(jq '.safety.message_count_before // -1' "$body_first")"
-message_after="$(jq '.safety.message_count_after // -1' "$body_first")"
-idemp_before="$(jq '.safety.idempotency_records_before // -1' "$body_first")"
-idemp_after="$(jq '.safety.idempotency_records_after // -1' "$body_first")"
-commit_before="$(jq '.safety.committed_offset_before // -1' "$body_first")"
-commit_after="$(jq '.safety.committed_offset_after // -1' "$body_first")"
-safety_state_result="$(jq -r '
-  if .safety.broker_state_mutated == false
-     and .safety.high_watermark_before == .safety.high_watermark_after
-     and .safety.message_count_before == .safety.message_count_after
-     and .safety.idempotency_records_before == .safety.idempotency_records_after
-  then "PASS" else "FAIL" end
-' "$body_first")"
-commit_result="$(jq -r '
-  if .safety.committed_offset_before == .safety.committed_offset_after
-  then "PASS" else "FAIL" end
-' "$body_first")"
+broker_mutated="$(jq -r '.safety.broker_state_mutated' "$body_first")"
+high_before="$(jq -r '.safety.high_watermark_before' "$body_first")"
+high_after="$(jq -r '.safety.high_watermark_after' "$body_first")"
+message_before="$(jq -r '.safety.message_count_before' "$body_first")"
+message_after="$(jq -r '.safety.message_count_after' "$body_first")"
+idemp_before="$(jq -r '.safety.idempotency_records_before' "$body_first")"
+idemp_after="$(jq -r '.safety.idempotency_records_after' "$body_first")"
+commit_before="$(jq -r '.safety.committed_offset_before' "$body_first")"
+commit_after="$(jq -r '.safety.committed_offset_after' "$body_first")"
+
+safety_evidence_valid=0
+if jq -e '
+  (.safety | type == "object") and
+  (.safety.broker_state_mutated | type == "boolean") and
+  (.safety.high_watermark_before | type == "number") and
+  (.safety.high_watermark_after | type == "number") and
+  (.safety.message_count_before | type == "number") and
+  (.safety.message_count_after | type == "number") and
+  (.safety.idempotency_records_before | type == "number") and
+  (.safety.idempotency_records_after | type == "number") and
+  (.safety.committed_offset_before | type == "number") and
+  (.safety.committed_offset_after | type == "number")
+' "$body_first" >/dev/null; then
+  safety_evidence_valid=1
+fi
+
+if (( safety_evidence_valid == 1 )) \
+  && [[ "$broker_mutated" == "false" ]] \
+  && [[ "$high_before" == "$high_after" ]] \
+  && [[ "$message_before" == "$message_after" ]] \
+  && [[ "$idemp_before" == "$idemp_after" ]]; then
+  safety_state_result="PASS"
+else
+  safety_state_result="FAIL"
+fi
+
+if (( safety_evidence_valid == 1 )) \
+  && is_non_negative_integer "$commit_before" \
+  && is_non_negative_integer "$commit_after" \
+  && [[ "$commit_before" == "$commit_after" ]]; then
+  commit_result="PASS"
+else
+  commit_result="FAIL"
+fi
 
 jq -nc \
   --arg result "$safety_state_result" \
@@ -322,13 +437,30 @@ jq -nc \
 if [[ "$TARGET" == "ayder-envoy" && -n "${DIRECT_RECEIPT:-}" && -f "$DIRECT_RECEIPT" ]]; then
   direct_fp="$(jq -r '.rows[] | select(.id=="representation.first_bounded_query") | .fingerprint' "$DIRECT_RECEIPT")"
   direct_etag="$(jq -r '.rows[] | select(.id=="representation.first_bounded_query") | .etag' "$DIRECT_RECEIPT")"
+  direct_result="$(jq -r '.rows[] | select(.id=="representation.first_bounded_query") | .result' "$DIRECT_RECEIPT")"
+  direct_status="$(jq -r '.rows[] | select(.id=="representation.first_bounded_query") | .observed_status' "$DIRECT_RECEIPT")"
+  transport_valid=0
+  if [[ "$direct_result" == "PASS" ]] \
+    && [[ "$direct_status" == "200" ]] \
+    && [[ "$code_first" == "200" ]] \
+    && is_sha256_fingerprint "$direct_fp" \
+    && is_sha256_fingerprint "$fingerprint_first" \
+    && [[ "$direct_fp" == "$fingerprint_first" ]] \
+    && is_nonempty_etag "$direct_etag" \
+    && is_nonempty_etag "$etag_first" \
+    && [[ "$direct_etag" == "$etag_first" ]]; then
+    transport_valid=1
+  fi
+
   jq -nc \
-    --arg result "$(result_for "$([[ "$direct_fp" == "$fingerprint_first" && "$direct_etag" == "$etag_first" ]] && echo 1 || echo 0)")" \
+    --arg result "$(result_for "$transport_valid")" \
+    --arg direct_status "$direct_status" \
+    --arg through_envoy_status "$code_first" \
     --arg direct_fingerprint "$direct_fp" \
     --arg through_envoy_fingerprint "$fingerprint_first" \
     --arg direct_etag "$direct_etag" \
     --arg through_envoy_etag "$etag_first" \
-    '{id:"transport.direct_envoy_equivalence",result:$result,direct:{status:200,fingerprint:$direct_fingerprint,etag:$direct_etag},through_envoy:{status:200,fingerprint:$through_envoy_fingerprint,etag:$through_envoy_etag},transport_equivalence:$result,direct_fingerprint:$direct_fingerprint,through_envoy_fingerprint:$through_envoy_fingerprint}' >>"$ROWS"
+    '{id:"transport.direct_envoy_equivalence",result:$result,direct:{status:($direct_status | tonumber? // $direct_status),fingerprint:$direct_fingerprint,etag:$direct_etag},through_envoy:{status:($through_envoy_status | tonumber? // $through_envoy_status),fingerprint:$through_envoy_fingerprint,etag:$through_envoy_etag},transport_equivalence:$result,direct_fingerprint:$direct_fingerprint,through_envoy_fingerprint:$through_envoy_fingerprint}' >>"$ROWS"
 fi
 
 receipt_path="$("${SCRIPT_DIR}/render-receipt.py" \

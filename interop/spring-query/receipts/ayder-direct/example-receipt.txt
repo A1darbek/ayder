@@ -6,7 +6,7 @@
  commit       : SANITIZED_EXAMPLE_COMMIT
  base_url     : http://127.0.0.1:1119
 ------------------------------------------------------------
- summary      : PASS=15 FAIL=0 OBSERVED=2 UNVERIFIED=2 NOT_SUPPORTED=0 NOT_APPLICABLE=0
+ summary      : PASS=15 FAIL=0 OBSERVED=2 UNVERIFIED=2 NOT_SUPPORTED=1 NOT_APPLICABLE=0
 ------------------------------------------------------------
  PASS            core.native_query
    expected_status: 200
@@ -16,6 +16,10 @@
    fingerprint: sha256:753694fb60975885eb5d75c976162fd0e27f4ab3b535ecf0e300a084a8a47411
  PASS            cors.allow_methods_mentions_query
    detail: Ayder response CORS header advertises QUERY; Spring must still prove OPTIONS preflight separately.
+ PASS            ayder.rate_limit_headers_sane
+   limit: 5000
+   remaining: 4999
+   reset: 1800000000
  PASS            representation.repeat_identical_query
    expected_status: 200
    observed_status: 200
@@ -24,10 +28,9 @@
  PASS            representation.revalidation
    expected_status: 304
    observed_status: 304
- PASS            representation.content_location
+ NOT_SUPPORTED   representation.content_location
    fingerprint: sha256:753694fb60975885eb5d75c976162fd0e27f4ab3b535ecf0e300a084a8a47411
    etag: "ayder-query-sha256-753694fb60975885eb5d75c976162fd0e27f4ab3b535ecf0e300a084a8a47411"
-   content_location: /broker/query-results/sha256:753694fb60975885eb5d75c976162fd0e27f4ab3b535ecf0e300a084a8a47411
  PASS            core.unsupported_content_type
    expected_status: 415
    observed_status: 415

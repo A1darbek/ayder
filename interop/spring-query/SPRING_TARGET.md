@@ -100,14 +100,26 @@ Verify:
 - `ETag` captured
 - exact `ETag` reused through `If-None-Match`
 - `304` handled without deserializing a normal body
+- rate-limit headers captured and forwarded unchanged
 - `415` exposed correctly
 - equivalent JSON receives the same Ayder fingerprint
+
+Ayder does not currently advertise `Content-Location`, because there is no
+retrievable authenticated result resource. Spring should record:
+
+```json
+{
+  "id": "spring.forwarding.content_location_preserved",
+  "result": "NOT_APPLICABLE",
+  "reason": "Ayder did not provide an upstream Content-Location header to preserve"
+}
+```
 
 Suggested receipt rows:
 
 - `representation.etag`
 - `representation.revalidation`
-- `representation.content_location`
+- `spring.forwarding.content_location_preserved`
 - `semantic.equivalent_json`
 - `transport.direct_envoy_equivalence`
 
@@ -123,7 +135,7 @@ Spring should output the same row IDs where applicable:
 - `cors.preflight`
 - `representation.etag`
 - `representation.revalidation`
-- `representation.content_location`
+- `spring.forwarding.content_location_preserved`
 - `semantic.equivalent_json`
 
 Use the same statuses:

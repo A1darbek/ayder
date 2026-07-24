@@ -7,6 +7,7 @@
     "core.missing_content_type",
     "core.query_body_reaches_handler",
     "core.post_compatibility_fallback",
+    "ayder.rate_limit_headers_sane",
     "representation.first_bounded_query",
     "representation.repeat_identical_query",
     "representation.equivalent_json",

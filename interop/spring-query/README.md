@@ -12,11 +12,12 @@ Ayder direct
   -> comparable receipts
 ```
 
-The proof answers four questions:
+The proof answers five questions:
 
 - Does native `QUERY` with a JSON body reach the application?
 - Do transport, security, firewall, and CORS layers recognize `QUERY`?
-- Are `ETag`, `Content-Location`, `Accept-Query`, and `304` preserved?
+- Are `ETag`, `Accept-Query`, `304`, and rate-limit headers preserved?
+- Is absent `Content-Location` reported honestly until a retrievable result resource exists?
 - Does `QUERY` remain read-only and avoid cache-identity collisions?
 
 ## One Command
@@ -52,6 +53,11 @@ interop/spring-query/receipts/ayder-envoy/example-receipt.txt
 
 Fresh runs overwrite `receipt.json` and `receipt.txt`; those generated files are
 ignored by Git.
+
+Each generated receipt is checked by `scripts/validate-receipt.py`. The
+validator rejects missing or duplicate required rows, unknown statuses, any
+`FAIL`, and evidence-free `PASS` results for fingerprints, ETags, safety
+counters, direct/Envoy equivalence, and rate-limit headers.
 
 The host port for direct Ayder is `1119` to avoid colliding with the normal
 repository demo service on `1109`. Inside Docker, Ayder still listens on `1109`.
@@ -95,6 +101,13 @@ It separates:
 
 Until a cache layer reports origin request counts, hit/miss evidence, and no
 cross-body collision, the cache proof rows stay `UNVERIFIED`.
+
+## Rate-Limit Evidence
+
+The Docker harness enables Ayder's bearer-token rate limiter. Direct and Envoy
+receipts therefore require `ayder.rate_limit_headers_sane = PASS` with numeric
+`X-RateLimit-Limit`, `X-RateLimit-Remaining`, and `X-RateLimit-Reset` evidence.
+Missing headers are a failure in this environment.
 
 ## Spring Handoff
 

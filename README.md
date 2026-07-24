@@ -116,7 +116,8 @@ receipts:
 
 It generates side-by-side Ayder-direct and Ayder-through-Envoy receipts under
 `interop/spring-query/receipts/`, plus a Spring-side matching contract for
-design partners.
+design partners. The harness records enabled rate-limit headers and validates
+every receipt against missing, duplicate, failed, or evidence-free rows.
 
 ## Correctness Evidence
 

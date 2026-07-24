@@ -46,6 +46,9 @@ MATRIX_TOPIC="$MATRIX_TOPIC" \
 MATRIX_GROUP="$MATRIX_GROUP" \
 "${SCRIPT_DIR}/run-direct.sh"
 
+python3 "${SCRIPT_DIR}/validate-receipt.py" \
+  "${INTEROP_DIR}/receipts/ayder-direct/receipt.json"
+
 printf '[%s] restarting clean stack for Envoy matrix\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 compose down -v --remove-orphans
 compose up -d --build
@@ -60,6 +63,9 @@ MATRIX_TOPIC="$MATRIX_TOPIC" \
 MATRIX_GROUP="$MATRIX_GROUP" \
 DIRECT_RECEIPT="${INTEROP_DIR}/receipts/ayder-direct/receipt.json" \
 "${SCRIPT_DIR}/run-envoy.sh"
+
+python3 "${SCRIPT_DIR}/validate-receipt.py" \
+  "${INTEROP_DIR}/receipts/ayder-envoy/receipt.json"
 
 printf '\nReceipts written:\n'
 printf '  %s\n' "${INTEROP_DIR}/receipts/ayder-direct/receipt.json"

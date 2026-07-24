@@ -27,6 +27,13 @@
       "result": "PASS"
     },
     {
+      "id": "ayder.rate_limit_headers_sane",
+      "limit": 5000,
+      "remaining": 4999,
+      "reset": 1800000000,
+      "result": "PASS"
+    },
+    {
       "expected_status": 200,
       "first_etag": "\"ayder-query-sha256-753694fb60975885eb5d75c976162fd0e27f4ab3b535ecf0e300a084a8a47411\"",
       "first_fingerprint": "sha256:753694fb60975885eb5d75c976162fd0e27f4ab3b535ecf0e300a084a8a47411",
@@ -39,22 +46,30 @@
     {
       "detail": "Object key order and whitespace changed; array order preserved.",
       "equivalent_fingerprint": "sha256:753694fb60975885eb5d75c976162fd0e27f4ab3b535ecf0e300a084a8a47411",
+      "equivalent_rows": 2,
+      "equivalent_status": 200,
       "first_fingerprint": "sha256:753694fb60975885eb5d75c976162fd0e27f4ab3b535ecf0e300a084a8a47411",
+      "first_rows": 2,
+      "first_status": 200,
       "id": "representation.equivalent_json",
       "result": "PASS"
     },
     {
+      "does_not_prove": "validator invalidation after the selected representation changes",
       "expected_status": 304,
       "id": "representation.revalidation",
       "observed_status": 304,
-      "result": "PASS"
+      "result": "PASS",
+      "scope": "unchanged selected representation",
+      "tracked_issue": "https://github.com/A1darbek/ayder/issues/13"
     },
     {
-      "content_location": "/broker/query-results/sha256:753694fb60975885eb5d75c976162fd0e27f4ab3b535ecf0e300a084a8a47411",
+      "design_issue": "https://github.com/A1darbek/ayder/issues/11",
       "etag": "\"ayder-query-sha256-753694fb60975885eb5d75c976162fd0e27f4ab3b535ecf0e300a084a8a47411\"",
       "fingerprint": "sha256:753694fb60975885eb5d75c976162fd0e27f4ab3b535ecf0e300a084a8a47411",
       "id": "representation.content_location",
-      "result": "PASS"
+      "reason": "Ayder does not advertise Content-Location until a retrievable authenticated result resource exists",
+      "result": "NOT_SUPPORTED"
     },
     {
       "expected_status": 415,
@@ -84,7 +99,7 @@
       "result": "PASS"
     },
     {
-      "broker_state_mutated": true,
+      "broker_state_mutated": false,
       "high_watermark_after": 3,
       "high_watermark_before": 3,
       "id": "safety.broker_state",
@@ -142,7 +157,7 @@
   "summary": {
     "fail": 0,
     "not_applicable": 0,
-    "not_supported": 0,
+    "not_supported": 1,
     "observed": 2,
     "pass": 15,
     "unverified": 2

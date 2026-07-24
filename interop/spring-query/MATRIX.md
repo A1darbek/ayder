@@ -37,6 +37,7 @@ Allowed row statuses:
 | `core.query_body_reaches_handler` | Did the JSON body reach the query handler? | Two matching rows and a fingerprint |
 | `core.post_compatibility_fallback` | Does legacy `POST /broker/query` still work? | Record separately |
 | `cors.allow_methods_mentions_query` | Does the response CORS method list mention `QUERY`? | `PASS` if present |
+| `ayder.rate_limit_headers_sane` | Did the enabled limiter emit sane `X-RateLimit-Limit`, `X-RateLimit-Remaining`, and `X-RateLimit-Reset` values? | Positive limit/reset and `0 <= remaining <= limit` |
 
 ## Representation Identity
 
@@ -45,8 +46,8 @@ Allowed row statuses:
 | `representation.first_bounded_query` | First bounded `0..3` query | `200`, two matching rows |
 | `representation.repeat_identical_query` | Repeat identical body | Same fingerprint and `ETag` |
 | `representation.equivalent_json` | Reordered object keys and whitespace | Same Ayder fingerprint |
-| `representation.revalidation` | `If-None-Match` with observed `ETag` | `304` |
-| `representation.content_location` | Stable HTTP-addressable result identity | Present |
+| `representation.revalidation` | Does exact `If-None-Match` produce `304` while the selected representation has not changed? | `304` |
+| `representation.content_location` | Is a retrievable authenticated result resource advertised? | `NOT_SUPPORTED` until that resource exists |
 | `representation.expanded_query` | Expanded range `0..5` | Different fingerprint/result |
 
 ## Safety Invariants
