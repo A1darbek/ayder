@@ -104,6 +104,21 @@ The `demos/` directory contains smaller scenario-specific receipts:
 
 See [demos/README.md](demos/README.md).
 
+## RFC 10008 QUERY Interop
+
+The Spring/Envoy interop package checks whether HTTP `QUERY` with JSON request
+content survives real transport boundaries and still produces safe recovery
+receipts:
+
+```bash
+./interop/spring-query/scripts/run-all.sh
+```
+
+It generates side-by-side Ayder-direct and Ayder-through-Envoy receipts under
+`interop/spring-query/receipts/`, plus a Spring-side matching contract for
+design partners. The harness records enabled rate-limit headers and validates
+every receipt against missing, duplicate, failed, or evidence-free rows.
+
 ## Correctness Evidence
 
 ### Broker-Level Jepsen Evidence

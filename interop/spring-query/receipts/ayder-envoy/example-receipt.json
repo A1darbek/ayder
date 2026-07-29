@@ -1,0 +1,183 @@
+{
+  "base_url": "http://127.0.0.1:18080",
+  "generated_at": "SANITIZED_EXAMPLE",
+  "implementation_commit": "SANITIZED_EXAMPLE_COMMIT",
+  "rows": [
+    {
+      "expected_status": 200,
+      "id": "core.native_query",
+      "observed_status": 200,
+      "result": "PASS"
+    },
+    {
+      "accept_query": "application/json",
+      "id": "core.accept_query_header",
+      "result": "PASS"
+    },
+    {
+      "fingerprint": "sha256:753694fb60975885eb5d75c976162fd0e27f4ab3b535ecf0e300a084a8a47411",
+      "id": "core.query_body_reaches_handler",
+      "matched_rows": 2,
+      "result": "PASS"
+    },
+    {
+      "access_control_allow_methods": "GET, POST, PUT, DELETE, QUERY, OPTIONS",
+      "detail": "Ayder response CORS header advertises QUERY; Spring must still prove OPTIONS preflight separately.",
+      "id": "cors.allow_methods_mentions_query",
+      "result": "PASS"
+    },
+    {
+      "id": "ayder.rate_limit_headers_sane",
+      "limit": 5000,
+      "remaining": 4999,
+      "reset": 1800000000,
+      "result": "PASS"
+    },
+    {
+      "expected_status": 200,
+      "first_etag": "\"ayder-query-sha256-753694fb60975885eb5d75c976162fd0e27f4ab3b535ecf0e300a084a8a47411\"",
+      "first_fingerprint": "sha256:753694fb60975885eb5d75c976162fd0e27f4ab3b535ecf0e300a084a8a47411",
+      "id": "representation.repeat_identical_query",
+      "observed_status": 200,
+      "repeat_etag": "\"ayder-query-sha256-753694fb60975885eb5d75c976162fd0e27f4ab3b535ecf0e300a084a8a47411\"",
+      "repeat_fingerprint": "sha256:753694fb60975885eb5d75c976162fd0e27f4ab3b535ecf0e300a084a8a47411",
+      "result": "PASS"
+    },
+    {
+      "detail": "Object key order and whitespace changed; array order preserved.",
+      "equivalent_fingerprint": "sha256:753694fb60975885eb5d75c976162fd0e27f4ab3b535ecf0e300a084a8a47411",
+      "equivalent_rows": 2,
+      "equivalent_status": 200,
+      "first_fingerprint": "sha256:753694fb60975885eb5d75c976162fd0e27f4ab3b535ecf0e300a084a8a47411",
+      "first_rows": 2,
+      "first_status": 200,
+      "id": "representation.equivalent_json",
+      "result": "PASS"
+    },
+    {
+      "does_not_prove": "validator invalidation after the selected representation changes",
+      "expected_status": 304,
+      "id": "representation.revalidation",
+      "observed_status": 304,
+      "result": "PASS",
+      "scope": "unchanged selected representation",
+      "tracked_issue": "https://github.com/A1darbek/ayder/issues/13"
+    },
+    {
+      "design_issue": "https://github.com/A1darbek/ayder/issues/11",
+      "etag": "\"ayder-query-sha256-753694fb60975885eb5d75c976162fd0e27f4ab3b535ecf0e300a084a8a47411\"",
+      "fingerprint": "sha256:753694fb60975885eb5d75c976162fd0e27f4ab3b535ecf0e300a084a8a47411",
+      "id": "representation.content_location",
+      "reason": "Ayder does not advertise Content-Location until a retrievable authenticated result resource exists",
+      "result": "NOT_SUPPORTED"
+    },
+    {
+      "expected_status": 415,
+      "id": "core.unsupported_content_type",
+      "observed_status": 415,
+      "result": "PASS"
+    },
+    {
+      "detail": "Recorded actual Ayder behavior when QUERY has a body but no Content-Type.",
+      "id": "core.missing_content_type",
+      "observed_status": 415,
+      "result": "OBSERVED"
+    },
+    {
+      "detail": "Legacy POST /broker/query remains recorded separately from native QUERY.",
+      "id": "core.post_compatibility_fallback",
+      "observed_status": 200,
+      "result": "OBSERVED"
+    },
+    {
+      "etag": "\"ayder-query-sha256-753694fb60975885eb5d75c976162fd0e27f4ab3b535ecf0e300a084a8a47411\"",
+      "expected_status": 200,
+      "fingerprint": "sha256:753694fb60975885eb5d75c976162fd0e27f4ab3b535ecf0e300a084a8a47411",
+      "id": "representation.first_bounded_query",
+      "matched_rows": 2,
+      "observed_status": 200,
+      "result": "PASS"
+    },
+    {
+      "broker_state_mutated": false,
+      "high_watermark_after": 3,
+      "high_watermark_before": 3,
+      "id": "safety.broker_state",
+      "idempotency_records_after": 0,
+      "idempotency_records_before": 0,
+      "message_count_after": 3,
+      "message_count_before": 3,
+      "result": "PASS"
+    },
+    {
+      "after": 0,
+      "before": 0,
+      "committed_offset_advanced": false,
+      "id": "safety.committed_offset",
+      "result": "PASS"
+    },
+    {
+      "detail": "Bounded sealed range 0..3 remains stable after new events are appended.",
+      "id": "safety.bounded_after_append",
+      "matched_rows": 2,
+      "messages_matched": 2,
+      "messages_scanned": 3,
+      "observed_status": 200,
+      "result": "PASS"
+    },
+    {
+      "bounded_fingerprint": "sha256:753694fb60975885eb5d75c976162fd0e27f4ab3b535ecf0e300a084a8a47411",
+      "expanded_fingerprint": "sha256:8d91dd29ce161a6562ce8f2ca911931f4a65b14f4aa3d9de8d0c1aa83ee87419",
+      "id": "representation.expanded_query",
+      "matched_rows": 4,
+      "observed_status": 200,
+      "result": "PASS"
+    },
+    {
+      "detail": "Expanded range 0..5 sees the two newly appended matching events.",
+      "id": "safety.expanded_after_append",
+      "matched_rows": 4,
+      "result": "PASS"
+    },
+    {
+      "body_a_rows": 2,
+      "body_b_rows": 4,
+      "detail": "A/B/A bodies returned distinct correct results, but no cache hit/miss or cache key evidence is measured yet.",
+      "id": "cache.collision_test",
+      "observed_status": 200,
+      "result": "UNVERIFIED"
+    },
+    {
+      "detail": "Forwarding and revalidation are verified separately. Body-aware cache compatibility requires origin request count and cache hit/miss evidence.",
+      "id": "cache.forwarded_not_cache_proof",
+      "result": "UNVERIFIED"
+    },
+    {
+      "direct": {
+        "etag": "\"ayder-query-sha256-753694fb60975885eb5d75c976162fd0e27f4ab3b535ecf0e300a084a8a47411\"",
+        "fingerprint": "sha256:753694fb60975885eb5d75c976162fd0e27f4ab3b535ecf0e300a084a8a47411",
+        "status": 200
+      },
+      "direct_fingerprint": "sha256:753694fb60975885eb5d75c976162fd0e27f4ab3b535ecf0e300a084a8a47411",
+      "id": "transport.direct_envoy_equivalence",
+      "result": "PASS",
+      "through_envoy": {
+        "etag": "\"ayder-query-sha256-753694fb60975885eb5d75c976162fd0e27f4ab3b535ecf0e300a084a8a47411\"",
+        "fingerprint": "sha256:753694fb60975885eb5d75c976162fd0e27f4ab3b535ecf0e300a084a8a47411",
+        "status": 200
+      },
+      "through_envoy_fingerprint": "sha256:753694fb60975885eb5d75c976162fd0e27f4ab3b535ecf0e300a084a8a47411",
+      "transport_equivalence": "PASS"
+    }
+  ],
+  "schema_version": "0.1",
+  "summary": {
+    "fail": 0,
+    "not_applicable": 0,
+    "not_supported": 1,
+    "observed": 2,
+    "pass": 16,
+    "unverified": 2
+  },
+  "target": "ayder-envoy"
+}

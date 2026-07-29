@@ -1,0 +1,67 @@
+============================================================
+ AYDER RFC 10008 QUERY INTEROP RECEIPT
+============================================================
+ target       : ayder-envoy
+ generated_at : SANITIZED_EXAMPLE
+ commit       : SANITIZED_EXAMPLE_COMMIT
+ base_url     : http://127.0.0.1:18080
+------------------------------------------------------------
+ summary      : PASS=16 FAIL=0 OBSERVED=2 UNVERIFIED=2 NOT_SUPPORTED=1 NOT_APPLICABLE=0
+------------------------------------------------------------
+ PASS            core.native_query
+   expected_status: 200
+   observed_status: 200
+ PASS            core.accept_query_header
+ PASS            core.query_body_reaches_handler
+   fingerprint: sha256:753694fb60975885eb5d75c976162fd0e27f4ab3b535ecf0e300a084a8a47411
+ PASS            cors.allow_methods_mentions_query
+   detail: Ayder response CORS header advertises QUERY; Spring must still prove OPTIONS preflight separately.
+ PASS            ayder.rate_limit_headers_sane
+   limit: 5000
+   remaining: 4999
+   reset: 1800000000
+ PASS            representation.repeat_identical_query
+   expected_status: 200
+   observed_status: 200
+ PASS            representation.equivalent_json
+   detail: Object key order and whitespace changed; array order preserved.
+ PASS            representation.revalidation
+   expected_status: 304
+   observed_status: 304
+ NOT_SUPPORTED   representation.content_location
+   fingerprint: sha256:753694fb60975885eb5d75c976162fd0e27f4ab3b535ecf0e300a084a8a47411
+   etag: "ayder-query-sha256-753694fb60975885eb5d75c976162fd0e27f4ab3b535ecf0e300a084a8a47411"
+ PASS            core.unsupported_content_type
+   expected_status: 415
+   observed_status: 415
+ OBSERVED        core.missing_content_type
+   detail: Recorded actual Ayder behavior when QUERY has a body but no Content-Type.
+   observed_status: 415
+ OBSERVED        core.post_compatibility_fallback
+   detail: Legacy POST /broker/query remains recorded separately from native QUERY.
+   observed_status: 200
+ PASS            representation.first_bounded_query
+   expected_status: 200
+   observed_status: 200
+   fingerprint: sha256:753694fb60975885eb5d75c976162fd0e27f4ab3b535ecf0e300a084a8a47411
+   etag: "ayder-query-sha256-753694fb60975885eb5d75c976162fd0e27f4ab3b535ecf0e300a084a8a47411"
+ PASS            safety.broker_state
+ PASS            safety.committed_offset
+   before: 0
+   after: 0
+ PASS            safety.bounded_after_append
+   detail: Bounded sealed range 0..3 remains stable after new events are appended.
+   observed_status: 200
+ PASS            representation.expanded_query
+   observed_status: 200
+ PASS            safety.expanded_after_append
+   detail: Expanded range 0..5 sees the two newly appended matching events.
+ UNVERIFIED      cache.collision_test
+   detail: A/B/A bodies returned distinct correct results, but no cache hit/miss or cache key evidence is measured yet.
+   observed_status: 200
+ UNVERIFIED      cache.forwarded_not_cache_proof
+   detail: Forwarding and revalidation are verified separately. Body-aware cache compatibility requires origin request count and cache hit/miss evidence.
+ PASS            transport.direct_envoy_equivalence
+   direct_fingerprint: sha256:753694fb60975885eb5d75c976162fd0e27f4ab3b535ecf0e300a084a8a47411
+   through_envoy_fingerprint: sha256:753694fb60975885eb5d75c976162fd0e27f4ab3b535ecf0e300a084a8a47411
+============================================================

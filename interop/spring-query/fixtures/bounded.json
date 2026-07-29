@@ -1,0 +1,37 @@
+{
+  "source": {
+    "topic": "payment-recovery",
+    "partition": 0,
+    "from_offset": 0,
+    "to_offset": 3,
+    "limit": 10,
+    "sealed_only": true
+  },
+  "filter": [
+    {
+      "field": "provider_commitment",
+      "op": "eq",
+      "value": "UNKNOWN"
+    },
+    {
+      "field": "safe_to_close",
+      "op": "eq",
+      "value": false
+    }
+  ],
+  "include": {
+    "metadata": true,
+    "commit_status_for_group": "payment-worker"
+  },
+  "transform": {
+    "left_fields": [
+      "event_id",
+      "payment_id",
+      "provider_order_id",
+      "provider_commitment",
+      "safe_to_close",
+      "manual_reconciliation_required"
+    ]
+  },
+  "explain": true
+}
