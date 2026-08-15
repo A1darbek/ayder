@@ -210,12 +210,14 @@ need curl
 need jq
 need mktemp
 need base64
+need realpath
 
 if [[ "$START_SERVER" == "1" ]]; then
   if [[ ! -x "$SERVER_BIN" ]]; then
     printf 'FAIL start_server                       binary not executable: %s\n' "$SERVER_BIN"
     exit 1
   fi
+  SERVER_BIN="$(realpath -e -- "$SERVER_BIN")"
   SERVER_TMP="$(mktemp -d)"
   (
     cd "$SERVER_TMP" || exit 1
