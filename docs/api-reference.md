@@ -6,7 +6,8 @@ Base URL examples use:
 
 ```bash
 BASE='http://127.0.0.1:1109'
-AUTH='Authorization: Bearer dev'
+AYDER_TOKEN="$(openssl rand -hex 24)"
+AUTH="Authorization: Bearer ${AYDER_TOKEN}"
 ```
 
 ## Authentication
@@ -15,8 +16,10 @@ Public endpoints:
 
 - `GET /health`
 - `GET /ready`
-- `GET /metrics`
-- `GET /metrics_ha`
+
+`GET /metrics` and `GET /metrics_ha` require the same bearer authentication by
+default. `RF_METRICS_PUBLIC=1` is an explicit opt-in for an already isolated
+operations network.
 
 All other endpoints require:
 
@@ -27,7 +30,7 @@ Authorization: Bearer <token>
 Tokens are configured with `RF_BEARER_TOKENS`:
 
 ```bash
-RF_BEARER_TOKENS='dev@5000:5000:1000000' ./ayder --port 1109
+RF_BEARER_TOKENS="${AYDER_TOKEN}@5000:5000:1000000" ./ayder --port 1109
 ```
 
 The token format is:
@@ -36,7 +39,8 @@ The token format is:
 token@rps:burst:daily
 ```
 
-For local demos, `dev` is the conventional token.
+Use a newly generated token for each local environment and a secret manager for
+shared or production-like environments.
 
 ## Response Conventions
 
@@ -60,6 +64,21 @@ Write paths can return `503` when:
 - the node is a follower without a usable redirect: `read_only_follower`
 
 In HA mode, follower writes can return a redirect body with `leader_url`.
+
+Mutation receipts separate durability properties:
+
+| Field | Meaning |
+|---|---|
+| `durability_scope` | `memory`, `local`, or `quorum` for this response |
+| `local_fsync` | the local persistence barrier completed |
+| `applied_all_workers` | every worker in this node applied the mutation |
+| `quorum_committed` | a voting majority durably stored/committed the Raft entry |
+| `failover_safe` | the checked failover property completed |
+| `raft_index` | associated Raft index, or 0 outside HA |
+
+Legacy `durable` and `synced` fields on non-idempotent broker responses are
+aliases for local fsync, not quorum proof. A failover-sensitive caller must
+check every explicit quorum field.
 
 ## Endpoint Index
 
@@ -110,13 +129,17 @@ Returns whether persistence is ready for writes:
 {"ready":true}
 ```
 
+HTTP status is `200` only when `ready` is true. A false readiness state returns
+`503` with `{"ready":false}`. Probes must check both the status and body.
+
 ### `GET /metrics`
 
-Returns Prometheus text metrics.
+Returns Prometheus text metrics. Bearer authentication is required unless
+`RF_METRICS_PUBLIC=1` is set.
 
 ### `GET /metrics_ha`
 
-Returns HA-specific Prometheus text metrics.
+Returns HA-specific Prometheus text metrics under the same exposure policy.
 
 ## Admin
 
@@ -138,7 +161,9 @@ Returns the last sealed batch known to be synced:
 {"ok":true,"last_synced_batch_id":12}
 ```
 
-Use this to verify a produced `batch_id` reached the sync watermark.
+This status is worker-local. It can help diagnose a request pinned to one worker,
+but a load-balanced poll is not durable proof because batch IDs and watermarks are
+not process-global.
 
 ### `POST /admin/sealed/release`
 
@@ -152,6 +177,11 @@ Response:
 
 ### `POST /admin/sealed/gc`
 
+Online sealed-log GC is disabled in Revenue Readiness v1 because safe
+cross-process inode coordination is not yet implemented. The endpoint returns
+an error; operators must not automate it until the production-readiness gate is
+updated.
+
 Request body:
 
 ```json
@@ -161,13 +191,23 @@ Request body:
 }
 ```
 
-Response:
+Response (`503 Service Unavailable`):
 
 ```json
-{"ok":true,"sealed_bytes_after":0}
+{
+  "ok": false,
+  "error": "sealed_gc_unavailable",
+  "message": "Online sealed GC is disabled pending safe cross-process coordination"
+}
 ```
 
 ## Broker
+
+> **Revenue Readiness v1 boundary:** the original load-balanced visibility bug
+> is fixed with process-shared topic publication and all-worker record
+> application. Focused regression observed 400/400 responses, rejected an
+> injected apply failure, and repaired all workers on restart. Full fault and
+> performance evidence is still required before production use.
 
 ### `POST /broker/topics`
 
@@ -202,7 +242,7 @@ Query parameters:
 | `partition` | recommended | Target partition. If omitted, Ayder may choose default routing. |
 | `key` | no | Optional message key. URL-decoded. |
 | `idempotency_key` | no | Deduplicates repeated produce attempts. URL-decoded. |
-| `timeout_ms` | no | Wait up to this many milliseconds for sealed sync. |
+| `timeout_ms` | no | Wait up to this many milliseconds for sealed sync. Required when the caller needs `durable:true`. |
 | `timing=1` | no | Include server timing fields for non-idempotent produce. |
 
 Request body is the raw message bytes. It can be JSON, text, or binary.
@@ -225,6 +265,12 @@ Non-idempotent response:
   "partition": 0,
   "batch_id": 1,
   "sealed": true,
+  "raft_index": 0,
+  "durability_scope": "local",
+  "local_fsync": true,
+  "quorum_committed": false,
+  "failover_safe": false,
+  "applied_all_workers": true,
   "durable": true,
   "mode": "sealed",
   "synced": true
@@ -239,8 +285,12 @@ Idempotent first-write response:
   "offset": 0,
   "partition": 0,
   "batch_id": 1,
-  "sealed": true,
-  "synced": true,
+  "raft_index": 0,
+  "durability_scope": "local",
+  "local_fsync": true,
+  "quorum_committed": false,
+  "failover_safe": false,
+  "applied_all_workers": true,
   "duplicate": false
 }
 ```
@@ -252,14 +302,32 @@ Idempotent duplicate response:
   "ok": true,
   "offset": 0,
   "partition": 0,
-  "sealed": true,
-  "synced": null,
+  "batch_id": 1,
+  "raft_index": 0,
+  "durability_scope": "local",
+  "local_fsync": true,
+  "quorum_committed": false,
+  "failover_safe": false,
+  "applied_all_workers": true,
   "duplicate": true
 }
 ```
 
 Operational note: `idempotency_key` deduplicates the broker write. It does not
 replace application-level idempotency for external side effects.
+
+The idempotency index uses a process-shared serialized, SHA-256 payload-bound
+`PENDING`/`COMMITTED` state. Concurrent reuse of one key with the same payload
+resolves to one offset; reuse with another payload returns
+`idempotency_conflict`. An uncertain final state is resolved from its durable
+record before another append. This deduplicates broker writes only; callers
+must still reconcile external side effects.
+
+`ok:true` without a positive sync wait means accepted, not fsync-confirmed, and
+returns `durable:false` with `synced:null`. `durable:true` is emitted only with
+`synced:true`. If an explicit wait expires, Ayder returns HTTP `503` with
+`error:"sync_timeout"`; the append may have been accepted and must be
+reconciled by its idempotency key or durable inspection before retrying.
 
 ### `POST /broker/topics/:topic/produce-ndjson`
 
@@ -271,7 +339,7 @@ Query parameters:
 |---|---:|---|
 | `partition` | recommended | Target partition. |
 | `idempotency_key` | no | Deduplicates the whole batch. |
-| `timeout_ms` | no | Wait for sealed sync. |
+| `timeout_ms` | no | Wait for sealed sync; required when the caller needs `durable:true`. |
 
 Input rules:
 
@@ -290,6 +358,12 @@ Response:
   "partition": 0,
   "batch_id": 2,
   "sealed": true,
+  "raft_index": 0,
+  "durability_scope": "local",
+  "local_fsync": true,
+  "quorum_committed": false,
+  "failover_safe": false,
+  "applied_all_workers": true,
   "durable": true,
   "mode": "sealed",
   "synced": true
@@ -335,6 +409,9 @@ truncated to fit internal response buffers. Prefer `encoding=b64`.
 
 Commits a consumer offset.
 
+Optional query parameter `timeout_ms` waits for the local sealed sync. Without
+it, a successful response is accepted but not fsync-confirmed.
+
 Request:
 
 ```json
@@ -349,8 +426,20 @@ Request:
 Response:
 
 ```json
-{"ok":true}
+{
+  "ok": true,
+  "durability_scope": "local",
+  "local_fsync": true,
+  "quorum_committed": false,
+  "failover_safe": false,
+  "applied_all_workers": true,
+  "batch_id": 3,
+  "raft_index": 0
+}
 ```
+
+As with produce, an explicitly requested sync that misses its deadline returns
+HTTP `503` and is an ambiguous accepted-but-unconfirmed operation.
 
 Commit discipline for recovery-sensitive paths:
 
@@ -368,6 +457,10 @@ them, optionally emits projected rows, and counts aggregates.
 
 RFC 10008-style query endpoint. This is the preferred HTTP-native shape for
 safe, idempotent read-only queries with request content.
+
+QUERY is read-only. The fixed cross-worker visibility regression returns a
+consistent local record set across workers; HA callers must still use the
+linearizable leader/read-index path required by their topology.
 
 Requirements:
 
@@ -610,6 +703,11 @@ Here `ns=app` and `key=customer/123`.
 
 Puts a binary value.
 
+KV put/delete use a checked transaction path: validate/CAS, persist and (in HA)
+obtain the requested quorum receipt before publishing shared state. A failed
+response does not publish the candidate value. A transport timeout can still be
+indeterminate to the caller and must be reconciled before blind retry.
+
 Query parameters:
 
 | Name | Description |
@@ -624,11 +722,13 @@ Response:
 {
   "ok": true,
   "cas": 1,
-  "sealed": true,
-  "durable": true,
-  "mode": "sealed",
-  "synced": true,
-  "batch_id": 3
+  "durability_scope": "local",
+  "local_fsync": true,
+  "quorum_committed": false,
+  "failover_safe": false,
+  "applied_all_workers": true,
+  "batch_id": 3,
+  "raft_index": 0
 }
 ```
 
@@ -669,6 +769,10 @@ Returns CAS and remaining TTL:
 
 Deletes a value by writing a tombstone.
 
+As with KV put, a later append/replication failure can follow a shared-state
+mutation. Treat the failure as an ambiguous partial effect and reconcile before
+retrying.
+
 Query parameters:
 
 | Name | Description |
@@ -682,11 +786,14 @@ Response:
 {
   "ok": true,
   "deleted": true,
-  "sealed": true,
-  "durable": true,
-  "mode": "sealed",
-  "synced": true,
-  "batch_id": 4
+  "cas": 2,
+  "durability_scope": "local",
+  "local_fsync": true,
+  "quorum_committed": false,
+  "failover_safe": false,
+  "applied_all_workers": true,
+  "batch_id": 4,
+  "raft_index": 0
 }
 ```
 

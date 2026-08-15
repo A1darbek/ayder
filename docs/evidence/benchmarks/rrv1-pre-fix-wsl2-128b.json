@@ -1,0 +1,81 @@
+{
+  "classification": "rejected_as_publishable_durability_evidence",
+  "reason": "The measured commit predates the sealed-watermark ordering and partial-write fixes. A synced=true response could therefore be a false durability acknowledgement under concurrency.",
+  "platform_label": "ARM64 WSL2 development benchmark",
+  "timestamp_utc": "2026-08-08T19:10:36Z",
+  "server_git_sha": "6374c514b01d00562e147ee19f4d41468c5fdb2b",
+  "server_source": "clean git archive of server_git_sha",
+  "host": {
+    "kernel": "Linux 6.6.87.2-microsoft-standard-WSL2 aarch64",
+    "cpu": "Qualcomm Oryon, 8 cores",
+    "ram_gib": 23,
+    "storage": "WSL2 Virtual Disk, ext4, /dev/sdd",
+    "compiler": "gcc 15.2.0",
+    "glibc": "2.42",
+    "io_uring_disabled": 0,
+    "perf": "6.12.25; perf_event_paranoid=2"
+  },
+  "workload": {
+    "path": "POST /broker/topics/<topic>/produce?partition=0&timeout_ms=5000",
+    "payload_bytes": 128,
+    "threads": 4,
+    "connections_10k": 128,
+    "connections_25k": 192,
+    "connections_50k": 256,
+    "warmup_seconds": 15,
+    "trial_seconds": 20,
+    "trials": 3,
+    "response_validator": "every counted response contained ok=true,durable=true,synced=true",
+    "rate_limits": "disabled",
+    "authentication": "enabled; token value redacted",
+    "topology": "single node; server CPUs 0-3; colocated client CPUs 4-7",
+    "fsync": "default 10 ms sealed-log group commit; response requested a 5000 ms sync wait"
+  },
+  "client": {
+    "repository": "https://github.com/AmpereTravis/wrk2-aarch64",
+    "source_commit": "59c09ad4442329ade4343e1ade683c4d12b0b370",
+    "binary_sha256": "9cec48c4b76c8a60891673224577be56d95aa3467bcc81891e0854e098ce3b9c",
+    "local_changes": "ARM64 getopt type fix and external wrk.lua loader; now captured reproducibly by bench/wrk2-aarch64.patch"
+  },
+  "cases": [
+    {
+      "offered_rps": 10000,
+      "achieved_rps_median": 9963.45,
+      "achieved_rps_pstdev": 0.1973716179,
+      "p50_ms_median": 1.281,
+      "p95_ms_median": 2.353,
+      "p99_ms_median": 2.781,
+      "p99_9_ms_median": 3.241,
+      "max_ms_median": 4.152,
+      "trial_request_counts": [199279, 199278, 199276],
+      "invalid_responses": 0,
+      "http_or_socket_errors": 0
+    },
+    {
+      "offered_rps": 25000,
+      "achieved_rps_median": 15215.16,
+      "achieved_rps_pstdev": 44.7158304059,
+      "p50_ms_median": 5636.095,
+      "p95_ms_median": 8372.223,
+      "p99_ms_median": 8896.511,
+      "p99_9_ms_median": 9093.119,
+      "max_ms_median": 9666.56,
+      "trial_request_counts": [304307, 304812, 302713],
+      "invalid_responses": 0,
+      "http_or_socket_errors": 0
+    },
+    {
+      "offered_rps": 50000,
+      "achieved_rps_median": 15197.8,
+      "achieved_rps_pstdev": 11.2381384382,
+      "p50_ms_median": 10354.687,
+      "p95_ms_median": 13484.031,
+      "p99_ms_median": 14163.967,
+      "p99_9_ms_median": 14360.575,
+      "max_ms_median": 14442.496,
+      "trial_request_counts": [303564, 303958, 304093],
+      "invalid_responses": 0,
+      "http_or_socket_errors": 0
+    }
+  ]
+}

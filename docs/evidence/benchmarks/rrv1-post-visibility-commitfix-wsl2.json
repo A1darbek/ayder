@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "platform_label": "ARM64 WSL2 development benchmark",
+  "filesystem": "/dev/sdd ext4",
+  "git_head": "6374c514b01d00562e147ee19f4d41468c5fdb2b",
+  "worktree_dirty": true,
+  "binary_sha256": "de14a5e1f46785785434d059dde9c4fc3b1b152eeafe36dd101151103c298008",
+  "wrk2_sha256": "b868e52fbd673e1ec0a2d06248ee2c957e518c05933e3109def13e081eb335a0",
+  "method": {
+    "threads": 4,
+    "connections": 128,
+    "warmup_seconds": 10,
+    "trial_seconds": 20,
+    "trials_per_case": 3,
+    "server_cpuset": "0-3",
+    "client_cpuset": "4-7",
+    "server_workers": 4,
+    "durability_contract": "HTTP 2xx, ok=true, durability_scope=local, local_fsync=true, applied_all_workers=true, quorum_committed=false, failover_safe=false",
+    "fsync_semantics": "10 ms group commit; response waits for completed local fsync and all local workers"
+  },
+  "cases": [
+    {"payload_bytes":128,"offered_rps":10000,"achieved_rps_median":380.26,"achieved_rps_pstdev":0.4148,"p50_ms":14442.495,"p95_ms":18694.143,"p99_ms":19103.743,"p99_9_ms":19316.735,"max_ms":19398.656,"clean":false},
+    {"payload_bytes":128,"offered_rps":25000,"achieved_rps_median":381.96,"achieved_rps_pstdev":1.4098,"p50_ms":14761.983,"p95_ms":19136.511,"p99_ms":19529.727,"p99_9_ms":19660.799,"max_ms":19677.184,"clean":false},
+    {"payload_bytes":128,"offered_rps":50000,"achieved_rps_median":380.47,"achieved_rps_pstdev":1.5435,"p50_ms":14901.247,"p95_ms":19283.967,"p99_ms":19677.183,"p99_9_ms":19775.487,"max_ms":19775.488,"clean":false},
+    {"payload_bytes":1024,"offered_rps":10000,"achieved_rps_median":369.01,"achieved_rps_pstdev":1.8004,"p50_ms":14442.495,"p95_ms":18710.527,"p99_ms":19120.127,"p99_9_ms":19333.119,"max_ms":19398.656,"clean":false},
+    {"payload_bytes":1024,"offered_rps":25000,"achieved_rps_median":359.67,"achieved_rps_pstdev":1.6302,"p50_ms":14802.943,"p95_ms":19152.895,"p99_ms":19546.111,"p99_9_ms":19644.415,"max_ms":19660.800,"clean":false},
+    {"payload_bytes":1024,"offered_rps":50000,"achieved_rps_median":352.39,"achieved_rps_pstdev":2.4249,"p50_ms":14909.439,"p95_ms":19300.351,"p99_ms":19693.567,"p99_9_ms":19775.487,"max_ms":19775.488,"clean":false},
+    {"payload_bytes":16384,"offered_rps":10000,"achieved_rps_median":308.76,"achieved_rps_pstdev":0.7785,"p50_ms":14540.799,"p95_ms":18825.215,"p99_ms":19234.815,"p99_9_ms":19480.575,"max_ms":19529.728,"clean":false},
+    {"payload_bytes":16384,"offered_rps":25000,"achieved_rps_median":309.37,"achieved_rps_pstdev":0.5745,"p50_ms":14802.943,"p95_ms":19185.663,"p99_ms":19578.879,"p99_9_ms":19693.567,"max_ms":19693.568,"clean":false},
+    {"payload_bytes":16384,"offered_rps":50000,"achieved_rps_median":307.53,"achieved_rps_pstdev":4.5411,"p50_ms":14925.823,"p95_ms":19300.351,"p99_ms":19693.567,"p99_9_ms":19791.871,"max_ms":19791.872,"clean":false}
+  ],
+  "validation": {
+    "received_successes": 188877,
+    "invalid_receipts": 0,
+    "http_4xx": 0,
+    "http_5xx": 0,
+    "client_timeouts": 3432,
+    "all_cases_clean": false
+  },
+  "raw_local_path": "bench/results/rrv1-post-visibility-commitfix-wsl2-20260816/matrix.json"
+}

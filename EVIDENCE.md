@@ -3,6 +3,14 @@
 Ayder separates broker-level correctness from application-level recovery
 evidence.
 
+> Revenue Readiness v1 status (2026-08-16): the published 45-run result below is
+> historical. Persistence, acknowledgement, HA, and concurrency behavior changed
+> materially on `hardening/revenue-readiness-v1`; the current-tree strict 45-run
+> campaign has not run and the branch is not release-ready. Current-tree short
+> kill, partition and mixed regressions passed with exact post-run convergence.
+> See
+> [`docs/REVENUE_READINESS_V1.md`](docs/REVENUE_READINESS_V1.md).
+
 ## 1. Broker Correctness
 
 The Jepsen suite under `tests/jepsen/` exercises the `broker-log` workload under
@@ -18,11 +26,18 @@ Published scoped result:
 Run:
 
 ```bash
-bash ./tests/demo/ha_broker_jepsen_gold.sh
+AYDER_JEPSEN_PROFILE=hn-ready STRICT_CLAIM=1 \
+  bash ./tests/demo/ha_broker_jepsen_gold.sh
 ```
 
 The claim is bounded by the published workload, checker, fault model, build, and
-configuration.
+configuration. It must not be described as evidence for later commits unless the
+same campaign is rerun against them. The current checker additionally requires
+`ok:true`, `durability_scope:"quorum"`, `local_fsync:true`,
+`quorum_committed:true`, `failover_safe:true`,
+`applied_all_workers:true`, a non-vacuous success floor, and exact cluster
+convergence. Those strengthened checks are not retroactive proof about the
+historical run.
 
 ## 2. Exactly-Once Reference Pipeline
 

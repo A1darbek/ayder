@@ -1,0 +1,103 @@
+{
+  "schema": "ayder.revenue-readiness-v1.benchmark-summary.v1",
+  "status": "superseded by rrv1-post-visibility-commitfix-wsl2.json; retained as pre-visibility-fix evidence",
+  "platform_label": "ARM64 WSL2 development benchmark",
+  "timestamp_utc": "2026-08-15T16:49:24Z",
+  "baseline_git_sha": "6374c514b01d00562e147ee19f4d41468c5fdb2b",
+  "worktree_dirty": true,
+  "tracked_patch_sha256_at_matrix_run": "36be9c67b138f44b6fb2cb3adb2b7ec061a77a4a639681be42aa820583542dfe",
+  "server_binary_sha256": "4bbb871decf346ff0aad85db3ca642df536c29ce5f1dfca330701e86ffa206a2",
+  "wrk2_sha256": "b868e52fbd673e1ec0a2d06248ee2c957e518c05933e3109def13e081eb335a0",
+  "hardware": {
+    "architecture": "aarch64",
+    "cpu": "Qualcomm Oryon",
+    "logical_cpus": 8,
+    "memory_gib": 23,
+    "kernel": "6.6.87.2-microsoft-standard-WSL2",
+    "filesystem": "ext4 on WSL2 virtual disk",
+    "compiler": "GCC 15.2.0",
+    "glibc": "2.42"
+  },
+  "topology": {
+    "broker_nodes": 1,
+    "forked_workers": 4,
+    "dedicated_worker": 0,
+    "server_cpuset": "0-3",
+    "client_cpuset": "4-7",
+    "client_server_placement": "colocated WSL2",
+    "authentication": "bearer enabled; value redacted",
+    "rate_limit": "disabled",
+    "threads": 4,
+    "connections": 128,
+    "warmup_seconds": 10,
+    "trial_seconds": 20,
+    "trials_per_case": 3
+  },
+  "durability_contract": "A response qualifies only when HTTP 2xx and ok=true, durable=true, synced=true; timeout_ms=5000; sealed acknowledgement waits for completed local fsync.",
+  "durable_produce_matrix": [
+    {"payload_bytes":128,"offered_rps":10000,"achieved_rps_median":425.34,"achieved_rps_pstdev":0.8230971321107209,"p50_ms_median":14360.575,"p95_ms_median":18612.223,"p99_ms_median":19021.823,"p99_9_ms_median":19202.047,"max_ms_median":19234.816,"all_trials_clean":false},
+    {"payload_bytes":128,"offered_rps":25000,"achieved_rps_median":446.19,"achieved_rps_pstdev":15.065789797492263,"p50_ms_median":14737.407,"p95_ms_median":19070.975,"p99_ms_median":19480.575,"p99_9_ms_median":19595.263,"max_ms_median":19628.032,"all_trials_clean":false},
+    {"payload_bytes":128,"offered_rps":50000,"achieved_rps_median":461.56,"achieved_rps_pstdev":1.2615334584015936,"p50_ms_median":14835.711,"p95_ms_median":19234.815,"p99_ms_median":19644.415,"p99_9_ms_median":19742.719,"max_ms_median":19742.72,"all_trials_clean":false},
+    {"payload_bytes":1024,"offered_rps":10000,"achieved_rps_median":459.51,"achieved_rps_pstdev":103.81135529839156,"p50_ms_median":14303.231,"p95_ms_median":18546.687,"p99_ms_median":18989.055,"p99_9_ms_median":19267.583,"max_ms_median":19316.736,"all_trials_clean":false},
+    {"payload_bytes":1024,"offered_rps":25000,"achieved_rps_median":455.46,"achieved_rps_pstdev":0.9716766723327013,"p50_ms_median":14491.647,"p95_ms_median":18890.751,"p99_ms_median":19415.039,"p99_9_ms_median":19611.647,"max_ms_median":19628.032,"all_trials_clean":false},
+    {"payload_bytes":1024,"offered_rps":50000,"achieved_rps_median":441.52,"achieved_rps_pstdev":105.07971270527067,"p50_ms_median":14852.095,"p95_ms_median":19267.583,"p99_ms_median":19628.031,"p99_9_ms_median":19709.951,"max_ms_median":19791.872,"all_trials_clean":false},
+    {"payload_bytes":16384,"offered_rps":10000,"achieved_rps_median":420.57,"achieved_rps_pstdev":1.33687030867702,"p50_ms_median":14376.959,"p95_ms_median":18595.839,"p99_ms_median":19054.591,"p99_9_ms_median":19333.119,"max_ms_median":19464.192,"all_trials_clean":false},
+    {"payload_bytes":16384,"offered_rps":25000,"achieved_rps_median":324.98,"achieved_rps_pstdev":47.11539097435855,"p50_ms_median":14753.791,"p95_ms_median":19087.359,"p99_ms_median":19513.343,"p99_9_ms_median":19660.799,"max_ms_median":19677.184,"all_trials_clean":false},
+    {"payload_bytes":16384,"offered_rps":50000,"achieved_rps_median":419.68,"achieved_rps_pstdev":2.7445015738543375,"p50_ms_median":14884.863,"p95_ms_median":19251.199,"p99_ms_median":19644.415,"p99_9_ms_median":19775.487,"max_ms_median":19775.488,"all_trials_clean":false}
+  ],
+  "endpoint_suite_at_1000_offered_rps": [
+    {"case":"http_overhead","achieved_rps_median":998.73,"p50_ms_median":0.9,"p95_ms_median":1.581,"p99_ms_median":1.923,"p99_9_ms_median":2.135,"max_ms_median":3.582,"all_trials_clean":true},
+    {"case":"accepted_produce","achieved_rps_median":998.72,"p50_ms_median":0.904,"p95_ms_median":1.608,"p99_ms_median":1.932,"p99_9_ms_median":2.187,"max_ms_median":3.434,"all_trials_clean":true,"contract":"ok=true, durable=false, synced=null"},
+    {"case":"durable_produce","achieved_rps_median":458.35,"p50_ms_median":2433.023,"p95_ms_median":6041.599,"p99_ms_median":7073.791,"p99_9_ms_median":8007.679,"max_ms_median":8261.632,"all_trials_clean":false},
+    {"case":"consume","achieved_rps_median":998.68,"p50_ms_median":0.877,"p95_ms_median":1.587,"p99_ms_median":1.915,"p99_9_ms_median":2.145,"max_ms_median":2.954,"all_trials_clean":false,"valid_response_counts_by_trial":[3436,3978,3040],"requests_by_trial":[9989,9989,9989],"finding":"HTTP remained fast, but most load-balanced responses did not contain the seeded record."},
+    {"case":"query_inspection_post","achieved_rps_median":998.76,"p50_ms_median":0.898,"p95_ms_median":1.596,"p99_ms_median":1.948,"p99_9_ms_median":2.469,"max_ms_median":4.09,"all_trials_clean":true,"scope":"Validates HTTP 200, ok=true, and query fingerprint, not identical row visibility across workers. The QUERY method itself passed route smoke."}
+  ],
+  "default_worker_comparison": {
+    "payload_bytes": 128,
+    "offered_rps": 10000,
+    "achieved_rps_median": 450.79,
+    "achieved_rps_pstdev": 11.544471500342597,
+    "p99_ms_median": 18939.903,
+    "all_trials_clean": false,
+    "conclusion": "The default four-worker topology also failed; RF_HA_DEDICATED_WORKER=0 did not explain the durable-path limit."
+  },
+  "profile": {
+    "offered_rps": 10000,
+    "achieved_rps": 422.84,
+    "p50_ms": 4734.975,
+    "p95_ms": 9019.391,
+    "p99_ms": 9437.183,
+    "p99_9_ms": 9658.367,
+    "max_ms": 9715.712,
+    "client_timeout_errors": 81,
+    "perf_samples": 619,
+    "perf_lost_samples": 0,
+    "perf_user_cpu_equivalent": 0.578,
+    "perf_ipc": 0.31,
+    "named_symbol_overhead_percent": {"wait_synced_until":8.07,"process_request_including_routing_and_handler":3.96,"sealed_sync_thread":2.81,"read_cb":1.2,"AOF_append_sealed":0.62},
+    "disk_samples": {"device":"sdd","writes_per_second_range":[1574,1811],"flushes_per_second_range":[792,867],"write_await_ms_range":[0.54,0.63],"flush_await_ms_range":[0.62,0.68],"util_percent_range":[83.2,90.0]},
+    "conclusion": "Synchronous event-loop waiting for sealed fsync plus lock/persistence activity dominated the useful profile. HTTP parsing was not isolated as a material bottleneck; partial symbols and a large unknown-kernel bucket prevent an exact parser percentage."
+  },
+  "single_worker_crash_recovery": {
+    "timestamp_utc": "2026-08-15T17:01:21Z",
+    "acknowledged": 100,
+    "recovered": 100,
+    "lost_acknowledged": 0,
+    "duplicates": 0,
+    "pass": true,
+    "scope": "Single-node, one-worker SIGKILL and restart only; not power loss, HA failover, or a multiworker proof."
+  },
+  "release_conclusion": {
+    "primary_target_met": false,
+    "target": "50000 achieved RPS with p99 <= 3.0 ms",
+    "publishable_performance_claim": false,
+    "reason": "All durable matrix cases timed out under offered load, the best median achieved rate was 461.56 RPS, and multiworker consume visibility failed."
+  },
+  "raw_artifacts": [
+    "bench/results/rrv1-post-fix-wsl2-final2/matrix.json",
+    "bench/results/rrv1-endpoints-wsl2-final/matrix.json",
+    "bench/results/rrv1-default-workers-128B-10000rps/summary.json",
+    "bench/results/rrv1-profile-final/",
+    "bench/results/rrv1-crash-wsl2-final/result.json"
+  ]
+}

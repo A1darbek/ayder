@@ -7,6 +7,12 @@ produced, replayed, consumed, committed, and recovered.
 This guide is for design partners, HN readers, and anyone evaluating the API.
 It covers every Ayder endpoint family with curl examples.
 
+This is a synthetic API evaluation guide, not a production deployment guide.
+The source example uses the simplest in-process topology. Focused multiworker
+visibility/failure/replay regressions now pass, but longer capacity and fault
+campaigns remain release gates. See [`PRODUCTION_READINESS.md`](PRODUCTION_READINESS.md)
+before using real data.
+
 ## 1. Start Ayder
 
 With Docker:
@@ -14,6 +20,8 @@ With Docker:
 ```bash
 git clone https://github.com/A1darbek/ayder.git
 cd ayder
+export AYDER_TOKEN="$(openssl rand -hex 24)"
+export RF_BEARER_TOKENS="${AYDER_TOKEN}@5000:5000:1000000"
 docker compose up -d --build
 ```
 
@@ -21,27 +29,36 @@ From source:
 
 ```bash
 make clean && make
-RF_BEARER_TOKENS='dev@5000:5000:1000000' ./ayder --port 1109
+export AYDER_TOKEN="$(openssl rand -hex 24)"
+RF_BEARER_TOKENS="${AYDER_TOKEN}@5000:5000:1000000" \
+  ./ayder --port 1109 --workers 0
 ```
 
 Set your shell helpers:
 
 ```bash
 BASE='http://127.0.0.1:1109'
-AUTH='Authorization: Bearer dev'
+AUTH="Authorization: Bearer ${AYDER_TOKEN}"
 JSON='Content-Type: application/json'
 ```
 
-Public endpoints:
+Unauthenticated liveness/readiness endpoints:
 
 ```bash
 curl -fsS "$BASE/health"
 curl -fsS "$BASE/ready"
-curl -fsS "$BASE/metrics" | head
-curl -fsS "$BASE/metrics_ha" | head
 ```
 
-All other endpoints require `Authorization: Bearer <token>`.
+Metrics and application/admin endpoints require `Authorization: Bearer <token>`
+by default:
+
+```bash
+curl -fsS "$BASE/metrics" -H "$AUTH" | head
+curl -fsS "$BASE/metrics_ha" -H "$AUTH" | head
+```
+
+`RF_METRICS_PUBLIC=1` deliberately makes metrics unauthenticated; use it only on
+an already isolated operations listener/network.
 
 ## 2. Broker: Topic, Produce, Consume, Commit
 
@@ -299,10 +316,12 @@ Check the sealed sync watermark:
 curl -fsS "$BASE/admin/sealed/status" -H "$AUTH" | jq
 ```
 
-Run sealed-file garbage collection:
+Online sealed-file garbage collection is intentionally unavailable in Revenue
+Readiness v1. The route returns HTTP 503 until cross-process drain, lock, rename,
+and fd-reopen coordination is implemented and fault-tested:
 
 ```bash
-curl -fsS -X POST "$BASE/admin/sealed/gc" \
+curl -sS -X POST "$BASE/admin/sealed/gc" \
   -H "$AUTH" -H "$JSON" \
   -d '{"max_age_ms":0,"max_bytes":0}' | jq
 ```

@@ -1,175 +1,219 @@
 # Ayder
 
-**HTTP-native durable event log and message bus, written in C.**
+Ayder is a single-binary, HTTP-native durable event log and message broker
+written in C. It is built for recovery-critical AI and API workflows where an
+operator needs durable evidence before deciding whether to retry, replay, or
+reconcile an uncertain external side effect.
 
-Ayder provides durable produce, deterministic offset replay, consumer groups,
-committed offsets, idempotency keys, and Raft-based high availability through a
-plain HTTP API.
+Ayder does not claim universal exactly-once effects across arbitrary external
+systems. A provider timeout can leave an outcome unknown; Ayder preserves and
+queries the broker evidence, while the application still owns provider
+reconciliation and idempotent effect handling.
 
-The repository contains two distinct layers:
+## Five-minute quick start
 
-1. **Ayder itself**: the broker, persistence, replay, commit, and HA code.
-2. **Examples on top of Ayder's broker/replay path**: payment, webhook, and data
-   pipeline applications that generate operator-facing recovery receipts.
-
-The examples are not built-in payment or data products. They demonstrate how
-application evidence can be derived from Ayder's durable event and replay
-semantics.
-
-## Quick Start
+Docker publishes the broker on loopback only and requires an explicit bearer
+credential. Generate a local evaluation token; use a secret manager for any
+shared environment.
 
 ```bash
 git clone https://github.com/A1darbek/ayder.git
 cd ayder
+export AYDER_TOKEN="$(openssl rand -hex 24)"
+export RF_BEARER_TOKENS="${AYDER_TOKEN}@5000:5000:1000000"
 docker compose up -d --build
+
 curl -fsS http://127.0.0.1:1109/health
+curl -fsS http://127.0.0.1:1109/ready
 ```
 
-Build from source on Debian/Ubuntu:
+Create a topic, produce one locally durable record, consume it, and commit the
+processed offset:
+
+```bash
+BASE=http://127.0.0.1:1109
+AUTH="Authorization: Bearer ${AYDER_TOKEN}"
+
+curl -fsS -X POST "$BASE/broker/topics" \
+  -H "$AUTH" -H 'Content-Type: application/json' \
+  --data-binary '{"name":"events","partitions":1}'
+
+curl -fsS -X POST \
+  "$BASE/broker/topics/events/produce?partition=0&timeout_ms=5000&idempotency_key=event-001" \
+  -H "$AUTH" --data-binary 'hello'
+
+curl -fsS \
+  "$BASE/broker/consume/events/my-group/0?offset=0&limit=10&encoding=b64" \
+  -H "$AUTH"
+
+curl -fsS -X POST "$BASE/broker/commit" \
+  -H "$AUTH" -H 'Content-Type: application/json' \
+  --data-binary '{"topic":"events","group":"my-group","partition":0,"offset":0}'
+```
+
+For a source build on Debian/Ubuntu:
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y build-essential pkg-config \
-  libuv1-dev libevent-dev libcurl4-openssl-dev libssl-dev zlib1g-dev liburing-dev
-
-make clean && make
-./ayder --port 1109
+sudo apt-get install -y build-essential pkg-config libuv1-dev libevent-dev \
+  libcurl4-openssl-dev libssl-dev zlib1g-dev liburing-dev
+make clean && make -j"$(nproc)"
+RF_BEARER_TOKENS="${AYDER_TOKEN}@5000:5000:1000000" \
+  ./ayder --port 1109 --workers 0
 ```
 
-Full docs:
+See the [full quick start](docs/quickstart.md) and
+[API reference](docs/api-reference.md).
 
-- [Quick Start](docs/quickstart.md)
-- [API Reference](docs/api-reference.md)
+## Architecture
 
-## HTTP Walkthrough
+HTTP/1 requests pass through bounded framing, bearer authentication, resource
+controls, routing, broker state, and the sealed append path. A parent process
+can fork `SO_REUSEPORT` workers that coordinate selected state and metrics in
+shared memory. Optional experimental HA adds leader gating, replication, and
+peer mTLS; the current implementation does not yet support a crash-safe Raft
+claim.
 
-```bash
-AUTH='Authorization: Bearer dev'
+The implementation map and trust boundaries are in
+[Architecture](docs/ARCHITECTURE.md) and the
+[Threat model](docs/THREAT_MODEL.md).
 
-curl -X POST http://127.0.0.1:1109/broker/topics \
-  -H "$AUTH" -H 'Content-Type: application/json' \
-  -d '{"name":"events","partitions":1}'
+## Durability contract
 
-curl -X POST \
-  'http://127.0.0.1:1109/broker/topics/events/produce?partition=0&timeout_ms=5000&idempotency_key=event-001' \
-  -H "$AUTH" --data-binary 'hello'
-
-curl \
-  'http://127.0.0.1:1109/broker/consume/events/my-group/0?offset=0&limit=10&encoding=b64' \
-  -H "$AUTH"
-
-curl -X POST http://127.0.0.1:1109/broker/commit \
-  -H "$AUTH" -H 'Content-Type: application/json' \
-  -d '{"topic":"events","group":"my-group","partition":0,"offset":0}'
-```
-
-A successful durable produce response includes evidence such as:
+A single-node write is locally fsync-confirmed and visible to every local worker
+only when all of these are true:
 
 ```json
 {
   "ok": true,
-  "offset": 0,
-  "partition": 0,
-  "batch_id": 1,
-  "sealed": true,
-  "durable": true,
-  "synced": true
+  "durability_scope": "local",
+  "local_fsync": true,
+  "quorum_committed": false,
+  "failover_safe": false,
+  "applied_all_workers": true
 }
 ```
 
-## Design-Review Examples
+The caller must provide a positive `timeout_ms` to request that proof. HTTP 2xx
+or `ok:true` alone means accepted, not durable. A timeout or persistence error
+is an ambiguous outcome that must be reconciled before retrying. `batch_id` and
+the sealed sync watermark are worker-local, not cluster-global transaction
+identifiers.
 
-These examples run application workflows on top of Ayder's broker/replay path.
-Each example starts its required database services, uses the real Ayder HTTP
-API, and emits machine-readable and operator-readable receipts.
+In HA mode, local `durable:true` does not prove failover durability. Require
+`durability_scope:"quorum"`, `quorum_committed:true`,
+`failover_safe:true`, and the local/all-worker fields above. Durable Raft state,
+protocol validation and atomic payload-bound idempotency are implemented with
+focused regressions; the full post-change fault campaign is still a release
+blocker. See
+[Production readiness](docs/PRODUCTION_READINESS.md).
 
-| Example | What it demonstrates | Run |
-|---|---|---|
-| [Payment ambiguity / PayPal verification](examples/payment-ambiguity-paypal/README.md) | Provider timeout is not failure; verify external commitment; DB wins over Redis | `./examples/payment-ambiguity-paypal/run_all.sh` |
-| [Duplicate/out-of-order payment webhooks](examples/payment-webhook-ordering/README.md) | Terminal-state monotonicity, provider-event dedupe, one business effect | `./examples/payment-webhook-ordering/run_demo.sh` |
-| [Databricks/Airflow/dbt pipeline recovery](examples/data-pipeline-recovery/README.md) | PASS/WARN/FAIL based on confirmed, missing, retried, critical, and audited data | `./examples/data-pipeline-recovery/run_all.sh` |
+## Evidence
 
-See [examples/README.md](examples/README.md) for the design-review sequence.
+- The repository contains fixed-rate wrk2 tooling, machine-readable summaries,
+  redacted environment capture, and crash/restart reconciliation under
+  [`bench/`](bench/).
+- The fixed ARM64 WSL2 matrix, requiring local fsync and all-worker application,
+  achieved roughly 308–382 responses/s with 19–20 second p99 and timeouts.
+  Every returned success carried a valid explicit local-only receipt. No 50k or
+  production-performance claim is supported. See
+  [Benchmarks](docs/BENCHMARKS.md).
+- A historical scoped `broker-log` Jepsen matrix recorded 45/45 passes on March
+  13, 2026. Persistence and acknowledgement behavior changed in this hardening
+  branch, so that historical result is context—not final-branch validation.
+  Current-tree short kill, partition and mixed runs pass with exact post-run
+  convergence; the strengthened full campaign remains required before merge.
+- HTTP framing has deterministic adversarial tests plus an ASan/UBSan mutation
+  smoke harness. Exact commands and bounded claims are indexed in the
+  [Buyer evidence pack](docs/BUYER_EVIDENCE_PACK.md).
 
-## Additional Recovery Demos
+## Recovery and QUERY
 
-The `demos/` directory contains smaller scenario-specific receipts:
+Ayder supports deterministic offset replay and the HTTP `QUERY` method for
+read-only recovery inspection. The examples demonstrate how applications can
+record an external-effect attempt, inspect durable evidence after an ambiguous
+response, reconcile provider state, and then make a deliberate retry or manual
+decision.
 
-- HTTP QUERY method support for safe broker queries with request bodies
-- provider timeout and financial indeterminism
-- ledger clearance and bank reconciliation
-- duplicate/out-of-order webhook suppression
-- DLQ redrive safety
-- data pipeline audit receipts
+- [Payment ambiguity / provider verification](examples/payment-ambiguity-paypal/README.md)
+- [Duplicate and out-of-order webhooks](examples/payment-webhook-ordering/README.md)
+- [Data-pipeline recovery](examples/data-pipeline-recovery/README.md)
+- [Additional recovery receipts](demos/README.md)
 
-See [demos/README.md](demos/README.md).
+These are reference applications, not built-in payment, banking, or data
+products.
 
-## Correctness Evidence
+## Observability and operations
 
-### Broker-Level Jepsen Evidence
+Ayder exports Prometheus metrics, example alert rules, and a Grafana dashboard.
+`/metrics` and `/metrics_ha` require bearer authentication by default; setting
+`RF_METRICS_PUBLIC=1` is an explicit deployment choice. Liveness and readiness
+remain unauthenticated, and `/ready` returns HTTP 503 when persistence is not
+ready.
 
-Published scoped claim:
+- [Observability](docs/OBSERVABILITY.md)
+- [Operations runbook](docs/RUNBOOK.md)
+- [Prometheus configuration and alerts](deploy/prometheus/)
+- [Grafana dashboard](deploy/grafana/ayder-dashboard.json)
 
-- workload: `broker-log`
-- fault modes: mixed, partition-only, kill-only
-- verified matrix date: March 13, 2026
-- result: 45/45 runs passed in the recorded `hn-ready` matrix
+## Security
 
-This is workload- and fault-model-specific evidence, not a universal proof for
-every endpoint or configuration.
+The hardening branch rejects ambiguous request framing (including TE+CL and
+invalid duplicate Content-Length), bounds decoded chunks and request lifetime,
+protects operational metrics by default, uses strict bearer syntax and bounded
+constant-time token comparison, and validates configured HA peer identity.
+These are internally tested controls, not an independent penetration test or
+certification.
 
-Run the published campaign:
+Read [SECURITY.md](SECURITY.md) before deployment. Report vulnerabilities using
+its private disclosure process rather than a public issue.
 
-```bash
-bash ./tests/demo/ha_broker_jepsen_gold.sh
-```
+## Current production limitations
 
-### End-to-End Exactly-Once Reference Pipeline
+This branch is prepared for technical evaluation, but it is not release-ready.
+Material open items include:
 
-The reference `Ayder -> consumer -> Postgres` harness demonstrates exactly-once
-business effects for its documented transactional consumer pattern:
+- final-branch full Jepsen 45/45 and stronger acknowledged-durability workloads
+  have not completed;
+- durable Raft state/protocol checks and explicit quorum receipts have focused
+  evidence, but the full post-change 45-run and power/storage-fault campaigns
+  have not completed;
+- cross-worker and atomic payload-bound idempotency defects have focused passing
+  regressions, but longer HA/concurrency faults remain required;
+- online sealed-log GC is disabled pending safe cross-process inode
+  coordination;
+- client TLS requires a trusted reverse proxy; authorization is bearer-wide
+  rather than fine-grained; encryption at rest and audit logging are external
+  deployment responsibilities;
+- cold backup/restore, distinct-binary rollback and one narrow crash RPO/RTO
+  drill pass, but online backup, rolling upgrade and target-scale DR remain
+  unsupported; and
+- final native Linux ARM64/amd64 performance and workflow evidence is pending.
 
-```bash
-bash ./tests/e2e/exactly_once/run_campaign.sh
-```
+The complete gate and gap matrix are in
+[Revenue Readiness v1](docs/REVENUE_READINESS_V1.md) and
+[Enterprise readiness](docs/ENTERPRISE_READINESS.md).
 
-It checks:
+## Contributing
 
-- no missing expected effects
-- no duplicate business effects
-- monotonic consumer offset state
-- replay safety across injected crashes, partitions, and broker restarts
+Start with [CONTRIBUTING.md](CONTRIBUTING.md). Security-sensitive changes must
+include adversarial regression coverage and must not weaken acknowledgement or
+persistence semantics to improve a benchmark.
 
-This is a reference-pipeline claim. Arbitrary external side effects still
-require application idempotency and transactional discipline.
-
-See [EVIDENCE.md](EVIDENCE.md) and
-[tests/e2e/exactly_once/README.md](tests/e2e/exactly_once/README.md).
-
-## Repository Map
+## Repository map
 
 ```text
-src/                 Ayder C source
-deps/                vendored dependencies
-examples/            design-review applications on Ayder
-demos/               additional recovery-receipt scenarios
-tests/e2e/           integration and exactly-once harnesses
-tests/jepsen/        Jepsen workload and campaign tooling
-tests/smoke/         HTTP API smoke coverage
-scripts/             operations, benchmark, and partner helpers
-cluster/             local HA cluster configuration
+src/                 broker, HTTP, persistence, HA, and shared state
+bench/               fixed-rate, endpoint, system, and crash/restart harnesses
+tests/security/      parser and live adversarial HTTP regressions
+tests/regression/    durability and HA contracts
+tests/jepsen/        distributed fault workloads and campaign tooling
+deploy/              Prometheus and Grafana examples
+examples/, demos/    recovery-oriented reference workflows
+cluster/             local HA configuration and certificate generator
 ```
 
-For partner evaluation, start with [DESIGN_PARTNERS.md](DESIGN_PARTNERS.md).
+Ayder is pre-revenue and has no paying or production customers. Design-partner
+and maintainer evaluation is technical feedback, not customer adoption.
 
-## Scope And Non-Goals
-
-- Ayder is not Kafka protocol compatible.
-- Ayder is not a SQL database.
-- Exactly-once business effects are not automatic across arbitrary systems.
-- Application examples demonstrate patterns; they are not production payment,
-  banking, or data-platform implementations.
-
-## License
-
-MIT
+License: [MIT](LICENSE).
