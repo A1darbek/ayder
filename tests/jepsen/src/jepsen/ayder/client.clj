@@ -10,7 +10,8 @@
   #{0 408 425 429 500 502 503 504})
 
 (def uncertain-errors
-  #{"commit_timeout" "timeout" "request_timeout"})
+  #{"commit_timeout" "timeout" "request_timeout" "no_quorum"
+    "durability_unknown" "replication_failed" "persistence_failed"})
 
 (defn- auth-headers [token]
   (if (str/blank? token)
@@ -116,7 +117,13 @@
                                            :body body})
               j (:json resp)]
           (cond
-            (and (= 200 (:status resp)) (= true (:ok j)))
+            (and (= 200 (:status resp))
+                 (= true (:ok j))
+                 (= "quorum" (:durability_scope j))
+                 (= true (:local_fsync j))
+                 (= true (:quorum_committed j))
+                 (= true (:failover_safe j))
+                 (= true (:applied_all_workers j)))
             (assoc op :type :ok)
 
             (indeterminate? resp)

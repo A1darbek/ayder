@@ -230,6 +230,99 @@ run_pre_ready_gate() {
   done
 }
 
+run_post_convergence_gate() {
+  local enabled="${AYDER_JEPSEN_POST_CONVERGENCE_ENABLED:-1}"
+  local nodes_csv="${AYDER_JEPSEN_NODES:-http://127.0.0.1:7001,http://127.0.0.1:8001,http://127.0.0.1:9001,http://127.0.0.1:10001,http://127.0.0.1:11001}"
+  local timeout_sec="${AYDER_JEPSEN_POST_CONVERGENCE_TIMEOUT_SEC:-60}"
+  local poll_sec="${AYDER_JEPSEN_POST_CONVERGENCE_POLL_SEC:-1}"
+  local curl_timeout_sec="${AYDER_JEPSEN_POST_CONVERGENCE_CURL_TIMEOUT_SEC:-1}"
+
+  if [[ "$enabled" != '1' ]]; then
+    log 'post-run convergence disabled (AYDER_JEPSEN_POST_CONVERGENCE_ENABLED!=1)'
+    return 0
+  fi
+
+  [[ "$timeout_sec" =~ ^[0-9]+$ ]] || timeout_sec=60
+  (( timeout_sec > 0 )) || timeout_sec=60
+  [[ "$poll_sec" =~ ^[0-9]+$ ]] || poll_sec=1
+  (( poll_sec > 0 )) || poll_sec=1
+  [[ "$curl_timeout_sec" =~ ^[0-9]+$ ]] || curl_timeout_sec=1
+  (( curl_timeout_sec > 0 )) || curl_timeout_sec=1
+
+  local node_count=0
+  while IFS= read -r _u; do
+    node_count=$((node_count + 1))
+  done < <(csv_to_lines "$nodes_csv")
+  (( node_count > 0 )) || return 0
+
+  log "post-run convergence start timeout=${timeout_sec}s nodes=${node_count}"
+  local start now last_log
+  start="$(date +%s)"
+  last_log=$((start - 5))
+
+  while true; do
+    local healthy=0 leaders=0 leader_fq=0 failed=0 converged=1
+    local reference='' snapshot=''
+
+    while IFS= read -r url; do
+      local base="${url%/}" metrics role state last commit applied fq tuple
+      if ! curl_auth "$base/health" "$curl_timeout_sec" >/dev/null 2>&1; then
+        converged=0
+        snapshot+="${base} unavailable"$'\n'
+        continue
+      fi
+      healthy=$((healthy + 1))
+      metrics="$(curl_auth "$base/metrics_ha" "$curl_timeout_sec" 2>/dev/null || true)"
+      role="$(awk '/^ramforge_ha_role /{print $2; exit}' <<<"$metrics")"
+      state="$(awk '/^ramforge_ha_state /{print $2; exit}' <<<"$metrics")"
+      last="$(awk '/^ramforge_ha_log_last_index /{print $2; exit}' <<<"$metrics")"
+      commit="$(awk '/^ramforge_ha_commit_index /{print $2; exit}' <<<"$metrics")"
+      applied="$(awk '/^ramforge_ha_applied_index /{print $2; exit}' <<<"$metrics")"
+      fq="$(awk '/^ramforge_ha_fresh_quorum /{print $2; exit}' <<<"$metrics")"
+      snapshot+="${base} role=${role:-missing} state=${state:-missing} last=${last:-missing} commit=${commit:-missing} applied=${applied:-missing} fresh_quorum=${fq:-missing}"$'\n'
+
+      if [[ ! "$role" =~ ^[0-9]+$ || ! "$state" =~ ^[0-9]+$ ||
+            ! "$last" =~ ^[0-9]+$ || ! "$commit" =~ ^[0-9]+$ ||
+            ! "$applied" =~ ^[0-9]+$ || ! "$fq" =~ ^[0-9]+$ ]]; then
+        converged=0
+        continue
+      fi
+      [[ "$state" == '4' ]] && failed=$((failed + 1))
+      if [[ "$role" == '0' ]]; then
+        leaders=$((leaders + 1))
+        [[ "$fq" == '1' ]] && leader_fq=1
+      fi
+      tuple="${last}:${commit}:${applied}"
+      if [[ -z "$reference" ]]; then
+        reference="$tuple"
+      elif [[ "$tuple" != "$reference" ]]; then
+        converged=0
+      fi
+      if [[ "$last" != "$commit" || "$commit" != "$applied" ]]; then
+        converged=0
+      fi
+    done < <(csv_to_lines "$nodes_csv")
+
+    printf '%s' "$snapshot" > "$ART_DIR/post-convergence.metrics"
+    if (( healthy == node_count && leaders == 1 && leader_fq == 1 &&
+          failed == 0 && converged == 1 )); then
+      log "post-run convergence ok healthy=${healthy}/${node_count} tuple=${reference}"
+      return 0
+    fi
+
+    now="$(date +%s)"
+    if (( now - start >= timeout_sec )); then
+      log "ERROR: post-run convergence timeout healthy=${healthy}/${node_count} leaders=${leaders} leader_fresh_quorum=${leader_fq} failed=${failed}"
+      return 1
+    fi
+    if (( now - last_log >= 5 )); then
+      log "post-run convergence pending healthy=${healthy}/${node_count} leaders=${leaders} leader_fresh_quorum=${leader_fq} failed=${failed}"
+      last_log="$now"
+    fi
+    sleep "$poll_sec"
+  done
+}
+
 DEFAULT_KILL_CMD='pids=$(pgrep -f "[a]yder --port 9001" || true); for p in $pids; do kill -9 "$p" 2>/dev/null || true; done; true'
 DEFAULT_RESTART_CMD="cd '$ROOT_DIR/cluster/node3' && source '$ROOT_DIR/tests/demo/ha6_stability_env_preset.sh' node3 && setsid '$ROOT_DIR/ayder' --port 9001 --workers 4 > /tmp/ayder-node3-jepsen.log 2>&1 < /dev/null & disown || true"
 
@@ -250,6 +343,25 @@ else
   GIT_DIRTY_COUNT='unknown'
 fi
 
+JEPSEN_BINARY="${AYDER_JEPSEN_BINARY:-$ROOT_DIR/ayder}"
+if [[ -f "$JEPSEN_BINARY" ]] && command -v sha256sum >/dev/null 2>&1; then
+  BINARY_SHA256="$(sha256sum "$JEPSEN_BINARY" | awk '{print $1}')"
+else
+  BINARY_SHA256='unknown'
+fi
+MACHINE_ARCH="$(uname -m 2>/dev/null || echo unknown)"
+if grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null; then
+  DEFAULT_PLATFORM_LABEL="${MACHINE_ARCH} WSL2 development"
+else
+  DEFAULT_PLATFORM_LABEL="${MACHINE_ARCH} native Linux"
+fi
+PLATFORM_LABEL="${AYDER_JEPSEN_PLATFORM_LABEL:-$DEFAULT_PLATFORM_LABEL}"
+if command -v findmnt >/dev/null 2>&1; then
+  FILESYSTEM="$(findmnt -T "$ROOT_DIR" -n -o SOURCE,FSTYPE 2>/dev/null | xargs || true)"
+else
+  FILESYSTEM='unknown'
+fi
+
 {
   echo "run_id=$RUN_ID"
   echo "timestamp_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -257,6 +369,11 @@ fi
   echo "artifact_dir=$ART_DIR"
   echo "git_sha=$GIT_SHA"
   echo "git_dirty_count=$GIT_DIRTY_COUNT"
+  echo "binary_path=$JEPSEN_BINARY"
+  echo "binary_sha256=$BINARY_SHA256"
+  echo "platform_label=$PLATFORM_LABEL"
+  echo "kernel=$(uname -sr 2>/dev/null || echo unknown)"
+  echo "filesystem=${FILESYSTEM:-unknown}"
   echo "workload=${AYDER_JEPSEN_WORKLOAD:-broker-log}"
   echo "nodes=${AYDER_JEPSEN_NODES:-http://127.0.0.1:7001,http://127.0.0.1:8001,http://127.0.0.1:9001,http://127.0.0.1:10001,http://127.0.0.1:11001}"
   echo "direct_url=${AYDER_JEPSEN_DIRECT_URL:-}"
@@ -266,6 +383,7 @@ fi
   echo "broker_read_timeout_ms=${AYDER_JEPSEN_BROKER_READ_TIMEOUT_MS:-}"
   echo "nemesis_interval_sec=${AYDER_JEPSEN_NEMESIS_INTERVAL:-6}"
   echo "nemesis_startup_sec=${AYDER_JEPSEN_NEMESIS_STARTUP_SEC:-10}"
+  echo "nemesis_mode=${AYDER_JEPSEN_NEMESIS_MODE:-mixed}"
   echo "default_partition_cmd=$DEFAULT_PARTITION_CMD"
   echo "default_heal_cmd=$DEFAULT_HEAL_CMD"
   echo "pre_heal_enabled=${AYDER_JEPSEN_PRE_HEAL_ENABLED:-1}"
@@ -279,6 +397,8 @@ fi
   echo "pre_ready_recovery_after_sec=${AYDER_JEPSEN_PRE_READY_RECOVERY_AFTER_SEC:-45}"
   echo "pre_ready_recovery_timeout_sec=${AYDER_JEPSEN_PRE_READY_RECOVERY_TIMEOUT_SEC:-120}"
   echo "pre_ready_recovery_cmd=${AYDER_JEPSEN_PRE_READY_RECOVERY_CMD:-}"
+  echo "post_convergence_enabled=${AYDER_JEPSEN_POST_CONVERGENCE_ENABLED:-1}"
+  echo "post_convergence_timeout_sec=${AYDER_JEPSEN_POST_CONVERGENCE_TIMEOUT_SEC:-60}"
   echo "runner_stream_stdout=$RUNNER_STREAM_STDOUT"
 } > "$ART_DIR/manifest.env"
 
@@ -324,11 +444,13 @@ cmd=(
   --topic-partitions "${AYDER_JEPSEN_TOPIC_PARTITIONS:-1}"
   --direct-url "${AYDER_JEPSEN_DIRECT_URL:-}"
   --client-stagger-ms "${AYDER_JEPSEN_CLIENT_STAGGER_MS:-10}"
+  --min-ok "${AYDER_JEPSEN_MIN_OK:-100}"
   --linearizable-history-mode "${AYDER_JEPSEN_LINEARIZABLE_HISTORY_MODE:-all}"
   --namespace "${AYDER_JEPSEN_NS:-jepsen}"
   --key "${AYDER_JEPSEN_KEY:-reg}"
   --time-limit-sec "${AYDER_JEPSEN_TIME:-120}"
   --nemesis-enabled "${AYDER_JEPSEN_NEMESIS:-true}"
+  --nemesis-mode "${AYDER_JEPSEN_NEMESIS_MODE:-mixed}"
   --nemesis-interval-sec "${AYDER_JEPSEN_NEMESIS_INTERVAL:-6}"
   --nemesis-startup-sec "${AYDER_JEPSEN_NEMESIS_STARTUP_SEC:-10}"
   --partition-cmd "${AYDER_JEPSEN_PARTITION_CMD:-$DEFAULT_PARTITION_CMD}"
@@ -361,10 +483,24 @@ else
 fi
 set -e
 
+post_convergence_rc='not_run'
+if [[ "$rc" -eq 0 ]]; then
+  set +e
+  run_post_convergence_gate
+  post_convergence_rc=$?
+  set -e
+  if [[ "$post_convergence_rc" -ne 0 ]]; then
+    rc=3
+  fi
+fi
+
 echo "$rc" > "$ART_DIR/exit_code.txt"
+echo "post_convergence_rc=$post_convergence_rc" >> "$ART_DIR/manifest.env"
 
 if [[ "$rc" -eq 0 ]]; then
   echo 'run_status=pass' >> "$ART_DIR/manifest.env"
+elif [[ "$rc" -eq 3 && "$post_convergence_rc" -ne 0 ]]; then
+  echo 'run_status=fail_post_convergence' >> "$ART_DIR/manifest.env"
 elif [[ "$rc" -eq 137 ]]; then
   echo 'run_status=fail_oom' >> "$ART_DIR/manifest.env"
   echo 'oom_suspected=1' >> "$ART_DIR/manifest.env"

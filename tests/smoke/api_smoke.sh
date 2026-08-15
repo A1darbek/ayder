@@ -284,7 +284,12 @@ expect_json "GET /admin/sealed/status" '.ok==true and (.last_synced_batch_id|typ
 
 request POST /admin/sealed/gc '{"max_age_ms":0,"max_bytes":0}'
 mark_route POST /admin/sealed/gc
-expect_json "POST /admin/sealed/gc" '.ok==true and (.sealed_bytes_after|type)=="number"'
+if [[ "$RESP_CODE" == "503" ]]; then
+  expect_json_any_status "POST /admin/sealed/gc" \
+    '.ok==false and .error=="sealed_gc_unavailable"'
+else
+  fail "POST /admin/sealed/gc" "expected disabled 503 contract: HTTP ${RESP_CODE}: $(snippet "$RESP_BODY")"
+fi
 
 request POST /admin/sealed/release '{}'
 mark_route POST /admin/sealed/release

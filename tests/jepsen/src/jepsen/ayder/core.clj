@@ -10,22 +10,32 @@
             [jepsen.ayder.local-remote :as local-remote]
             [knossos.model :as model]))
 
-(defn- nemesis-generator [interval-sec]
-  (cycle [{:f :partition}
-          (gen/sleep interval-sec)
-          {:f :heal}
-          (gen/sleep interval-sec)
-          {:f :kill}
-          (gen/sleep interval-sec)
-          {:f :restart}
-          (gen/sleep interval-sec)]))
+(defn- nemesis-generator [mode interval-sec]
+  (cycle
+    (case mode
+      :kill [{:f :kill}
+             (gen/sleep interval-sec)
+             {:f :restart}
+             (gen/sleep interval-sec)]
+      :partition [{:f :partition}
+                  (gen/sleep interval-sec)
+                  {:f :heal}
+                  (gen/sleep interval-sec)]
+      :mixed [{:f :partition}
+              (gen/sleep interval-sec)
+              {:f :heal}
+              (gen/sleep interval-sec)
+              {:f :kill}
+              (gen/sleep interval-sec)
+              {:f :restart}
+              (gen/sleep interval-sec)])))
 
 (defn- op-stagger-sec [{:keys [client-stagger-ms]}]
   (let [ms (long (or client-stagger-ms 10))]
     (/ (double (max 1 ms)) 1000.0)))
 
 (defn- workload-body
-  [{:keys [time-limit-sec nemesis-enabled nemesis-interval-sec nemesis-startup-sec]} client-ops final-ops]
+  [{:keys [time-limit-sec nemesis-enabled nemesis-mode nemesis-interval-sec nemesis-startup-sec]} client-ops final-ops]
   (let [startup-sec (long (max 0 (or nemesis-startup-sec 10)))
         mixed-sec (if nemesis-enabled
                     (max 1 (- (long time-limit-sec) startup-sec))
@@ -33,20 +43,28 @@
         client-body (gen/clients client-ops)
         mixed-body (if nemesis-enabled
                      (gen/mix [client-body
-                               (gen/nemesis (nemesis-generator nemesis-interval-sec))])
+                               (gen/nemesis (nemesis-generator nemesis-mode nemesis-interval-sec))])
                      client-body)
         warmup-body (when (and nemesis-enabled (pos? startup-sec))
                       (->> client-body
                            (gen/time-limit startup-sec)))
         steady-body (->> mixed-body
-                         (gen/time-limit mixed-sec))]
+                         (gen/time-limit mixed-sec))
+        recovery-phases (when nemesis-enabled
+                          (case nemesis-mode
+                            :kill [(gen/log "Restarting killed node")
+                                   (gen/nemesis {:f :restart})]
+                            :partition [(gen/log "Healing partition")
+                                        (gen/nemesis {:f :heal})]
+                            :mixed [(gen/log "Healing partition and restarting killed node")
+                                    (gen/nemesis {:f :heal})
+                                    (gen/nemesis {:f :restart})]))]
     (apply gen/phases
            (concat
              (when warmup-body [warmup-body])
-             [steady-body
-              (gen/log "Healing nemesis")
-              (gen/nemesis {:f :heal})
-              (->> final-ops
+             [steady-body]
+             recovery-phases
+             [(->> final-ops
                    (gen/clients)
                    (gen/time-limit 5))]))))
 
@@ -140,7 +158,9 @@
 (defn kv-test [opts]
   (let [nodes (:nodes opts)
         history-mode (:linearizable-history-mode opts)
-        name (str "ayder-kv-register-" (if (:nemesis-enabled opts) "nemesis" "steady"))]
+        min-ok (long (or (:min-ok opts) 100))
+        name (str "ayder-kv-register-" (if (:nemesis-enabled opts)
+                                          (name (:nemesis-mode opts)) "steady"))]
     (merge tests/noop-test
            {:name      name
             :nodes     nodes
@@ -151,13 +171,15 @@
             :checker   (checker/compose
                          {:timeline (timeline/html)
                           :linearizable (linearizable-clients-checker (model/register) history-mode)
-                          :min-ok (min-ok-checker 1)
+                          :min-ok (min-ok-checker min-ok)
                           :stats (checker/stats)})})))
 
 (defn broker-test [opts]
   (let [nodes (:nodes opts)
         history-mode (:linearizable-history-mode opts)
-        name (str "ayder-broker-log-" (if (:nemesis-enabled opts) "nemesis" "steady"))]
+        min-ok (long (or (:min-ok opts) 100))
+        name (str "ayder-broker-log-" (if (:nemesis-enabled opts)
+                                         (name (:nemesis-mode opts)) "steady"))]
     (merge tests/noop-test
            {:name      name
             :nodes     nodes
@@ -168,7 +190,7 @@
             :checker   (checker/compose
                          {:timeline (timeline/html)
                           :linearizable (linearizable-clients-checker (broker-model/model) history-mode)
-                          :min-ok (min-ok-checker 1)
+                          :min-ok (min-ok-checker min-ok)
                           :stats (checker/stats)})})))
 
 ;; Backward compatibility for callers expecting ayder-test as KV workload.

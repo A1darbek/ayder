@@ -47,11 +47,11 @@ export RF_HA_ELECTION_TIMEOUT_MS=3000
 export RF_HA_HEARTBEAT_MS=50
 
 # Throughput and bus tuning.
-export RF_HA_MAX_MSG_BYTES=16777216
-export RF_HA_REPLICATION_BATCH=2048
-export RF_BUS_DESC=4194304
-export RF_BUS_HEAP_MB=2048
-export RF_HA_DEDICATED_WORKER=0
+export RF_HA_MAX_MSG_BYTES="${RF_HA_MAX_MSG_BYTES:-16777216}"
+export RF_HA_REPLICATION_BATCH="${RF_HA_REPLICATION_BATCH:-2048}"
+export RF_BUS_DESC="${RF_BUS_DESC:-4194304}"
+export RF_BUS_HEAP_MB="${RF_BUS_HEAP_MB:-2048}"
+export RF_HA_DEDICATED_WORKER="${RF_HA_DEDICATED_WORKER:-0}"
 
 # Stability knobs from latest fixes.
 export RF_HA_BOOTSTRAP_GATE_MS=9000
@@ -71,4 +71,3 @@ export RF_HA_TLS_KEY="../certs/${NODE_ID}.key"
 echo "Loaded HA preset for $NODE_ID"
 echo "  raft_port=$AYDER_RAFT_PORT http_port=$AYDER_HTTP_PORT"
 echo "Start command: ../../ayder --port $AYDER_HTTP_PORT --workers 4"
-

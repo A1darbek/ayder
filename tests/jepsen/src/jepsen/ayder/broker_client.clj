@@ -11,7 +11,9 @@
   #{0 408 425 429 500 502 503 504})
 
 (def uncertain-errors
-  #{"commit_timeout" "timeout" "request_timeout" "no_quorum"})
+  #{"commit_timeout" "timeout" "request_timeout" "no_quorum"
+    "durability_unknown" "replication_failed" "persistence_failed"
+    "idempotency_pending"})
 
 (def failover-errors
   #{"not_leader" "redirect_to_leader" "read_only_follower" "no_quorum" "commit_timeout" "timeout" "request_timeout"})
@@ -186,7 +188,14 @@
 (defn- append-ok-meta [resp]
   (let [j (:json resp)
         off (as-int (:offset j))]
-    (when (and (= 200 (:status resp)) (= true (:ok j)) (integer? off))
+    (when (and (= 200 (:status resp))
+               (= true (:ok j))
+               (= "quorum" (:durability_scope j))
+               (= true (:local_fsync j))
+               (= true (:quorum_committed j))
+               (= true (:failover_safe j))
+               (= true (:applied_all_workers j))
+               (integer? off))
       {:offset off :json j})))
 
 (defn- resolve-append-indeterminate [req candidates]
@@ -259,7 +268,14 @@
               j (:json resp)
               off (as-int (:offset j))]
           (cond
-            (and (= 200 (:status resp)) (= true (:ok j)) (integer? off))
+            (and (= 200 (:status resp))
+                 (= true (:ok j))
+                 (= "quorum" (:durability_scope j))
+                 (= true (:local_fsync j))
+                 (= true (:quorum_committed j))
+                 (= true (:failover_safe j))
+                 (= true (:applied_all_workers j))
+                 (integer? off))
             (assoc op :type :ok :value {:offset off :msg msg})
 
             (indeterminate? resp)

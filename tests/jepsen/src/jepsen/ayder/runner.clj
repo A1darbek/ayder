@@ -5,7 +5,8 @@
             [clojure.string :as str]
             [clojure.tools.cli :refer [parse-opts]]
             [jepsen.core :as jepsen]
-            [jepsen.ayder.core :as core]))
+            [jepsen.ayder.core :as core]
+            [jepsen.ayder.nemesis :as ayder-nemesis]))
 
 (def cli-options
   [["-n" "--nodes URLS" "Comma-separated node URLs"
@@ -31,6 +32,9 @@
    ["-S" "--client-stagger-ms MS" "Delay between client ops (ms); higher lowers checker pressure"
     :default 10
     :parse-fn #(Integer/parseInt %)]
+   ["-M" "--min-ok N" "Minimum successful client operations required for a non-vacuous run"
+    :default 100
+    :parse-fn #(Integer/parseInt %)]
    ["-Y" "--linearizable-history-mode MODE" "Linearizability history mode: all | completed-only"
     :default "all"]
 
@@ -39,6 +43,8 @@
     :parse-fn #(Integer/parseInt %)]
    ["-E" "--nemesis-enabled BOOL" "Enable nemesis"
     :default "true"]
+   ["-F" "--nemesis-mode MODE" "Nemesis mode: kill | partition | mixed"
+    :default "mixed"]
    ["-I" "--nemesis-interval-sec SECONDS" "Seconds between nemesis actions"
     :default 6
     :parse-fn #(Integer/parseInt %)]
@@ -69,6 +75,13 @@
   (case (str/lower-case (str (or s "")))
     "all" :all
     "completed-only" :completed-only
+    :invalid))
+
+(defn- parse-nemesis-mode [s]
+  (case (str/lower-case (str (or s "")))
+    "kill" :kill
+    "partition" :partition
+    "mixed" :mixed
     :invalid))
 
 (defn- split-csv [s]
@@ -118,13 +131,38 @@
                  (get-in result [:linearizable :valid?])
                  (get-in result [:linear :valid?])))
 
-(defn- pass? [result nemesis]
+(defn- expected-nemesis-values [opts]
+  (if-not (:nemesis-enabled opts)
+    #{}
+    (case (:nemesis-mode opts)
+      :kill #{:killed :restarted}
+      :partition #{:partitioned :healed}
+      :mixed #{:partitioned :healed :killed :restarted}
+      #{})))
+
+(defn- nemesis-complete? [opts nemesis]
+  (let [actual (set (keys (:by-value nemesis)))]
+    (every? actual (expected-nemesis-values opts))))
+
+(defn- required-commands-valid? [opts]
+  (if-not (:nemesis-enabled opts)
+    true
+    (let [required (case (:nemesis-mode opts)
+                     :kill [(:kill-cmd opts) (:restart-cmd opts)]
+                     :partition [(:partition-cmd opts) (:heal-cmd opts)]
+                     :mixed [(:partition-cmd opts) (:heal-cmd opts)
+                             (:kill-cmd opts) (:restart-cmd opts)]
+                     [])]
+      (not-any? ayder-nemesis/no-op-command? required))))
+
+(defn- pass? [opts result nemesis]
   (let [lin-valid? (linearizable-valid result)
         overall-valid? (first-present (:valid? result)
                                       (get-in result [:results :valid?]))]
     (and (= true lin-valid?)
          (= true overall-valid?)
-         (zero? (long (or (:error-count nemesis) 0))))))
+         (zero? (long (or (:error-count nemesis) 0)))
+         (nemesis-complete? opts nemesis))))
 (defn- choose-test [opts]
   (case (:workload opts)
     "broker-log" (core/broker-test opts)
@@ -160,7 +198,9 @@
                      :linearizable   (linearizable-valid result)
                      :result_path    (maybe-path result)
                      :nemesis        nemesis
-                     :nemesis-ok     (zero? (long (or (:error-count nemesis) 0)))
+                     :nemesis-complete (nemesis-complete? opts nemesis)
+                     :nemesis-ok     (and (zero? (long (or (:error-count nemesis) 0)))
+                                          (nemesis-complete? opts nemesis))
                      :argv           (vec args)
                      :opts           (redact-opts opts)}]
         (spit (io/file dir-file "summary.json") (json/generate-string summary {:pretty true}))
@@ -182,6 +222,7 @@
     (let [opts (-> options
                    (update :nodes split-csv)
                    (update :nemesis-enabled parse-bool)
+                   (update :nemesis-mode parse-nemesis-mode)
                    (update :linearizable-history-mode parse-history-mode))]
       (when (empty? (:nodes opts))
         (binding [*out* *err*] (println "No nodes provided"))
@@ -195,6 +236,21 @@
       (when (<= (long (:client-stagger-ms opts)) 0)
         (binding [*out* *err*]
           (println "Invalid --client-stagger-ms. Must be > 0"))
+        (System/exit 2))
+
+      (when (= :invalid (:nemesis-mode opts))
+        (binding [*out* *err*]
+          (println "Invalid --nemesis-mode. Allowed: kill, partition, mixed"))
+        (System/exit 2))
+
+      (when-not (required-commands-valid? opts)
+        (binding [*out* *err*]
+          (println "Selected nemesis mode has a blank/no-op fault command"))
+        (System/exit 2))
+
+      (when (<= (long (:min-ok opts)) 0)
+        (binding [*out* *err*]
+          (println "Invalid --min-ok. Must be > 0"))
         (System/exit 2))
 
       (when (< (long (:nemesis-startup-sec opts)) 0)
@@ -212,13 +268,15 @@
       (println "Workload:" (:workload opts))
       (println "Nodes:" (:nodes opts))
       (println "Nemesis enabled:" (:nemesis-enabled opts))
+      (println "Nemesis mode:" (:nemesis-mode opts))
       (println "Nemesis startup sec:" (:nemesis-startup-sec opts))
       (println "Client stagger ms:" (:client-stagger-ms opts))
+      (println "Minimum successful client operations:" (:min-ok opts))
       (println "Linearizable history mode:" (:linearizable-history-mode opts))
 
       (let [result (jepsen/run! (choose-test opts))
             nemesis (nemesis-summary (:history result))
-            ok? (pass? result nemesis)]
+            ok? (pass? opts result nemesis)]
         (try
           (write-artifacts! opts args result nemesis ok?)
           (catch Throwable t

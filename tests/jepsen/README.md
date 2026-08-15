@@ -27,7 +27,15 @@ Model:
 Checker:
 
 - `checker/linearizable` on client processes only
-- `min-ok` guard to reject vacuous runs with zero successful operations
+- configurable `min-ok` guard (default 100) to reject low-availability or
+  vacuous runs
+- write success requires HTTP 200, `ok:true`,
+  `durability_scope:"quorum"`, `local_fsync:true`,
+  `quorum_committed:true`, `failover_safe:true`, and
+  `applied_all_workers:true`
+- the wrapper's post-run gate requires every node healthy, exactly one
+  fresh-quorum leader, no failed HA state, and identical
+  last/commit/applied indices on every node
 - timeline HTML report
 
 Nemesis:
@@ -82,6 +90,7 @@ Important env vars:
 - `AYDER_JEPSEN_TIME`
 - `AYDER_JEPSEN_NEMESIS=true|false`
 - `AYDER_JEPSEN_NEMESIS_INTERVAL`
+- `AYDER_JEPSEN_MIN_OK` (default `100` successful client operations)
 - `AYDER_JEPSEN_PARTITION_CMD`
 - `AYDER_JEPSEN_HEAL_CMD`
 - `AYDER_JEPSEN_KILL_CMD`
@@ -169,6 +178,8 @@ Outputs:
 5. Require `min-ok` checker pass (non-vacuous run).
 6. Publish raw Jepsen result directories + timelines + bundle hash.
 7. Publish exact Ayder commit SHA and full Jepsen command lines.
+8. Require the post-run convergence gate to pass and retain its metrics
+   snapshot.
 
 ## Nemesis Evidence
 
