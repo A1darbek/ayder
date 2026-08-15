@@ -14,12 +14,25 @@ typedef struct {
     int      redirect_status;
     int      retry_after;
     uint64_t last_heartbeat_us;
+    uint64_t commit_index;
+    uint64_t applied_index;
+    uint64_t last_log_index;
+    uint64_t last_log_term;
     uint64_t config_epoch;
     int      joint_active;
     int      has_fresh_quorum;
     char     leader_url[128];
 } ha_shared_snapshot_t;
 _Static_assert(sizeof(ha_shared_snapshot_t) <= 256, "ha_shared_snapshot_t exceeds shared-storage payload budget");
+
+typedef struct {
+    uint64_t raft_index;
+    uint64_t aof_batch_id;
+    int raft_log_fsynced;      /* local indexed Raft log is on stable storage */
+    int quorum_committed;      /* a voting majority durably stores this index */
+    int local_fsync;           /* local state-machine AOF is fsynced */
+    int applied_all_workers;   /* every worker has observed the committed record */
+} ha_write_receipt_t;
 
 int RAMForge_HA_read_snapshot(ha_shared_snapshot_t *out);
 int RAMForge_HA_init(void);
@@ -33,6 +46,10 @@ int RAMForge_HA_get_redirect_status(void);
 int RAMForge_HA_get_retry_after(void);
 int RAMForge_HA_is_follower(void);
 int RAMForge_HA_replicate_write(uint32_t record_type, const void *data, uint32_t size);
+int RAMForge_HA_replicate_write_checked(uint32_t record_type, const void *data,
+                                        uint32_t size, uint32_t timeout_ms,
+                                        ha_write_receipt_t *receipt);
+int RAMForge_HA_handle_write_forward(const void *payload, uint32_t size);
 int RAMForge_HA_linearizable_read_barrier(uint64_t barrier_id, uint32_t timeout_ms);
 const char* RAMForge_HA_get_local_node_id(void);
 const char* RAMForge_HA_get_leader_node_id(void);

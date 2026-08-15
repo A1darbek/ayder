@@ -11,6 +11,7 @@
 #include "storage_thread_safeguard.h"
 #include "metrics_shared.h"
 #include <inttypes.h>
+#include <limits.h>
 #include <stdlib.h>
 #include "rf_broker.h"
 #include "ramforge_ha_integration.h"
@@ -258,6 +259,7 @@ typedef struct {
 } error_response_t;
 
 static void send_error(Response *res, const error_response_t *err) {
+    atomic_fetch_add(&g_metrics.broker_errors_total, 1);
     int n = snprintf(res->buffer, RESPONSE_BUFFER_SIZE,
                      "{\"ok\":false,\"error\":\"%s\",\"message\":\"%s\"%s%s%s}",
                      err->error,
@@ -275,22 +277,6 @@ static inline uint64_t now_us(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000ULL + ts.tv_nsec / 1000;
-}
-
-static inline uint64_t now_us_monotonic(void) {
-    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
-}
-
-static int wait_synced_until(uint64_t batch_id, int timeout_ms) {
-    if (batch_id == 0 || timeout_ms <= 0) return -1;
-    uint64_t start = now_us_monotonic();
-    for (;;) {
-        if (AOF_sealed_last_synced_id() >= batch_id) return 1;
-        if ((now_us_monotonic() - start) / 1000ULL >= (uint64_t)timeout_ms) return 0;
-        /* small sleep to avoid busy spin; adjust as you like */
-        usleep(50);  /* 50??s */
-    }
 }
 
 static inline uint64_t wall_us(void){
@@ -322,8 +308,11 @@ static int qs_u64(const char *qs, const char *name, uint64_t *out){
             p += nlen + 1;
             uint64_t v = 0; int any=0;
             while (*p && *p!='&') {
-                if (*p>='0' && *p<='9') { v = v*10 + (*p-'0'); any=1; }
-                else break;
+                if (*p>='0' && *p<='9') {
+                    uint64_t digit = (uint64_t)(*p-'0');
+                    if (v > (UINT64_MAX - digit) / 10ULL) return 0;
+                    v = v*10 + digit; any=1;
+                } else return 0;
                 p++;
             }
             if (any){ *out=v; return 1; }
@@ -360,20 +349,20 @@ static uint64_t broker_consume_next_barrier_id(void) {
     return (t << 16) ^ seq;
 }
 
-static int broker_consume_send_ha_error(Response *res, int rc) {
+static int linearizable_read_send_ha_error(Response *res, int rc) {
     const char *leader_url = RAMForge_HA_get_leader_url();
     int has_leader = (leader_url && *leader_url);
 
     if (rc == -4) {
         if (has_leader) {
             int n = snprintf(res->buffer, RESPONSE_BUFFER_SIZE,
-                             "{\"ok\":false,\"error\":\"not_leader\",\"message\":\"Linearizable consume is leader-only\",\"leader_url\":\"%s\"}",
+                             "{\"ok\":false,\"error\":\"not_leader\",\"message\":\"Linearizable reads are leader-only\",\"leader_url\":\"%s\"}",
                              leader_url);
             res->buffer[(n > 0 && n < (int)RESPONSE_BUFFER_SIZE) ? n : (RESPONSE_BUFFER_SIZE - 1)] = '\0';
         } else {
             send_error(res, &(error_response_t){
                 .error = "not_leader",
-                .message = "Linearizable consume is leader-only",
+                .message = "Linearizable reads are leader-only",
                 .docs = NULL
             });
         }
@@ -399,7 +388,7 @@ static int broker_consume_send_ha_error(Response *res, int rc) {
     if (rc == -5) {
         send_error(res, &(error_response_t){
             .error = "commit_timeout",
-            .message = "Linearizable consume timed out waiting for read-index barrier",
+            .message = "Linearizable read timed out waiting for read-index barrier",
             .docs = NULL
         });
         return -3;
@@ -407,7 +396,7 @@ static int broker_consume_send_ha_error(Response *res, int rc) {
 
     send_error(res, &(error_response_t){
         .error = "linearizable_read_failed",
-        .message = "Linearizable consume failed",
+        .message = "Linearizable read failed",
         .docs = NULL
     });
     return -3;
@@ -703,6 +692,81 @@ static int jv_to_u64_field(json_value_t *obj, const char *name, uint64_t *out) {
     return 0;
 }
 
+static int linearizable_read_gate(Request *req, Response *res) {
+    if (!RAMForge_HA_is_enabled()) return 0;
+    if (!RAMForge_HA_is_leader())
+        return linearizable_read_send_ha_error(res, -4);
+    if (!RAMForge_HA_has_fresh_quorum())
+        return linearizable_read_send_ha_error(res, -3);
+
+    uint32_t timeout_ms = broker_consume_linearizable_timeout_ms(req);
+    uint64_t barrier_id = broker_consume_next_barrier_id();
+    int rc = RAMForge_HA_linearizable_read_barrier(barrier_id, timeout_ms);
+    if (rc != 0) return linearizable_read_send_ha_error(res, rc);
+    if (rf_wait_ha_read_barrier(barrier_id, timeout_ms) != 0)
+        return linearizable_read_send_ha_error(res, -5);
+    return 0;
+}
+
+static int query_has_parameter(const char *query, const char *name) {
+    if (!query || !name) return 0;
+    size_t name_len = strlen(name);
+    for (const char *p = query; *p;) {
+        if ((p == query || p[-1] == '&') && strncmp(p, name, name_len) == 0 &&
+            p[name_len] == '=') return 1;
+        const char *amp = strchr(p, '&');
+        if (!amp) break;
+        p = amp + 1;
+    }
+    return 0;
+}
+
+/* 0 absent, 1 valid, -1 explicitly present but invalid. */
+static int requested_sync_timeout_ms(const Request *req, int *timeout_ms) {
+    uint64_t value = 0;
+    if (timeout_ms) *timeout_ms = 0;
+    if (!req || !query_has_parameter(req->query_string, "timeout_ms")) return 0;
+    if (!qs_u64(req->query_string, "timeout_ms", &value) ||
+        value == 0 || value > (uint64_t)INT_MAX) return -1;
+    if (timeout_ms) *timeout_ms = (int)value;
+    return 1;
+}
+
+static int send_invalid_sync_timeout(Response *res) {
+    atomic_fetch_add(&g_metrics.broker_errors_total, 1);
+    snprintf(res->buffer, RESPONSE_BUFFER_SIZE,
+             "{\"ok\":false,\"error\":\"invalid_timeout_ms\","
+             "\"message\":\"timeout_ms must be a decimal integer between 1 and %d\"}",
+             INT_MAX);
+    return -4;
+}
+
+static int send_transaction_failure(Response *res, int rc,
+                                    const rf_write_receipt_t *receipt) {
+    atomic_fetch_add(&g_metrics.broker_errors_total, 1);
+    int committed = receipt && receipt->quorum_committed;
+    int local = receipt && receipt->local_fsync;
+    const char *error = committed ? "durability_unknown"
+                       : (rc == -2 ? "persistence_failed" : "replication_failed");
+    const char *message = committed
+        ? "The record is quorum-committed but local application was not confirmed; reconcile before retrying"
+        : "The mutation was not acknowledged because its requested durability scope was not confirmed";
+    int n = snprintf(res->buffer, RESPONSE_BUFFER_SIZE,
+                     "{\"ok\":false,\"error\":\"%s\",\"message\":\"%s\","
+                     "\"batch_id\":%" PRIu64 ",\"raft_index\":%" PRIu64 ","
+                     "\"local_fsync\":%s,\"quorum_committed\":%s,"
+                     "\"failover_safe\":%s,\"applied_all_workers\":%s}",
+                     error, message,
+                     receipt ? receipt->batch_id : 0,
+                     receipt ? receipt->raft_index : 0,
+                     local ? "true" : "false",
+                     committed ? "true" : "false",
+                     (receipt && receipt->failover_safe) ? "true" : "false",
+                     (receipt && receipt->applied_all_workers) ? "true" : "false");
+    res->buffer[(n > 0 && n < (int)RESPONSE_BUFFER_SIZE) ? n : (RESPONSE_BUFFER_SIZE - 1)] = '\0';
+    return -3;
+}
+
 static int jv_to_bool_field(json_value_t *obj, const char *name, int *out) {
     json_value_t *v = json_get_field(obj, name);
     if (!v || v->type != JSON_BOOL) return 0;
@@ -804,6 +868,7 @@ static int query_fingerprint_hex(json_value_t *root, char hex[65]) {
 }
 
 int broker_query_handler(Request *req, Response *res){
+    atomic_fetch_add(&g_metrics.broker_query_total, 1);
     json_value_t *root = json_parse(req->body, req->body_len);
     if (!root || root->type != JSON_OBJECT){
         const char *e = "{\"ok\":false,\"error\":\"invalid_json\"}";
@@ -936,8 +1001,9 @@ int broker_query_handler(Request *req, Response *res){
             if (gkey[0]){
                 size_t k=0; for (; k<agg_n; k++) if (strcmp(aggs[k].key, gkey)==0) break;
                 if (k==agg_n && agg_n < (sizeof aggs/sizeof aggs[0])) {
-                    strncpy(aggs[agg_n].key, gkey, sizeof aggs[agg_n].key-1);
-                    aggs[agg_n].key[sizeof aggs[agg_n].key-1]=0;
+                    size_t group_len = strnlen(gkey, sizeof(gkey) - 1);
+                    memcpy(aggs[agg_n].key, gkey, group_len);
+                    aggs[agg_n].key[group_len] = 0;
                     aggs[agg_n].count=0;
                     agg_n++;
                 }
@@ -1405,7 +1471,16 @@ int broker_join_handler(Request *req, Response *res){
 
     // emit rows
     char *p = res->buffer, *end = res->buffer + RESPONSE_BUFFER_SIZE - 1;
-#define APP(...) do { int __n = snprintf(p, (size_t)(end-p), __VA_ARGS__); if (__n<0) __n=0; p += (__n<(end-p)?__n:(int)(end-p)); } while(0)
+#define APP(...) do {                                                            \
+        if (p <= end) {                                                          \
+            size_t __cap = (size_t)(end - p) + 1;                                \
+            int __n = snprintf(p, __cap, __VA_ARGS__);                           \
+            if (__n > 0) {                                                       \
+                size_t __used = (size_t)__n < __cap ? (size_t)__n : __cap - 1;   \
+                p += __used;                                                     \
+            }                                                                    \
+        }                                                                        \
+    } while (0)
 
     APP("{\"ok\":true,\"rows\":[");
     int emitted=0; int firstRow=1;
@@ -1614,10 +1689,22 @@ int ha_membership_add_handler(Request *req, Response *res) {
     if (http && http->type == JSON_STRING) {
         jv_to_cstr(http, node.http_addr, sizeof(node.http_addr));
     } else {
-        char host[256] = {0};
+        char host[224] = {0};
         int port = 0;
-        if (sscanf(node.advertise_addr, "%255[^:]:%d", host, &port) == 2) {
-            snprintf(node.http_addr, sizeof(node.http_addr), "http://%s:%d", host, port + 1);
+        if (sscanf(node.advertise_addr, "%223[^:]:%d", host, &port) != 2 ||
+            port <= 0 || port >= 65535) {
+            json_free(root);
+            return ha_membership_send_error(
+                res, -6, "bad_request_fields",
+                "advertise_addr must be a bounded host:port with port 1..65534");
+        }
+        int addr_len = snprintf(node.http_addr, sizeof(node.http_addr),
+                                "http://%s:%d", host, port + 1);
+        if (addr_len < 0 || (size_t)addr_len >= sizeof(node.http_addr)) {
+            json_free(root);
+            return ha_membership_send_error(
+                res, -6, "bad_request_fields",
+                "advertise_addr is too long to derive http_addr");
         }
     }
     node.priority = (pri && (pri->type == JSON_INT || pri->type == JSON_DOUBLE))
@@ -1700,6 +1787,7 @@ static inline uint64_t monotonic_us(void){
     return (uint64_t)ts.tv_sec*1000000ull + ts.tv_nsec/1000ull;
 }
 int broker_produce_raw(Request *req, Response *res) {
+    atomic_fetch_add(&g_metrics.broker_produce_total, 1);
 
     uint64_t t0 = monotonic_us();
     uint64_t timing_flag = 0;
@@ -1741,54 +1829,52 @@ int broker_produce_raw(Request *req, Response *res) {
     if (idk_q) idk_len = url_decode_into(idk_buf, sizeof(idk_buf), idk_q, idk_q_len);
 
     const void *val_ptr = req->body; size_t val_len = req->body_len;
+    int timeout_ms = 0;
+    if (requested_sync_timeout_ms(req, &timeout_ms) < 0)
+        return send_invalid_sync_timeout(res);
 
     if (idk_len){
         uint64_t offset=0,batch_id=0; int dup=0;
-        int rc = rf_produce_sealed_idemp(topic_buf, partition,
-                                         key_len?key_buf:NULL, key_len,
-                                         val_ptr, val_len,
-                                         idk_buf, idk_len,
-                                         &offset, &batch_id, &dup);
-        if (rc < 0) {
-            send_error(res, &(error_response_t){
-                    .error = "produce_failed",
-                    .message = "Failed to write message to partition. Check topic exists and partition is valid.",
-                    .docs = "https://ayder.dev/docs/api/produce#troubleshooting"
-            });
-            return -1;
+        int rc = rf_produce_sealed_idemp_checked(
+            topic_buf, partition, key_len ? key_buf : NULL, key_len,
+            val_ptr, val_len, idk_buf, idk_len, (uint32_t)timeout_ms,
+            &offset, &batch_id, &dup);
+        rf_write_receipt_t receipt;
+        rf_last_write_receipt(&receipt);
+        if (rc == RF_ERR_IDEMP_CONFLICT) {
+            snprintf(res->buffer, RESPONSE_BUFFER_SIZE,
+                     "{\"ok\":false,\"error\":\"idempotency_conflict\","
+                     "\"message\":\"The idempotency key is already bound to a different payload\"}");
+            return -4;
         }
-        if (dup){
-            int n = snprintf(res->buffer, RESPONSE_BUFFER_SIZE,
-                             "{\"ok\":true,\"offset\":%" PRIu64 ",\"partition\":%d,"
-                             "\"sealed\":true,\"synced\":null,\"duplicate\":true}",
-                             offset, partition);
-            res->buffer[(n>0&&n<(int)RESPONSE_BUFFER_SIZE)?n:(RESPONSE_BUFFER_SIZE-1)]=0; return 0;
-        }
+        if (rc == RF_ERR_IDEMP_PENDING)
+            return send_transaction_failure(res, rc, &receipt);
+        if (rc < 0) return send_transaction_failure(res, rc, &receipt);
+        const char *scope = receipt.quorum_committed ? "quorum" :
+                            (receipt.local_fsync ? "local" : "memory");
         int n = snprintf(res->buffer, RESPONSE_BUFFER_SIZE,
                          "{\"ok\":true,\"offset\":%" PRIu64 ",\"partition\":%d,"
-                         "\"batch_id\":%" PRIu64 ",\"sealed\":true,\"synced\":true,"
-                         "\"duplicate\":false}", offset, partition, batch_id);
+                         "\"batch_id\":%" PRIu64 ",\"raft_index\":%" PRIu64 ","
+                         "\"durability_scope\":\"%s\",\"local_fsync\":%s,"
+                         "\"quorum_committed\":%s,\"failover_safe\":%s,"
+                         "\"applied_all_workers\":%s,\"duplicate\":%s}",
+                         offset, partition, batch_id, receipt.raft_index, scope,
+                         receipt.local_fsync ? "true" : "false",
+                         receipt.quorum_committed ? "true" : "false",
+                         receipt.failover_safe ? "true" : "false",
+                         receipt.applied_all_workers ? "true" : "false",
+                         dup ? "true" : "false");
         res->buffer[(n>0&&n<(int)RESPONSE_BUFFER_SIZE)?n:(RESPONSE_BUFFER_SIZE-1)]=0; return 0;
     } else {
         uint64_t offset=0,batch_id=0;
-        int rc = rf_produce_sealed(topic_buf, partition,
-                                   key_len?key_buf:NULL, key_len,
-                                   val_ptr, val_len, &offset, &batch_id);
-        if (rc < 0) {
-            send_error(res, &(error_response_t){
-                    .error = "produce_failed",
-                    .message = "Failed to write message to partition. Check topic exists and partition is valid.",
-                    .docs = "https://ayder.dev/docs/api/produce#troubleshooting"
-            });
-            return -1;
-        }
-
-        int timeout_ms=0; uint64_t tmp;
-        if (qs_u64(req->query_string,"timeout_ms",&tmp)) timeout_ms=(int)tmp;
+        int rc = rf_produce_sealed_checked(
+            topic_buf, partition, key_len ? key_buf : NULL, key_len,
+            val_ptr, val_len, (uint32_t)timeout_ms, &offset, &batch_id);
+        rf_write_receipt_t receipt;
+        rf_last_write_receipt(&receipt);
+        if (rc < 0) return send_transaction_failure(res, rc, &receipt);
 
         uint64_t t_after_produce = monotonic_us();
-        int sync_state = wait_synced_until(batch_id, timeout_ms);
-
         uint64_t t_end = monotonic_us();
 
         uint64_t server_us    = t_end - t0;
@@ -1796,9 +1882,13 @@ int broker_produce_raw(Request *req, Response *res) {
         uint64_t sync_wait_us = t_end - t_after_produce;
 
 
-        const char *mode = (batch_id==0) ? "rocket":"sealed";
-        int durable = (batch_id!=0);
-        const char *synced_json = (sync_state<0) ? "null" : (sync_state ? "true":"false");
+        const char *scope = receipt.quorum_committed ? "quorum" :
+                            (receipt.local_fsync ? "local" : "memory");
+        const char *mode = receipt.local_fsync ? "sealed" : "rocket";
+        const char *local_json = receipt.local_fsync ? "true" : "false";
+        const char *quorum_json = receipt.quorum_committed ? "true" : "false";
+        const char *failover_json = receipt.failover_safe ? "true" : "false";
+        const char *workers_json = receipt.applied_all_workers ? "true" : "false";
 
         if (want_timing) {
             uint64_t queue_us = rf_http_queue_us;
@@ -1807,11 +1897,15 @@ int broker_produce_raw(Request *req, Response *res) {
             int n = snprintf(res->buffer, RESPONSE_BUFFER_SIZE,
                              "{\"ok\":true,\"offset\":%" PRIu64 ",\"partition\":%d,"
                              "\"batch_id\":%" PRIu64 ",\"sealed\":true,"
+                             "\"raft_index\":%" PRIu64 ",\"durability_scope\":\"%s\","
+                             "\"local_fsync\":%s,\"quorum_committed\":%s,"
+                             "\"failover_safe\":%s,\"applied_all_workers\":%s,"
                              "\"durable\":%s,\"mode\":\"%s\",\"synced\":%s,"
                              "\"queue_us\":%" PRIu64 ",\"recv_parse_us\":%" PRIu64 ","
                              "\"server_us\":%" PRIu64 ",\"produce_us\":%" PRIu64 ",\"sync_wait_us\":%" PRIu64 "}",
                              offset, partition, batch_id,
-                             durable?"true":"false", mode, synced_json,
+                             receipt.raft_index, scope, local_json, quorum_json,
+                             failover_json, workers_json, local_json, mode, local_json,
                              queue_us, recv_parse_us,
                              server_us, produce_us, sync_wait_us);
 
@@ -1820,15 +1914,20 @@ int broker_produce_raw(Request *req, Response *res) {
             int n = snprintf(res->buffer, RESPONSE_BUFFER_SIZE,
                              "{\"ok\":true,\"offset\":%" PRIu64 ",\"partition\":%d,"
                              "\"batch_id\":%" PRIu64 ",\"sealed\":true,"
+                             "\"raft_index\":%" PRIu64 ",\"durability_scope\":\"%s\","
+                             "\"local_fsync\":%s,\"quorum_committed\":%s,"
+                             "\"failover_safe\":%s,\"applied_all_workers\":%s,"
                              "\"durable\":%s,\"mode\":\"%s\",\"synced\":%s}",
                              offset, partition, batch_id,
-                             durable?"true":"false", mode, synced_json);
+                             receipt.raft_index, scope, local_json, quorum_json,
+                             failover_json, workers_json, local_json, mode, local_json);
             res->buffer[(n>0 && n<(int)RESPONSE_BUFFER_SIZE)?n:(RESPONSE_BUFFER_SIZE-1)] = 0;
         }
         return 0;
     }
 }
 int broker_produce_ndjson(Request *req, Response *res) {
+    atomic_fetch_add(&g_metrics.broker_produce_total, 1);
     /* path: /broker/topics/:topic/produce-ndjson */
     const char *topic=NULL;
     for (int i=0;i<req->param_count;i++)
@@ -1911,49 +2010,82 @@ int broker_produce_ndjson(Request *req, Response *res) {
         return -1;
     }
 
+    int timeout_ms = 0;
+    if (requested_sync_timeout_ms(req, &timeout_ms) < 0) {
+        if (msgs!=stack_msgs) slab_free(msgs);
+        return send_invalid_sync_timeout(res);
+    }
+
     uint64_t first_offset=0, batch_id=0; int duplicate=0; int rc;
     if (idk_len){
-        rc = rf_produce_batch_sealed_idemp(topic_buf, partition, msgs, count,
-                                           idk_buf, idk_len,
-                                           &first_offset, &batch_id, &duplicate);
+        rc = rf_produce_batch_sealed_idemp_checked(
+            topic_buf, partition, msgs, count, idk_buf, idk_len,
+            (uint32_t)timeout_ms, &first_offset, &batch_id, &duplicate);
     } else {
-        rc = rf_produce_batch_sealed(topic_buf, partition, msgs, count,
-                                     &first_offset, &batch_id);
+        rc = rf_produce_batch_sealed_checked(
+            topic_buf, partition, msgs, count, (uint32_t)timeout_ms,
+            &first_offset, &batch_id);
     }
 
     if (msgs!=stack_msgs) slab_free(msgs);
 
-    if (rc<0){
-        memcpy(res->buffer, "{\"error\":\"Sealed batch produce failed\"}", 39);
-        res->buffer[39]=0; return -1;
-    }
+    rf_write_receipt_t receipt;
+    rf_last_write_receipt(&receipt);
 
-    if (idk_len && duplicate){
+    if (rc == RF_ERR_IDEMP_CONFLICT) {
+        snprintf(res->buffer, RESPONSE_BUFFER_SIZE,
+                 "{\"ok\":false,\"error\":\"idempotency_conflict\","
+                 "\"message\":\"The idempotency key is already bound to a different batch payload\"}");
+        return -4;
+    }
+    if (rc == RF_ERR_IDEMP_PENDING)
+        return send_transaction_failure(res, rc, &receipt);
+    if (rc<0) return send_transaction_failure(res, rc, &receipt);
+
+    if (idk_len) {
+        const char *scope = receipt.quorum_committed ? "quorum" :
+                            (receipt.local_fsync ? "local" : "memory");
         int n = snprintf(res->buffer, RESPONSE_BUFFER_SIZE,
                          "{\"ok\":true,\"first_offset\":%" PRIu64 ",\"count\":%zu,"
-                         "\"partition\":%d,\"sealed\":true,\"synced\":null,\"duplicate\":true}",
-                         first_offset, count, partition);
-        res->buffer[(n>0&&n<(int)RESPONSE_BUFFER_SIZE)?n:(RESPONSE_BUFFER_SIZE-1)]=0;
+                         "\"partition\":%d,\"batch_id\":%" PRIu64 ","
+                         "\"raft_index\":%" PRIu64 ",\"durability_scope\":\"%s\","
+                         "\"local_fsync\":%s,\"quorum_committed\":%s,"
+                         "\"failover_safe\":%s,\"applied_all_workers\":%s,"
+                         "\"duplicate\":%s}",
+                         first_offset, count, partition, batch_id,
+                         receipt.raft_index, scope,
+                         receipt.local_fsync ? "true" : "false",
+                         receipt.quorum_committed ? "true" : "false",
+                         receipt.failover_safe ? "true" : "false",
+                         receipt.applied_all_workers ? "true" : "false",
+                         duplicate ? "true" : "false");
+        res->buffer[(n > 0 && n < (int)RESPONSE_BUFFER_SIZE) ? n : (RESPONSE_BUFFER_SIZE - 1)] = 0;
         return 0;
     }
 
-    int timeout_ms=0; uint64_t tmp;
-    if (qs_u64(req->query_string,"timeout_ms",&tmp)) timeout_ms=(int)tmp;
-    int sync_state = wait_synced_until(batch_id, timeout_ms);
-    const char *mode = (batch_id==0) ? "rocket":"sealed";
-    int durable = (batch_id!=0);
-    const char *synced_json = (sync_state<0) ? "null" : (sync_state?"true":"false");
+    const char *scope = receipt.quorum_committed ? "quorum" :
+                        (receipt.local_fsync ? "local" : "memory");
+    const char *mode = receipt.local_fsync ? "sealed" : "rocket";
+    const char *local_json = receipt.local_fsync ? "true" : "false";
 
     int n = snprintf(res->buffer, RESPONSE_BUFFER_SIZE,
                      "{\"ok\":true,\"first_offset\":%" PRIu64 ",\"count\":%zu,"
                      "\"partition\":%d,\"batch_id\":%" PRIu64 ",\"sealed\":true,"
+                     "\"raft_index\":%" PRIu64 ",\"durability_scope\":\"%s\","
+                     "\"local_fsync\":%s,\"quorum_committed\":%s,"
+                     "\"failover_safe\":%s,\"applied_all_workers\":%s,"
                      "\"durable\":%s,\"mode\":\"%s\",\"synced\":%s}",
                      first_offset, count, partition, batch_id,
-                     durable?"true":"false", mode, synced_json);
+                     receipt.raft_index, scope, local_json,
+                     receipt.quorum_committed ? "true" : "false",
+                     receipt.failover_safe ? "true" : "false",
+                     receipt.applied_all_workers ? "true" : "false",
+                     local_json, mode, local_json);
     res->buffer[(n>0&&n<(int)RESPONSE_BUFFER_SIZE)?n:(RESPONSE_BUFFER_SIZE-1)]=0;
     return 0;
 }
 int broker_consume(Request *req, Response *res) {
+    atomic_fetch_add(&g_metrics.broker_consume_total, 1);
     /* path: /broker/consume/:topic/:group/:partition */
     const char* topic_in      = req->params[0].value;
     const char* group_in      = req->params[1].value;
@@ -2005,24 +2137,9 @@ int broker_consume(Request *req, Response *res) {
 
     int want_b64 = (enc_q && enc_len==3 && !strncmp(enc_q,"b64",3)) ? 1 : 0;
 
-    if (RAMForge_HA_is_enabled()) {
-        uint32_t tmo_ms = broker_consume_linearizable_timeout_ms(req);
-
-        if (!RAMForge_HA_is_leader()) {
-            return broker_consume_send_ha_error(res, -4);
-        }
-        if (!RAMForge_HA_has_fresh_quorum()) {
-            return broker_consume_send_ha_error(res, -3);
-        }
-
-        uint64_t barrier_id = broker_consume_next_barrier_id();
-        int brc = RAMForge_HA_linearizable_read_barrier(barrier_id, tmo_ms);
-        if (brc != 0) {
-            return broker_consume_send_ha_error(res, brc);
-        }
-        if (rf_wait_ha_read_barrier(barrier_id, tmo_ms) != 0) {
-            return broker_consume_send_ha_error(res, -5);
-        }
+    {
+        int gate_rc = linearizable_read_gate(req, res);
+        if (gate_rc != 0) return gate_rc;
     }
 
     uint64_t committed = 0;
@@ -2092,6 +2209,7 @@ int broker_consume(Request *req, Response *res) {
 }
 // POST /broker/commit ??? commit consumer offset
 int broker_commit_fast(Request *req, Response *res) {
+    atomic_fetch_add(&g_metrics.broker_commit_total, 1);
     json_value_t* root = json_parse(req->body, req->body_len);
     if (!root || root->type != JSON_OBJECT) {
         send_error(res, &(error_response_t){
@@ -2100,7 +2218,7 @@ int broker_commit_fast(Request *req, Response *res) {
                 .docs = "https://ayder.dev/docs/api/commit"
         });
         if (root) json_free(root);
-        return -1;
+        return -4;
     }
 
     json_value_t* topic_field = json_get_field(root, "topic");
@@ -2112,14 +2230,18 @@ int broker_commit_fast(Request *req, Response *res) {
         topic_field->type != JSON_STRING ||
         group_field->type != JSON_STRING ||
         partition_field->type != JSON_INT ||
-        offset_field->type != JSON_INT) {
+        offset_field->type != JSON_INT ||
+        topic_field->as.s.len == 0 || topic_field->as.s.len >= RF_MAX_TOPIC_LEN ||
+        group_field->as.s.len == 0 || group_field->as.s.len >= RF_MAX_GROUP_LEN ||
+        partition_field->as.i < 0 || partition_field->as.i > 255 ||
+        offset_field->as.i < 0) {
         send_error(res, &(error_response_t){
                 .error = "missing_fields",
-                .message = "Required fields: topic (string), group (string), partition (int), offset (int)",
+                .message = "Required bounded fields: non-empty topic/group, partition 0..255, and non-negative offset",
                 .docs = "https://ayder.dev/docs/api/commit#request-format"
         });
         json_free(root);
-        return -1;
+        return -4;
     }
 
     // Extract fields
@@ -2127,35 +2249,48 @@ int broker_commit_fast(Request *req, Response *res) {
     char group_buf[RF_MAX_GROUP_LEN];
 
     size_t topic_len = topic_field->as.s.len;
-    if (topic_len >= sizeof(topic_buf)) topic_len = sizeof(topic_buf) - 1;
     memcpy(topic_buf, topic_field->as.s.ptr, topic_len);
     topic_buf[topic_len] = '\0';
 
     size_t group_len = group_field->as.s.len;
-    if (group_len >= sizeof(group_buf)) group_len = sizeof(group_buf) - 1;
     memcpy(group_buf, group_field->as.s.ptr, group_len);
     group_buf[group_len] = '\0';
 
     int partition = (int)partition_field->as.i;
     uint64_t offset = (uint64_t)offset_field->as.i;
 
-    // Commit offset using lock-free broker
-    int result = rf_commit(topic_buf, group_buf, partition, offset);
-
-    if (result < 0) {
-        send_error(res, &(error_response_t){
-                .error = "commit_failed",
-                .message = "Failed to commit offset. Partition may not exist or storage is full.",
-                .docs = "https://ayder.dev/docs/api/commit#troubleshooting"
-        });
+    int timeout_ms = 0;
+    if (requested_sync_timeout_ms(req, &timeout_ms) < 0) {
         json_free(root);
-        return -1;
+        return send_invalid_sync_timeout(res);
     }
 
-    // Success response
-    static const char success[] = "{\"ok\":true}";
-    memcpy(res->buffer, success, sizeof(success) - 1);
-    res->buffer[sizeof(success) - 1] = '\0';
+    uint64_t batch_id = 0;
+    rf_write_receipt_t receipt;
+    int result = rf_commit_checked(topic_buf, group_buf, partition, offset,
+                                   (uint32_t)timeout_ms, &batch_id, &receipt);
+
+    if (result < 0) {
+        json_free(root);
+        return send_transaction_failure(res, result, &receipt);
+    }
+
+    const char *scope = receipt.quorum_committed ? "quorum" :
+                        (receipt.local_fsync ? "local" : "memory");
+    int n = snprintf(res->buffer, RESPONSE_BUFFER_SIZE,
+                     "{\"ok\":true,\"batch_id\":%" PRIu64 ","
+                     "\"raft_index\":%" PRIu64 ",\"durability_scope\":\"%s\","
+                     "\"local_fsync\":%s,\"quorum_committed\":%s,"
+                     "\"failover_safe\":%s,\"applied_all_workers\":%s,"
+                     "\"durable\":%s,\"synced\":%s}",
+                     batch_id, receipt.raft_index, scope,
+                     receipt.local_fsync ? "true" : "false",
+                     receipt.quorum_committed ? "true" : "false",
+                     receipt.failover_safe ? "true" : "false",
+                     receipt.applied_all_workers ? "true" : "false",
+                     receipt.local_fsync ? "true" : "false",
+                     receipt.local_fsync ? "true" : "false");
+    res->buffer[(n > 0 && n < (int)RESPONSE_BUFFER_SIZE) ? n : (RESPONSE_BUFFER_SIZE - 1)] = '\0';
 
     json_free(root);
     return 0;
@@ -2247,6 +2382,7 @@ int ready_handler(Request *req, Response *res) {
     } else {
         const char out[] = "{\"ready\":false}";
         memcpy(res->buffer, out, sizeof(out)-1);
+        return -3;
     }
     return 0;
 }
@@ -2261,7 +2397,15 @@ int sealed_gc_handler(Request *req, Response *res) {
 
     uint64_t after = 0;
     int rc = AOF_sealed_gc(age, bytes, &after);
-    if (rc < 0) { memcpy(res->buffer, "{\"error\":\"sealed_gc_failed\"}", 28); res->buffer[28]=0; json_free(root); return -1; }
+    if (rc < 0) {
+        const char unavailable[] =
+            "{\"ok\":false,\"error\":\"sealed_gc_unavailable\","
+            "\"message\":\"Online sealed GC is disabled pending safe cross-process coordination\"}";
+        memcpy(res->buffer, unavailable, sizeof(unavailable) - 1);
+        res->buffer[sizeof(unavailable) - 1] = 0;
+        json_free(root);
+        return -3;
+    }
     int m = snprintf(res->buffer, RESPONSE_BUFFER_SIZE, "{\"ok\":true,\"sealed_bytes_after\":%" PRIu64 "}", after);
     res->buffer[(m>0 && m<(int)RESPONSE_BUFFER_SIZE)?m:(RESPONSE_BUFFER_SIZE-1)] = '\0';
     json_free(root); return 0;
@@ -2271,106 +2415,87 @@ int sealed_gc_handler(Request *req, Response *res) {
 int broker_set_retention_fast(Request *req, Response *res) {
     json_value_t* root = json_parse(req->body, req->body_len);
     if (!root || root->type != JSON_OBJECT) {
-        const char* e = "{\"error\":\"Invalid JSON\"}";
-        memcpy(res->buffer, e, strlen(e)); res->buffer[strlen(e)] = 0;
+        const char *e = "{\"ok\":false,\"error\":\"invalid_json\"}";
+        memcpy(res->buffer, e, strlen(e) + 1);
         if (root) json_free(root);
-        return -1;
+        return -4;
     }
 
-    json_value_t *topic_f  = json_get_field(root, "topic");       // string or "*", optional
-    json_value_t *part_f   = json_get_field(root, "partition");   // int, optional
-    json_value_t *ttl_f    = json_get_field(root, "ttl_ms");      // int, optional
+    json_value_t *topic_f  = json_get_field(root, "topic");
+    json_value_t *part_f   = json_get_field(root, "partition");
+    json_value_t *ttl_f    = json_get_field(root, "ttl_ms");
     json_value_t *maxb_f   = json_get_field(root, "max_bytes");
-    json_value_t *sealed_f = json_get_field(root, "sealed");      // object {max_age_ms,max_bytes}, optional
+    json_value_t *sealed_f = json_get_field(root, "sealed");
+    if (sealed_f) {
+        const char unavailable[] =
+            "{\"ok\":false,\"error\":\"sealed_gc_unavailable\","
+            "\"message\":\"Online sealed GC is disabled; retention was not changed\"}";
+        memcpy(res->buffer, unavailable, sizeof(unavailable));
+        json_free(root);
+        return -3;
+    }
 
-    uint64_t sealed_after = 0;
-    int ttl_applied = 0;
-    int size_applied = 0;
-    int have_any_retention = 0;
+    int has_ttl = ttl_f != NULL;
+    int has_max_bytes = maxb_f != NULL;
+    if ((!has_ttl && !has_max_bytes) ||
+        (has_ttl && (ttl_f->type != JSON_INT || ttl_f->as.i < 0)) ||
+        (has_max_bytes && (maxb_f->type != JSON_INT || maxb_f->as.i < 0)) ||
+        (topic_f && (topic_f->type != JSON_STRING || topic_f->as.s.len == 0 ||
+                     topic_f->as.s.len >= RF_MAX_TOPIC_LEN)) ||
+        (part_f && (part_f->type != JSON_INT || part_f->as.i < -1 ||
+                    part_f->as.i > INT32_MAX))) {
+        const char *e = "{\"ok\":false,\"error\":\"invalid_retention_request\"}";
+        memcpy(res->buffer, e, strlen(e) + 1);
+        json_free(root);
+        return -4;
+    }
 
-    /* Build a single record we???ll persist if either TTL or size was provided */
-    aof_ttl_rec_t rec = (aof_ttl_rec_t) {0};
+    char topic[RF_MAX_TOPIC_LEN];
+    const char *topic_arg = "*";
+    if (topic_f) {
+        memcpy(topic, topic_f->as.s.ptr, topic_f->as.s.len);
+        topic[topic_f->as.s.len] = '\0';
+        topic_arg = topic;
+    }
+    int partition = part_f ? (int)part_f->as.i : -1;
+    int timeout_ms = 0;
+    if (requested_sync_timeout_ms(req, &timeout_ms) < 0) {
+        json_free(root);
+        return send_invalid_sync_timeout(res);
+    }
 
-    /* ----- TTL handling (apply locally) ----- */
-    if (ttl_f && ttl_f->type == JSON_INT) {
-        have_any_retention = 1;
-        uint64_t ttl_ms = (uint64_t) ttl_f->as.i;
-        rec.ttl_ms = ttl_ms;
-
-        int have_topic = (topic_f && topic_f->type == JSON_STRING && topic_f->as.s.len > 0);
-        int part = -1;
-        if (part_f && part_f->type == JSON_INT) part = (int) part_f->as.i;
-
-        if (!have_topic || (topic_f->as.s.len == 1 && topic_f->as.s.ptr[0] == '*')) {
-            rec.partition = -1;
-            rec.topic[0] = '*';
-            rec.topic[1] = 0;
-            ttl_applied = (rf_set_ttl_ms_all(ttl_ms) == 0);
-        } else {
-            size_t n = topic_f->as.s.len;
-            if (n >= sizeof(rec.topic)) n = sizeof(rec.topic) - 1;
-            memcpy(rec.topic, topic_f->as.s.ptr, n);
-            rec.topic[n] = 0;
-            rec.partition = (int32_t) part;
-            ttl_applied = (rf_set_ttl_ms(rec.topic, part, ttl_ms) == 0);
+    rf_write_receipt_t receipt;
+    int rc = rf_set_retention_checked(
+        topic_arg, partition, has_ttl, has_ttl ? (uint64_t)ttl_f->as.i : 0,
+        has_max_bytes, has_max_bytes ? (uint64_t)maxb_f->as.i : 0,
+        (uint32_t)timeout_ms, &receipt);
+    if (rc != 0) {
+        json_free(root);
+        if (rc == -1 || rc == -2) {
+            const char *e = "{\"ok\":false,\"error\":\"topic_or_partition_not_found\"}";
+            memcpy(res->buffer, e, strlen(e) + 1);
+            return -4;
         }
+        return send_transaction_failure(res, rc, &receipt);
     }
 
-    /* ----- SIZE handling (apply locally) ----- */
-    if (maxb_f && maxb_f->type == JSON_INT) {
-        have_any_retention = 1;
-        uint64_t maxb = (uint64_t) maxb_f->as.i;
-        rec.max_bytes = maxb;
-
-        int have_topic = (topic_f && topic_f->type == JSON_STRING && topic_f->as.s.len > 0);
-        int part = -1;
-        if (part_f && part_f->type == JSON_INT) part = (int) part_f->as.i;
-
-        if (!have_topic || (topic_f->as.s.len == 1 && topic_f->as.s.ptr[0] == '*')) {
-            if (rec.topic[0] == 0) {
-                rec.topic[0] = '*';
-                rec.topic[1] = 0;
-                rec.partition = -1;
-            }
-            size_applied = (rf_set_max_bytes_all(maxb) == 0);
-        } else {
-            if (rec.topic[0] == 0) {
-                size_t n = topic_f->as.s.len;
-                if (n >= sizeof(rec.topic)) n = sizeof(rec.topic) - 1;
-                memcpy(rec.topic, topic_f->as.s.ptr, n);
-                rec.topic[n] = 0;
-                rec.partition = (int32_t) part;
-            }
-            size_applied = (rf_set_max_bytes(rec.topic, part, maxb) == 0);
-        }
-    }
-
-    /* Persist the combined retention config if anything was set */
-    if (have_any_retention) {
-        AOF_append_sealed(AOF_REC_BROKER_TTL, &rec, sizeof(rec));
-    }
-
-    if (RAMForge_HA_is_enabled()) {
-        RAMForge_HA_replicate_write(AOF_REC_BROKER_TTL, &rec, sizeof(rec));
-    }
-
-    /* ----- sealed file GC (one-shot) ----- */
-    if (sealed_f && sealed_f->type == JSON_OBJECT) {
-        json_value_t *age_f   = json_get_field(sealed_f, "max_age_ms");
-        json_value_t *bytes_f = json_get_field(sealed_f, "max_bytes");
-        uint64_t age   = (age_f   && age_f->type   == JSON_INT) ? (uint64_t)age_f->as.i   : 0;
-        uint64_t bytes = (bytes_f && bytes_f->type == JSON_INT) ? (uint64_t)bytes_f->as.i : 0;
-        AOF_sealed_gc(age, bytes, &sealed_after);
-    }
-
+    const char *scope = receipt.quorum_committed ? "quorum" :
+                        (receipt.local_fsync ? "local" : "memory");
     int n = snprintf(res->buffer, RESPONSE_BUFFER_SIZE,
                      "{\"ok\":true,\"ttl_applied\":%s,\"size_applied\":%s,"
-                     "\"sealed_bytes_after\":%" PRIu64 "}",
-                     ttl_applied ? "true" : "false",
-                     size_applied ? "true" : "false",
-                     sealed_after);
-    res->buffer[(n>0 && n<(int)RESPONSE_BUFFER_SIZE)?n:(RESPONSE_BUFFER_SIZE-1)] = '\0';
-
+                     "\"sealed_bytes_after\":0,\"batch_id\":%" PRIu64 ","
+                     "\"raft_index\":%" PRIu64 ",\"durability_scope\":\"%s\","
+                     "\"local_fsync\":%s,\"quorum_committed\":%s,"
+                     "\"failover_safe\":%s,\"applied_all_workers\":%s}",
+                     has_ttl ? "true" : "false",
+                     has_max_bytes ? "true" : "false",
+                     receipt.batch_id, receipt.raft_index, scope,
+                     receipt.local_fsync ? "true" : "false",
+                     receipt.quorum_committed ? "true" : "false",
+                     receipt.failover_safe ? "true" : "false",
+                     receipt.applied_all_workers ? "true" : "false");
+    res->buffer[(n > 0 && n < (int)RESPONSE_BUFFER_SIZE) ? n :
+                (RESPONSE_BUFFER_SIZE - 1)] = '\0';
     json_free(root);
     return 0;
 }
@@ -2393,7 +2518,10 @@ int broker_delete_before_offset(Request *req, Response *res) {
     if (!topic_field || !partition_field || !before_offset_field ||
         topic_field->type != JSON_STRING ||
         partition_field->type != JSON_INT ||
-        before_offset_field->type != JSON_INT) {
+        before_offset_field->type != JSON_INT ||
+        topic_field->as.s.len == 0 || topic_field->as.s.len >= RF_MAX_TOPIC_LEN ||
+        partition_field->as.i < 0 || partition_field->as.i > UINT16_MAX ||
+        before_offset_field->as.i < 0) {
         const char* error = "{\"error\":\"Missing required fields\"}";
         memcpy(res->buffer, error, strlen(error));
         res->buffer[strlen(error)] = '\0';
@@ -2403,28 +2531,45 @@ int broker_delete_before_offset(Request *req, Response *res) {
 
     char topic_buf[RF_MAX_TOPIC_LEN];
     size_t topic_len = topic_field->as.s.len;
-    if (topic_len >= sizeof(topic_buf)) topic_len = sizeof(topic_buf) - 1;
     memcpy(topic_buf, topic_field->as.s.ptr, topic_len);
     topic_buf[topic_len] = '\0';
 
     int partition = (int)partition_field->as.i;
     uint64_t before = (uint64_t)before_offset_field->as.i;
-
-    uint64_t deleted = 0, freed = 0;
-    int rc = rf_delete_before(topic_buf, partition, before, &deleted, &freed);
-    if (rc < 0) {
-        const char* error = (rc == -2)
-                            ? "{\"error\":\"Topic or partition not found\"}"
-                            : "{\"error\":\"Delete-before failed\"}";
-        memcpy(res->buffer, error, strlen(error));
-        res->buffer[strlen(error)] = '\0';
+    int timeout_ms = 0;
+    if (requested_sync_timeout_ms(req, &timeout_ms) < 0) {
         json_free(root);
-        return -1;
+        return send_invalid_sync_timeout(res);
     }
 
+    uint64_t deleted = 0, freed = 0;
+    rf_write_receipt_t receipt;
+    int rc = rf_delete_before_checked(topic_buf, partition, before,
+                                      (uint32_t)timeout_ms, &deleted, &freed,
+                                      &receipt);
+    if (rc < 0) {
+        json_free(root);
+        if (rc == -1 || rc == -2) {
+            const char *error = "{\"ok\":false,\"error\":\"topic_or_partition_not_found\"}";
+            memcpy(res->buffer, error, strlen(error) + 1);
+            return -4;
+        }
+        return send_transaction_failure(res, rc, &receipt);
+    }
+
+    const char *scope = receipt.quorum_committed ? "quorum" :
+                        (receipt.local_fsync ? "local" : "memory");
     int n = snprintf(res->buffer, RESPONSE_BUFFER_SIZE,
-                     "{\"ok\":true,\"deleted_count\":%" PRIu64 ",\"freed_bytes\":%" PRIu64 "}",
-                     deleted, freed);
+                     "{\"ok\":true,\"deleted_count\":%" PRIu64 ","
+                     "\"freed_bytes\":%" PRIu64 ",\"batch_id\":%" PRIu64 ","
+                     "\"raft_index\":%" PRIu64 ",\"durability_scope\":\"%s\","
+                     "\"local_fsync\":%s,\"quorum_committed\":%s,"
+                     "\"failover_safe\":%s,\"applied_all_workers\":%s}",
+                     deleted, freed, receipt.batch_id, receipt.raft_index, scope,
+                     receipt.local_fsync ? "true" : "false",
+                     receipt.quorum_committed ? "true" : "false",
+                     receipt.failover_safe ? "true" : "false",
+                     receipt.applied_all_workers ? "true" : "false");
     res->buffer[(n>0 && n<(int)RESPONSE_BUFFER_SIZE)?n:(RESPONSE_BUFFER_SIZE-1)] = '\0';
 
     json_free(root);
@@ -2445,6 +2590,11 @@ int kv_get_handler(Request *req, Response *res){
                 .docs="https://ayder.dev/docs/api/kv#get"
         });
         return 0;
+    }
+
+    {
+        int gate_rc = linearizable_read_gate(req, res);
+        if (gate_rc != 0) return gate_rc;
     }
 
     int skey = kv_int_key(ns,key);
@@ -2494,6 +2644,11 @@ int kv_meta_handler(Request *req, Response *res){
     }
     if (!ns || !key) { strcpy(res->buffer, "{\"error\":\"bad_params\"}"); return 0; }
 
+    {
+        int gate_rc = linearizable_read_gate(req, res);
+        if (gate_rc != 0) return gate_rc;
+    }
+
     int skey = kv_int_key(ns,key);
     uint8_t buf[MAX_DATA_SIZE];
     if (!shared_storage_get_fast(g_shared_storage, skey, buf, sizeof(buf))) {
@@ -2513,6 +2668,10 @@ int kv_meta_handler(Request *req, Response *res){
 
 /* ---------- POST /kv/:ns/:key+ (CAS/TTL) ---------- */
 int kv_put_handler(Request *req, Response *res){
+    int timeout_ms = 0;
+    if (requested_sync_timeout_ms(req, &timeout_ms) < 0)
+        return send_invalid_sync_timeout(res);
+
     const char *ns=NULL, *key=NULL;
     for (int i=0;i<req->param_count;i++){
         if (!ns && strcmp(req->params[i].name,"ns")==0)  ns  = req->params[i].value;
@@ -2529,29 +2688,6 @@ int kv_put_handler(Request *req, Response *res){
     }
 
     int skey = kv_int_key(ns,key);
-    uint8_t curbuf[MAX_DATA_SIZE];
-    uint64_t cur_cas = 0;
-    int have = shared_storage_get_fast(g_shared_storage, skey, curbuf, sizeof(curbuf));
-    if (have) {
-        kvrec_t *r = (kvrec_t*)curbuf;
-        cur_cas = r->cas;
-    }
-
-    // CAS check (only if provided)
-    if (want_cas != UINT64_MAX && want_cas != cur_cas) {
-        int n = snprintf(res->buffer, RESPONSE_BUFFER_SIZE,
-                         "{\"ok\":false,\"error\":\"cas_mismatch\","
-                         "\"message\":\"CAS value %llu does not match current %llu. Key was modified by another client.\","
-                         "\"expected\":%llu,\"current\":%llu,"
-                         "\"docs\":\"https://ayder.dev/docs/api/kv#cas\"}",
-                         (unsigned long long)want_cas, (unsigned long long)cur_cas,
-                         (unsigned long long)want_cas, (unsigned long long)cur_cas
-        );
-        res->buffer[(n>0 && n<(int)RESPONSE_BUFFER_SIZE)?n:(RESPONSE_BUFFER_SIZE-1)] = '\0';
-        return 0;
-    }
-
-    // Build new record (decide CAS now so all workers see the same CAS)
     size_t need = sizeof(kvrec_t) + req->body_len;
     if (need > MAX_DATA_SIZE) {
         int max_payload = (int)(MAX_DATA_SIZE - sizeof(kvrec_t));
@@ -2565,70 +2701,47 @@ int kv_put_handler(Request *req, Response *res){
         res->buffer[(n>0 && n<(int)RESPONSE_BUFFER_SIZE)?n:(RESPONSE_BUFFER_SIZE-1)] = '\0';
         return 0;
     }
-    uint8_t *buf = (uint8_t*)alloca(need);
-    kvrec_t *nw = (kvrec_t*)buf;
-    nw->cas = cur_cas + 1;
-    nw->flags = 0;
-    nw->value_len = (uint32_t)req->body_len;
-    nw->expires_us = ttl_ms ? (wall_us() + ttl_ms*1000ULL) : 0;
-    if (req->body_len) memcpy(nw->value, req->body, req->body_len);
-
-    if (shared_storage_set(g_shared_storage, skey, buf, need) != 0) {
-        strcpy(res->buffer, "{\"ok\":false,\"error\":\"storage_full\"}");
+    uint64_t new_cas = 0, current_cas = 0;
+    rf_write_receipt_t receipt;
+    int rc = rf_kv_put_transaction(
+        skey, want_cas != UINT64_MAX, want_cas,
+        ttl_ms ? (wall_us() + ttl_ms * 1000ULL) : 0,
+        req->body, (uint32_t)req->body_len, (uint32_t)timeout_ms,
+        &new_cas, &current_cas, &receipt);
+    if (rc == 1) {
+        int n = snprintf(res->buffer, RESPONSE_BUFFER_SIZE,
+                         "{\"ok\":false,\"error\":\"cas_mismatch\","
+                         "\"expected\":%" PRIu64 ",\"current\":%" PRIu64 "}",
+                         want_cas, current_cas);
+        res->buffer[(n > 0 && n < (int)RESPONSE_BUFFER_SIZE) ? n : (RESPONSE_BUFFER_SIZE - 1)] = '\0';
         return 0;
     }
+    if (rc != 0) return send_transaction_failure(res, rc, &receipt);
 
-    /* --- sealed/rocket append --- */
-    uint64_t batch_id = 0;
-    {
-        aof_kv_put_t hdr = {
-                .skey       = skey,
-                .cas        = nw->cas,
-                .expires_us = nw->expires_us,
-                .flags      = nw->flags,
-                .value_len  = nw->value_len
-        };
-        size_t payload_sz = sizeof(hdr) + nw->value_len;
-        void *payload = alloca(payload_sz);
-        memcpy(payload, &hdr, sizeof(hdr));
-        if (nw->value_len) memcpy((uint8_t *) payload + sizeof(hdr), nw->value, nw->value_len);
-
-        const char *rocket_env = getenv("RF_ROCKET");
-        const int rocket_on = (rocket_env && rocket_env[0] != '\0' && rocket_env[0] != '0');
-        if (rocket_on) {
-            /* broadcast to all workers, non-durable */
-            (void) rf_bus_publish(AOF_REC_KV_PUT, payload, (uint32_t) payload_sz);
-            batch_id = 0;
-        } else {
-            batch_id = AOF_append_sealed(AOF_REC_KV_PUT, payload, payload_sz);
-        }
-
-        if (RAMForge_HA_is_enabled()) {
-            RAMForge_HA_replicate_write(AOF_REC_KV_PUT, payload, payload_sz);
-        }
-    }
-
-    /* optional fsync wait */
-    int timeout_ms = 0;
-    uint64_t tmp;
-    if (qs_u64(req->query_string, "timeout_ms", &tmp)) timeout_ms = (int) tmp;
-    int sync_state = wait_synced_until(batch_id, timeout_ms);
-    const char *mode = (batch_id == 0) ? "rocket" : "sealed";
-    int durable = (batch_id != 0);
-    const char *synced_json = (sync_state < 0) ? "null" : (sync_state ? "true" : "false");
-
+    const char *scope = receipt.quorum_committed ? "quorum" :
+                        (receipt.local_fsync ? "local" : "memory");
     int n = snprintf(res->buffer, RESPONSE_BUFFER_SIZE,
                      "{\"ok\":true,\"cas\":%" PRIu64 ","
-                     "\"sealed\":true,\"durable\":%s,"
-                     "\"mode\":\"%s\",\"synced\":%s,"
-                     "\"batch_id\":%" PRIu64 "}",
-                     nw->cas, durable ? "true" : "false", mode, synced_json, batch_id);
+                     "\"durability_scope\":\"%s\",\"local_fsync\":%s,"
+                     "\"quorum_committed\":%s,\"failover_safe\":%s,"
+                     "\"applied_all_workers\":%s,\"batch_id\":%" PRIu64 ","
+                     "\"raft_index\":%" PRIu64 "}",
+                     new_cas, scope,
+                     receipt.local_fsync ? "true" : "false",
+                     receipt.quorum_committed ? "true" : "false",
+                     receipt.failover_safe ? "true" : "false",
+                     receipt.applied_all_workers ? "true" : "false",
+                     receipt.batch_id, receipt.raft_index);
     (void) n;
     return 0;
 }
 
 /* ---------- DELETE /kv/:ns/:key+ (CAS) ---------- */
 int kv_delete_handler(Request *req, Response *res){
+    int timeout_ms = 0;
+    if (requested_sync_timeout_ms(req, &timeout_ms) < 0)
+        return send_invalid_sync_timeout(res);
+
     const char *ns=NULL, *key=NULL;
     for (int i=0;i<req->param_count;i++){
         if (!ns && strcmp(req->params[i].name,"ns")==0)  ns  = req->params[i].value;
@@ -2640,61 +2753,38 @@ int kv_delete_handler(Request *req, Response *res){
     if (req->query_string) qs_u64(req->query_string,"cas",&want_cas);
 
     int skey = kv_int_key(ns,key);
-    uint8_t curbuf[MAX_DATA_SIZE];
-    if (!shared_storage_get_fast(g_shared_storage, skey, curbuf, sizeof(curbuf))) {
+    uint64_t new_cas = 0, current_cas = 0;
+    rf_write_receipt_t receipt;
+    int rc = rf_kv_delete_transaction(
+        skey, want_cas != UINT64_MAX, want_cas, (uint32_t)timeout_ms,
+        &new_cas, &current_cas, &receipt);
+    if (rc == 2) {
         strcpy(res->buffer, "{\"ok\":true,\"deleted\":false}");
         return 0;
     }
-    kvrec_t *r = (kvrec_t*)curbuf;
-    if (want_cas != UINT64_MAX && want_cas != r->cas) {
+    if (rc == 1) {
         int n = snprintf(res->buffer, RESPONSE_BUFFER_SIZE,
-                         "{\"ok\":false,\"error\":\"cas_mismatch\",\"current\":%" PRIu64 "}", r->cas);
-        (void)n; return 0;
+                         "{\"ok\":false,\"error\":\"cas_mismatch\","
+                         "\"current\":%" PRIu64 "}", current_cas);
+        res->buffer[(n > 0 && n < (int)RESPONSE_BUFFER_SIZE) ? n : (RESPONSE_BUFFER_SIZE - 1)] = '\0';
+        return 0;
     }
+    if (rc != 0) return send_transaction_failure(res, rc, &receipt);
 
-    // tombstone record (keeps CAS history; safe in shared table that lacks delete)
-    uint8_t buf[sizeof(kvrec_t)];
-    kvrec_t *del = (kvrec_t*)buf;
-    del->cas = r->cas + 1;
-    del->flags = KV_FLAG_TOMBSTONE;
-    del->value_len = 0;
-    del->expires_us = 0;
-
-    shared_storage_set(g_shared_storage, skey, buf, sizeof(buf));
-
-    /* sealed/rocket append for delete */
-    uint64_t batch_id = 0;
-    {
-        aof_kv_del_t d = {.skey = skey, .cas = del->cas, .flags = del->flags};
-        const char *rocket_env = getenv("RF_ROCKET");
-        const int rocket_on = (rocket_env && rocket_env[0] != '\0' && rocket_env[0] != '0');
-        if (rocket_on) {
-            (void) rf_bus_publish(AOF_REC_KV_DEL, &d, (uint32_t) sizeof(d));
-            batch_id = 0;
-        } else {
-            batch_id = AOF_append_sealed(AOF_REC_KV_DEL, &d, sizeof(d));
-        }
-
-        if (RAMForge_HA_is_enabled()) {
-            RAMForge_HA_replicate_write(AOF_REC_KV_DEL, &d, sizeof(d));
-        }
-
-
-    }
-    int timeout_ms = 0;
-    uint64_t tmp;
-    if (qs_u64(req->query_string, "timeout_ms", &tmp)) timeout_ms = (int) tmp;
-    int sync_state = wait_synced_until(batch_id, timeout_ms);
-    const char *mode = (batch_id == 0) ? "rocket" : "sealed";
-    int durable = (batch_id != 0);
-    const char *synced_json = (sync_state < 0) ? "null" : (sync_state ? "true" : "false");
-
+    const char *scope = receipt.quorum_committed ? "quorum" :
+                        (receipt.local_fsync ? "local" : "memory");
     int n = snprintf(res->buffer, RESPONSE_BUFFER_SIZE,
-                     "{\"ok\":true,\"deleted\":true,"
-                     "\"sealed\":true,\"durable\":%s,"
-                     "\"mode\":\"%s\",\"synced\":%s,"
-                     "\"batch_id\":%" PRIu64 "}",
-                     durable ? "true" : "false", mode, synced_json, batch_id);
+                     "{\"ok\":true,\"deleted\":true,\"cas\":%" PRIu64 ","
+                     "\"durability_scope\":\"%s\",\"local_fsync\":%s,"
+                     "\"quorum_committed\":%s,\"failover_safe\":%s,"
+                     "\"applied_all_workers\":%s,\"batch_id\":%" PRIu64 ","
+                     "\"raft_index\":%" PRIu64 "}",
+                     new_cas, scope,
+                     receipt.local_fsync ? "true" : "false",
+                     receipt.quorum_committed ? "true" : "false",
+                     receipt.failover_safe ? "true" : "false",
+                     receipt.applied_all_workers ? "true" : "false",
+                     receipt.batch_id, receipt.raft_index);
     res->buffer[(n > 0 && n < (int) RESPONSE_BUFFER_SIZE) ? n : (RESPONSE_BUFFER_SIZE - 1)] = 0;
     return 0;
 }

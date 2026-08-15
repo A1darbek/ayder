@@ -18,13 +18,27 @@ static inline uint32_t mix32(uint32_t x) {
 
 /// Initialize with a small power-of-two capacity.
 void storage_init(Storage *st) {
+    if (!st) return;
+    memset(st, 0, sizeof(*st));
     const char *env_cap = getenv("RAMFORGE_INIT_CAPACITY");
-    st->capacity = env_cap ? (size_t)strtoull(env_cap, NULL, 10) : 131072;
+    size_t requested = env_cap ? (size_t)strtoull(env_cap, NULL, 10) : 131072;
+    if (requested < 16) requested = 16;
+    size_t capacity = 16;
+    while (capacity < requested && capacity <= SIZE_MAX / 2) capacity <<= 1;
+    if (capacity < requested) return;
+    st->capacity = capacity;
     st->size     = 0;
     st->flags    = calloc(st->capacity, sizeof(uint8_t));
-    st->keys     = malloc(st->capacity * sizeof(int));
-    st->values   = malloc(st->capacity * sizeof(void*));
-    st->val_sizes= malloc(st->capacity * sizeof(size_t));
+    st->keys     = calloc(st->capacity, sizeof(int));
+    st->values   = calloc(st->capacity, sizeof(void*));
+    st->val_sizes= calloc(st->capacity, sizeof(size_t));
+    if (!st->flags || !st->keys || !st->values || !st->val_sizes) {
+        free(st->flags);
+        free(st->keys);
+        free(st->values);
+        free(st->val_sizes);
+        memset(st, 0, sizeof(*st));
+    }
 }
 
 /// Free all data blocks and arrays.
@@ -33,7 +47,7 @@ void storage_destroy(Storage *st) {
     atomic_thread_fence(memory_order_seq_cst);   /* let writer threads finish */
 
     // Free all occupied buckets
-    for (size_t i = 0; i < st->capacity; i++) {
+    for (size_t i = 0; st->flags && i < st->capacity; i++) {
         if (st->flags[i] == BUCKET_OCCUPIED && st->values[i] != NULL) {
             free(st->values[i]);
             st->values[i] = NULL;  // Prevent double-free
@@ -55,41 +69,75 @@ void storage_destroy(Storage *st) {
     st->size = 0;
 }
 
-/// Rehash into a new table twice as large
-static void storage_rehash(Storage *st) {
-    size_t old_cap = st->capacity;
-    uint8_t *old_flags = st->flags;
-    int     *old_keys  = st->keys;
-    void    **old_vals = st->values;
-    size_t  *old_sz    = st->val_sizes;
-
-    st->capacity *= 2;
-    st->size = 0;
-    st->flags    = calloc(st->capacity, sizeof(uint8_t));
-    st->keys     = malloc(st->capacity * sizeof(int));
-    st->values   = malloc(st->capacity * sizeof(void*));
-    st->val_sizes= malloc(st->capacity * sizeof(size_t));
-
-    for (size_t i = 0; i < old_cap; i++) {
-        if (old_flags[i] == BUCKET_OCCUPIED) {
-            storage_save(st, old_keys[i], old_vals[i], old_sz[i]);
-            // storage_save makes its own copy, so free old buffer
-            free(old_vals[i]);
+static void storage_insert_owned(Storage *st, int key, void *value, size_t size) {
+    size_t mask = st->capacity - 1;
+    size_t index = mix32((uint32_t)key) & mask;
+    size_t distance = 0;
+    for (;;) {
+        if (st->flags[index] != BUCKET_OCCUPIED) {
+            st->flags[index] = BUCKET_OCCUPIED;
+            st->keys[index] = key;
+            st->values[index] = value;
+            st->val_sizes[index] = size;
+            st->size++;
+            return;
         }
+        uint32_t occupant_hash = mix32((uint32_t)st->keys[index]);
+        size_t occupant_distance =
+            (index + st->capacity - (occupant_hash & mask)) & mask;
+        if (occupant_distance < distance) {
+            int displaced_key = st->keys[index];
+            void *displaced_value = st->values[index];
+            size_t displaced_size = st->val_sizes[index];
+            st->keys[index] = key;
+            st->values[index] = value;
+            st->val_sizes[index] = size;
+            key = displaced_key;
+            value = displaced_value;
+            size = displaced_size;
+            distance = occupant_distance;
+        }
+        index = (index + 1) & mask;
+        distance++;
     }
-    free(old_flags);
-    free(old_keys);
-    free(old_vals);
-    free(old_sz);
+}
+
+/// Rehash into a new table twice as large without changing the old table on OOM.
+static int storage_rehash(Storage *st) {
+    if (!st || st->capacity > SIZE_MAX / 2) return -1;
+    Storage next = {.capacity = st->capacity * 2};
+    next.flags = calloc(next.capacity, sizeof(uint8_t));
+    next.keys = calloc(next.capacity, sizeof(int));
+    next.values = calloc(next.capacity, sizeof(void *));
+    next.val_sizes = calloc(next.capacity, sizeof(size_t));
+    if (!next.flags || !next.keys || !next.values || !next.val_sizes) {
+        free(next.flags);
+        free(next.keys);
+        free(next.values);
+        free(next.val_sizes);
+        return -1;
+    }
+    for (size_t i = 0; i < st->capacity; i++) {
+        if (st->flags[i] == BUCKET_OCCUPIED)
+            storage_insert_owned(&next, st->keys[i], st->values[i],
+                                 st->val_sizes[i]);
+    }
+    free(st->flags);
+    free(st->keys);
+    free(st->values);
+    free(st->val_sizes);
+    *st = next;
+    return 0;
 }
 
 /// Insert or update via Robin-Hood hashing
-void storage_save(Storage *st, int id, const void *data, size_t size) {
-    if (st == NULL || data == NULL) return;
+int storage_save(Storage *st, int id, const void *data, size_t size) {
+    if (!st || (!data && size) || !st->flags || !st->keys || !st->values ||
+        !st->val_sizes || st->capacity == 0) return -1;
 
     // Grow if load factor > 0.7
     if ((double)(st->size + 1) / st->capacity > 0.7) {
-        storage_rehash(st);
+        if (storage_rehash(st) != 0) return -1;
     }
 
     uint32_t hash = mix32((uint32_t)id);
@@ -104,9 +152,9 @@ void storage_save(Storage *st, int id, const void *data, size_t size) {
 
     // Prepare new entry
     int    new_key = id;
-    void  *new_val = malloc(size);
-    if (new_val == NULL) return;  // Handle malloc failure
-    memcpy(new_val, data, size);
+    void  *new_val = malloc(size ? size : 1);
+    if (new_val == NULL) return -1;
+    if (size) memcpy(new_val, data, size);
     size_t new_sz  = size;
 
     for (;;) {
@@ -119,7 +167,7 @@ void storage_save(Storage *st, int id, const void *data, size_t size) {
             st->val_sizes[idx] = new_sz;
             st->size++;
 
-            return;
+            return 0;
         }
 
         // Check if this is the same key (update case)
@@ -127,7 +175,7 @@ void storage_save(Storage *st, int id, const void *data, size_t size) {
             free(st->values[idx]);
             st->values[idx] = new_val;
             st->val_sizes[idx] = new_sz;
-            return;
+            return 0;
         }
 
         // Compute existing entry's probe distance

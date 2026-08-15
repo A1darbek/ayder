@@ -47,6 +47,7 @@ void AOF_sync(void);
 size_t AOF_pending_writes(void);
 uint64_t AOF_append_sealed(int id, const void *data, size_t sz);
 uint64_t AOF_sealed_last_synced_id(void);
+int AOF_sealed_is_healthy(void);
 size_t   AOF_sealed_replay(const char *aof_path);
 int AOF_rewrite_nonblocking(Storage *st);
 

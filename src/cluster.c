@@ -31,12 +31,16 @@ extern RAMForgeMetrics *g_metrics_ptr;   /* declared, not defined */
 void init_shared_metrics(void);          /* just the prototype */
 
 static pid_t manager_pid = -1;  /* parent-only state */
-static volatile int  cluster_shutdown = 0;
+static volatile sig_atomic_t cluster_shutdown = 0;
 static pid_t        *worker_pids      = NULL;
 static int           worker_count     = 0;
 static int           single_process_mode = 0;
 
 static volatile sig_atomic_t shut_once = 0;
+
+int cluster_shutdown_is_requested(void) {
+    return cluster_shutdown != 0;
+}
 
 /* ────────── CLI / ENV helpers ────────── */
 int detect_worker_target(int argc, char **argv) {
@@ -120,6 +124,11 @@ static App* init_worker_systems(int wid) {
     // Keep local storage for worker-specific data and caching
     static Storage storage;
     storage_init(&storage);
+    if (!storage.flags || !storage.keys || !storage.values ||
+        !storage.val_sizes) {
+        fprintf(stderr, "❌ Worker %d failed to initialize local storage\n", wid);
+        return NULL;
+    }
 
     // ADDITION: Attach to shared storage (created by parent process)
     if (!g_shared_storage) {
@@ -156,6 +165,10 @@ static App* init_worker_systems(int wid) {
         // IMPORTANT: Pass LOCAL storage to persistence (for AOF recovery)
         // but your HTTP handlers will use shared storage for live data
         Persistence_zp_init( aof, &storage, enhanced_flush_ms);
+        if (!Persistence_is_ready()) {
+            fprintf(stderr, "❌ Worker %d persistence initialization did not become ready\n", wid);
+            return NULL;
+        }
         if (single_process_mode || wid == 0) {
             printf("✓ AOF persistence enabled (flush_ms=%u)\n", enhanced_flush_ms);
             printf("   Ring capacity: 128K entries\n");
@@ -215,10 +228,17 @@ static void run_worker(int wid, int port) {
 
     const char *ha_en = getenv("RF_HA_ENABLED");
     if (ha_en && ha_en[0] == '1') {
+        if (!Persistence_is_ready()) {
+            fprintf(stderr,
+                    "❌ Worker %d cannot start HA without initialized durable persistence\n",
+                    wid);
+            exit(EXIT_FAILURE);
+        }
         if (wid > 0) setenv("RF_HA_AGENT_ONLY", "1", 1);
         printf("🔧 Worker %d initializing HA (%s)...\n", wid, (wid == 0 ? "leader-runtime" : "agent-only"));
         if (RAMForge_HA_init() != 0) {
-            fprintf(stderr, "⚠️  Worker %d HA init failed - continuing without HA\n", wid);
+            fprintf(stderr, "❌ Worker %d HA init failed; refusing to serve without HA\n", wid);
+            exit(EXIT_FAILURE);
         }
     }
 
@@ -226,7 +246,7 @@ static void run_worker(int wid, int port) {
         app->start(app, port);   // participates in SO_REUSEPORT
     } else {
         fprintf(stderr, "🧠 Worker %d is HA-dedicated: not listening on data port %d\n", wid, port);
-        for (;;) pause();        // keep process alive; HA threads keep running
+        while (!cluster_shutdown) pause(); // HA threads remain live until shutdown
     }
 
     /* graceful path (rare) */
@@ -264,6 +284,12 @@ static void wait_for_workers(void) {
 int start_cluster_with_args(int port, int argc, char **argv) {
     ignore_sigpipe();
     worker_count = detect_worker_target(argc, argv);
+    {
+        char count_buf[32];
+        int effective_workers = worker_count == 0 ? 1 : worker_count;
+        snprintf(count_buf, sizeof(count_buf), "%d", effective_workers);
+        setenv("RF_EFFECTIVE_WORKER_COUNT", count_buf, 1);
+    }
 
     /* shared promotion bus (64MB heap, 8192 descriptors) */
     size_t bus_heap = 512ULL * 1024ULL * 1024ULL;   // 512MB default

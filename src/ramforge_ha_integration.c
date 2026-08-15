@@ -27,6 +27,9 @@ static _Atomic int g_ha_agent_only = 0;
 static _Atomic uint64_t g_mem_fwd_seq = 1;
 static _Atomic int g_pending_membership_valid = 0;
 static ha_membership_record_t g_pending_membership;
+static ha_cfg_change_t *g_pending_cfg_changes;
+static size_t g_pending_cfg_count;
+static size_t g_pending_cfg_capacity;
 
 #define HA_SNAPSHOT_KEY 0x00040001
 #define SHMEM_HA_KEY 0xA001337
@@ -71,13 +74,41 @@ static void ha_store_pending_membership(const ha_membership_record_t *rec) {
     if (!rec) return;
     g_pending_membership = *rec;
     atomic_store(&g_pending_membership_valid, 1);
+    /* A snapshot supersedes all configuration changes before it in AOF order. */
+    g_pending_cfg_count = 0;
 }
 
-static void ha_apply_pending_membership_if_any(void) {
-    if (!atomic_load(&g_pending_membership_valid)) return;
-    if (HA_apply_membership_snapshot(&g_pending_membership) == 0) {
-        atomic_store(&g_pending_membership_valid, 0);
+static int ha_queue_pending_cfg_change(const ha_cfg_change_t *change) {
+    if (!change) return -1;
+    if (g_pending_cfg_count == g_pending_cfg_capacity) {
+        size_t next = g_pending_cfg_capacity ? g_pending_cfg_capacity * 2 : 16;
+        if (next < g_pending_cfg_capacity ||
+            next > SIZE_MAX / sizeof(*g_pending_cfg_changes)) return -1;
+        void *p = realloc(g_pending_cfg_changes,
+                          next * sizeof(*g_pending_cfg_changes));
+        if (!p) return -1;
+        g_pending_cfg_changes = p;
+        g_pending_cfg_capacity = next;
     }
+    g_pending_cfg_changes[g_pending_cfg_count++] = *change;
+    return 0;
+}
+
+static int ha_apply_pending_membership_if_any(void) {
+    if (atomic_load(&g_pending_membership_valid) &&
+        HA_apply_membership_snapshot(&g_pending_membership) != 0) return -1;
+    atomic_store(&g_pending_membership_valid, 0);
+
+    for (size_t i = 0; i < g_pending_cfg_count; i++) {
+        if (HA_apply_cfg_change_entry(&g_pending_cfg_changes[i],
+                                      sizeof(g_pending_cfg_changes[i])) != 0)
+            return -1;
+    }
+    free(g_pending_cfg_changes);
+    g_pending_cfg_changes = NULL;
+    g_pending_cfg_count = 0;
+    g_pending_cfg_capacity = 0;
+    return 0;
 }
 
 static void ha_publish_to_shmem(void) {
@@ -122,6 +153,9 @@ static void HA_publish_snapshot_tick(uint64_t now) {
     snap.redirect_status = g_ha_config.redirect_status;
     snap.retry_after = g_ha_config.retry_after_sec;
     snap.last_heartbeat_us = atomic_load(&g_ha_runtime.last_heartbeat_us);
+    snap.commit_index = atomic_load(&g_ha_runtime.commit_index);
+    snap.applied_index = atomic_load(&g_ha_runtime.applied_index);
+    HA_get_last_log_info(&snap.last_log_index, &snap.last_log_term);
     snap.config_epoch = atomic_load(&g_ha_runtime.config_epoch);
     snap.joint_active = atomic_load(&g_ha_runtime.joint_active);
     snap.has_fresh_quorum = HA_has_fresh_quorum();
@@ -552,12 +586,23 @@ static void* ha_worker_thread(void *arg) {
     uint64_t election_timeout_us = g_ha_config.election_timeout_ms * 1000ULL;
     uint64_t last_kick = HA_repl_kick_read();
 
-    atomic_store(&g_ha_runtime.state, HA_STATE_READY);
+    atomic_store(&g_ha_runtime.state,
+                 atomic_load(&g_ha_runtime.applied_index) <
+                 atomic_load(&g_ha_runtime.commit_index)
+                 ? HA_STATE_SYNCING : HA_STATE_READY);
     printf("HA worker thread started\n");
 
     while (atomic_load(&g_ha_running)) {
         uint64_t now = now_us();
         HA_publish_snapshot_tick(now);
+
+        if (atomic_load(&g_ha_runtime.applied_index) <
+            atomic_load(&g_ha_runtime.commit_index)) {
+            if (HA_apply_committed_entries() == 0 &&
+                atomic_load(&g_ha_runtime.applied_index) >=
+                atomic_load(&g_ha_runtime.commit_index))
+                atomic_store(&g_ha_runtime.state, HA_STATE_READY);
+        }
 
         if (HA_is_leader(&g_ha_runtime)) {
             uint64_t kick = HA_repl_kick_read();
@@ -575,8 +620,7 @@ static void* ha_worker_thread(void *arg) {
                     printf("HA leader lost fresh quorum; stepping down\n");
                     s_last_quorum_log = now;
                 }
-                atomic_store(&g_ha_runtime.role, HA_ROLE_FOLLOWER);
-                atomic_store(&g_ha_runtime.current_leader, -1);
+                (void)HA_step_down_to_term(atomic_load(&g_ha_runtime.term), -1);
             }
         } else if (atomic_load(&g_ha_runtime.role) == HA_ROLE_FOLLOWER) {
             uint64_t last_hb = atomic_load(&g_ha_runtime.last_heartbeat_us);
@@ -621,7 +665,10 @@ int RAMForge_HA_init(void) {
     }
 
     HA_replication_bind(&g_ha_config, &g_ha_runtime);
-    ha_apply_pending_membership_if_any();
+    if (ha_apply_pending_membership_if_any() != 0) {
+        fprintf(stderr, "Failed to restore durable HA membership history\n");
+        return -1;
+    }
 
     if (HA_tls_init_from_env() != 0) {
         fprintf(stderr, "Failed to initialize HA mTLS\n");
@@ -641,24 +688,23 @@ int RAMForge_HA_init(void) {
         printf("HA agent-only mode: reading HA state from shared memory\n");
     }
 
-    if (g_ha_config.node_count == 1) {
-        atomic_store(&g_ha_runtime.role, HA_ROLE_LEADER);
-        atomic_store(&g_ha_runtime.current_leader, g_ha_config.local_node_index);
-        atomic_store(&g_ha_runtime.state, HA_STATE_READY);
+    if (!atomic_load(&g_ha_agent_only) && g_ha_config.node_count == 1) {
         atomic_store(&g_ha_runtime.bootstrap_gate_active, 0);
         atomic_store(&g_ha_runtime.bootstrap_quorum_confirmed, 1);
+        if (HA_start_election() != 0 || !HA_is_leader(&g_ha_runtime)) {
+            fprintf(stderr, "Single-node durable election failed\n");
+            return -1;
+        }
     }
 
     if (!atomic_load(&g_ha_agent_only) && g_ha_config.node_count > 1) {
         const char *boot = getenv("RF_HA_BOOTSTRAP_LEADER");
         if (boot && strcmp(boot, "1") == 0) {
-            atomic_store(&g_ha_runtime.role, HA_ROLE_LEADER);
-            atomic_store(&g_ha_runtime.current_leader, g_ha_config.local_node_index);
-            atomic_store(&g_ha_runtime.state, HA_STATE_READY);
             atomic_store(&g_ha_runtime.bootstrap_gate_active, 1);
             atomic_store(&g_ha_runtime.bootstrap_quorum_confirmed, 0);
             atomic_store(&g_ha_runtime.bootstrap_gate_start_us, now_us());
-            printf("Bootstrap: assuming LEADER (startup quorum gate active)\n");
+            printf("Bootstrap: requesting a checked quorum election\n");
+            (void)HA_start_election();
         }
     }
 
@@ -749,24 +795,88 @@ int RAMForge_HA_get_retry_after(void) {
     return g_ha_config.retry_after_sec;
 }
 
-int RAMForge_HA_replicate_write(uint32_t record_type, const void *data, uint32_t size) {
+int RAMForge_HA_replicate_write_checked(uint32_t record_type, const void *data,
+                                        uint32_t size, uint32_t timeout_ms,
+                                        ha_write_receipt_t *receipt) {
+    ha_write_receipt_t local_receipt;
+    memset(&local_receipt, 0, sizeof(local_receipt));
+    if (receipt) *receipt = local_receipt;
     if (!atomic_load(&g_ha_enabled)) return 0;
+    if (!data && size) return -1;
+    if (timeout_ms == 0) timeout_ms = g_ha_config.replication_timeout_ms;
+    if (timeout_ms == 0) timeout_ms = 3000;
 
     if (atomic_load(&g_ha_agent_only)) {
-        return ha_fwd_send(record_type, data, size);
+        ha_fwd_write_rsp_t forwarded;
+        memset(&forwarded, 0, sizeof(forwarded));
+        int rc = ha_fwd_send_checked(record_type, data, size, timeout_ms, &forwarded);
+        local_receipt.raft_index = forwarded.raft_index;
+        local_receipt.aof_batch_id = forwarded.aof_batch_id;
+        local_receipt.raft_log_fsynced = forwarded.raft_log_fsynced != 0;
+        local_receipt.quorum_committed = forwarded.quorum_committed != 0;
+        local_receipt.local_fsync = forwarded.local_fsync != 0;
+        local_receipt.applied_all_workers = forwarded.applied_all_workers != 0;
+        if (receipt) *receipt = local_receipt;
+        return rc;
     }
 
     if (!HA_is_leader(&g_ha_runtime)) return -1;
+    if (!HA_has_fresh_quorum()) return -3;
 
+    uint64_t started = now_us();
     uint64_t idx = HA_append_local_entry(record_type, data, size);
     if (idx == 0) return -1;
+    local_receipt.raft_index = idx;
+    local_receipt.raft_log_fsynced = 1;
+    if (receipt) *receipt = local_receipt;
 
-    if (g_ha_config.sync_mode == 0) {
-        HA_request_catchup();
-        return 0;
+    HA_request_catchup();
+    if (HA_wait_for_replication(idx, timeout_ms) != 0) return -5;
+    local_receipt.quorum_committed = 1;
+    if (receipt) *receipt = local_receipt;
+
+    uint64_t elapsed_ms = (now_us() - started) / 1000ULL;
+    uint32_t remaining_ms = elapsed_ms >= timeout_ms
+                          ? 1u : (uint32_t)(timeout_ms - elapsed_ms);
+    uint64_t batch_id = 0;
+    if (HA_wait_for_local_apply(idx, remaining_ms, &batch_id) != 0) {
+        if (receipt) *receipt = local_receipt;
+        return -6;
     }
+    local_receipt.aof_batch_id = batch_id;
+    local_receipt.local_fsync = 1;
+    local_receipt.applied_all_workers = 1;
+    if (receipt) *receipt = local_receipt;
+    return 0;
+}
 
-    return HA_wait_for_replication(idx, g_ha_config.replication_timeout_ms);
+int RAMForge_HA_replicate_write(uint32_t record_type, const void *data, uint32_t size) {
+    return RAMForge_HA_replicate_write_checked(record_type, data, size,
+                                               g_ha_config.replication_timeout_ms,
+                                               NULL);
+}
+
+int RAMForge_HA_handle_write_forward(const void *payload, uint32_t size) {
+    if (!payload || size < sizeof(ha_fwd_rec_t)) return -1;
+    const ha_fwd_rec_t *request = (const ha_fwd_rec_t *)payload;
+    if (request->req_id == 0 || request->size != size - sizeof(*request)) return -1;
+
+    ha_write_receipt_t receipt;
+    int rc = RAMForge_HA_replicate_write_checked(
+        request->type, (const uint8_t *)payload + sizeof(*request), request->size,
+        request->timeout_ms, &receipt);
+    ha_fwd_write_rsp_t response = {
+        .req_id = request->req_id,
+        .rc = rc,
+        .raft_index = receipt.raft_index,
+        .aof_batch_id = receipt.aof_batch_id,
+        .raft_log_fsynced = receipt.raft_log_fsynced ? 1u : 0u,
+        .quorum_committed = receipt.quorum_committed ? 1u : 0u,
+        .local_fsync = receipt.local_fsync ? 1u : 0u,
+        .applied_all_workers = receipt.applied_all_workers ? 1u : 0u
+    };
+    if (ha_fwd_store_response(&response) != 0) return -1;
+    return rc;
 }
 
 int RAMForge_HA_linearizable_read_barrier(uint64_t barrier_id, uint32_t timeout_ms) {
@@ -940,21 +1050,20 @@ int RAMForge_HA_replay_record(uint32_t record_type, const void *data, size_t siz
     if (!data) return 0;
 
     if (record_type == HA_LOG_CFG_CHANGE) {
-        if (size < sizeof(ha_cfg_change_t)) return 1;
-        if (!atomic_load(&g_ha_enabled)) return 1;
-        (void)HA_apply_cfg_change_entry(data, (uint32_t)size);
-        return 1;
+        if (size != sizeof(ha_cfg_change_t)) return -1;
+        if (!atomic_load(&g_ha_enabled))
+            return ha_queue_pending_cfg_change(data) == 0 ? 1 : -1;
+        return HA_apply_cfg_change_entry(data, (uint32_t)size) == 0 ? 1 : -1;
     }
 
     if (record_type == AOF_REC_HA_MEMBERSHIP) {
-        if (size < sizeof(ha_membership_record_t)) return 1;
+        if (size != sizeof(ha_membership_record_t)) return -1;
         const ha_membership_record_t *rec = (const ha_membership_record_t *)data;
         if (!atomic_load(&g_ha_enabled)) {
             ha_store_pending_membership(rec);
             return 1;
         }
-        (void)HA_apply_membership_snapshot(rec);
-        return 1;
+        return HA_apply_membership_snapshot(rec) == 0 ? 1 : -1;
     }
 
     return 0;
@@ -964,7 +1073,13 @@ void RAMForge_HA_export_metrics(char *buf, size_t cap) {
     if (!buf || cap == 0) return;
 
     if (!atomic_load(&g_ha_enabled)) {
-        snprintf(buf, cap, "# HA disabled\n");
+        snprintf(buf, cap,
+                 "# HELP ramforge_ha_enabled Whether HA is configured on this node\n"
+                 "# TYPE ramforge_ha_enabled gauge\n"
+                 "ramforge_ha_enabled 0\n"
+                 "# HELP ramforge_ha_leader_available Whether this node knows a current HA leader\n"
+                 "# TYPE ramforge_ha_leader_available gauge\n"
+                 "ramforge_ha_leader_available 0\n");
         return;
     }
 
@@ -975,18 +1090,53 @@ void RAMForge_HA_export_metrics(char *buf, size_t cap) {
     }
 
     snprintf(buf, cap,
+             "# HELP ramforge_ha_enabled Whether HA is configured on this node\n"
+             "# TYPE ramforge_ha_enabled gauge\n"
+             "ramforge_ha_enabled 1\n"
+             "# HELP ramforge_ha_role Numeric role; see docs/OBSERVABILITY.md\n"
+             "# TYPE ramforge_ha_role gauge\n"
              "ramforge_ha_role %d\n"
+             "# HELP ramforge_ha_state Numeric HA runtime state; see docs/OBSERVABILITY.md\n"
+             "# TYPE ramforge_ha_state gauge\n"
              "ramforge_ha_state %d\n"
+             "# HELP ramforge_ha_term Current durable Raft term\n"
+             "# TYPE ramforge_ha_term gauge\n"
              "ramforge_ha_term %lu\n"
+             "# HELP ramforge_ha_log_last_index Last index in the durable Raft log\n"
+             "# TYPE ramforge_ha_log_last_index gauge\n"
+             "ramforge_ha_log_last_index %lu\n"
+             "# HELP ramforge_ha_log_last_term Term of the last durable Raft log entry\n"
+             "# TYPE ramforge_ha_log_last_term gauge\n"
+             "ramforge_ha_log_last_term %lu\n"
+             "# HELP ramforge_ha_commit_index Highest durably committed Raft log index\n"
+             "# TYPE ramforge_ha_commit_index gauge\n"
+             "ramforge_ha_commit_index %lu\n"
+             "# HELP ramforge_ha_applied_index Highest Raft log index applied durably to the state machine\n"
+             "# TYPE ramforge_ha_applied_index gauge\n"
+             "ramforge_ha_applied_index %lu\n"
+             "# HELP ramforge_ha_epoch Current membership configuration epoch\n"
+             "# TYPE ramforge_ha_epoch gauge\n"
              "ramforge_ha_epoch %lu\n"
+             "# HELP ramforge_ha_joint_active Whether joint-consensus membership is active\n"
+             "# TYPE ramforge_ha_joint_active gauge\n"
              "ramforge_ha_joint_active %d\n"
-             "ramforge_ha_fresh_quorum %d\n",
+             "# HELP ramforge_ha_fresh_quorum Whether the leader has a fresh quorum\n"
+             "# TYPE ramforge_ha_fresh_quorum gauge\n"
+             "ramforge_ha_fresh_quorum %d\n"
+             "# HELP ramforge_ha_leader_available Whether this node knows a current HA leader\n"
+             "# TYPE ramforge_ha_leader_available gauge\n"
+             "ramforge_ha_leader_available %d\n",
              snap.role,
              snap.state,
              (unsigned long)snap.term,
+             (unsigned long)snap.last_log_index,
+             (unsigned long)snap.last_log_term,
+             (unsigned long)snap.commit_index,
+             (unsigned long)snap.applied_index,
              (unsigned long)snap.config_epoch,
              snap.joint_active,
-             snap.has_fresh_quorum);
+             snap.has_fresh_quorum,
+             snap.leader_index >= 0 ? 1 : 0);
 }
 
 

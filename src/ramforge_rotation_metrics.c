@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include <stdio.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdatomic.h>
@@ -15,6 +16,7 @@
 #include "ramforge_rotation_metrics.h"
 #include "aof_batch.h"
 #include "metrics_shared.h"
+#include "persistence_zp.h"
 #include <fcntl.h>
 #include <dlfcn.h>
 #include <sys/statvfs.h>
@@ -388,8 +390,21 @@ static void execute_aof_rotation(RotationReason reason) {
         char *dir = dirname(dirbuf);
         int dfd = open(dir ? dir : ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
         if (dfd >= 0) {
-            fsync(dfd);
-            close(dfd);
+            int sync_rc;
+            do {
+                sync_rc = fsync(dfd);
+            } while (sync_rc != 0 && errno == EINTR);
+            if (sync_rc != 0 || close(dfd) != 0) {
+                perror("AOF rotation directory sync");
+                atomic_fetch_add(&g_metrics.rotation_failures, 1);
+                pthread_mutex_unlock(&g_rotation_lock);
+                return;
+            }
+        } else {
+            perror("AOF rotation directory open");
+            atomic_fetch_add(&g_metrics.rotation_failures, 1);
+            pthread_mutex_unlock(&g_rotation_lock);
+            return;
         }
     }
 
@@ -638,33 +653,94 @@ void RAMForge_export_prometheus_metrics_buffer(char *buffer, size_t capacity) {
     metrics_buffer_t buf;
     metrics_buf_init(&buf, buffer, capacity);
 
-    metrics_buf_printf(&buf, "# HELP ayder_aof_files_total Current AOF segment count\n");
-    metrics_buf_printf(&buf, "# TYPE ayder_aof_files_total gauge\n");
-    metrics_buf_printf(&buf, "ayder_aof_files_total %" PRIu64 "\n\n",
+    metrics_buf_printf(&buf, "# HELP ayder_aof_files Current AOF segment count\n");
+    metrics_buf_printf(&buf, "# TYPE ayder_aof_files gauge\n");
+    metrics_buf_printf(&buf, "ayder_aof_files %" PRIu64 "\n\n",
                        atomic_load(&g_metrics.aof_files_total));
 
-
+    metrics_buf_printf(&buf, "# HELP ayder_aof_generation Current AOF rotation generation\n");
     metrics_buf_printf(&buf, "# TYPE ayder_aof_generation gauge\n");
     metrics_buf_printf(&buf, "ayder_aof_generation %" PRIu64 "\n\n",
                        atomic_load(&g_metrics.aof_generation));
 
+    metrics_buf_printf(&buf, "# HELP ayder_process_start_time_seconds Unix time when this broker process group started\n");
+    metrics_buf_printf(&buf, "# TYPE ayder_process_start_time_seconds gauge\n");
+    metrics_buf_printf(&buf, "ayder_process_start_time_seconds %" PRIu64 "\n\n",
+                       atomic_load(&g_metrics.process_start_time_unix));
+
+    metrics_buf_printf(&buf, "# HELP ayder_persistence_ready Whether local persistence completed initialization\n");
+    metrics_buf_printf(&buf, "# TYPE ayder_persistence_ready gauge\n");
+    metrics_buf_printf(&buf, "ayder_persistence_ready %d\n\n", Persistence_is_ready() ? 1 : 0);
+
     /* ---------- HTTP counters ---------- */
     metrics_buf_printf(&buf, "# HELP ayder_http_requests_total Total HTTP requests (all statuses)\n");
     metrics_buf_printf(&buf, "# TYPE ayder_http_requests_total counter\n");
-    metrics_buf_printf(&buf, "ayder_http_requests_total %" PRIu64 "\n\n", RAMForge_http_total());
+    metrics_buf_printf(&buf, "ayder_http_requests_total %" PRIu64 "\n\n",
+                       atomic_load(&g_metrics.http_requests_total));
 
     metrics_buf_printf(&buf, "# HELP ayder_http_responses_total HTTP responses by class/code\n");
     metrics_buf_printf(&buf, "# TYPE ayder_http_responses_total counter\n");
-    metrics_buf_printf(&buf, "ayder_http_responses_total{code=\"2xx\"} %" PRIu64 "\n", RAMForge_http_2xx());
-    metrics_buf_printf(&buf, "ayder_http_responses_total{code=\"4xx\"} %" PRIu64 "\n", RAMForge_http_4xx());
-    metrics_buf_printf(&buf, "ayder_http_responses_total{code=\"401\"} %" PRIu64 "\n", RAMForge_http_401());
-    metrics_buf_printf(&buf, "ayder_http_responses_total{code=\"429\"} %" PRIu64 "\n", RAMForge_http_429());
-    metrics_buf_printf(&buf, "ayder_http_responses_total{code=\"5xx\"} %" PRIu64 "\n", RAMForge_http_5xx());
-    metrics_buf_printf(&buf, "ayder_http_responses_total{code=\"503\"} %" PRIu64 "\n\n", RAMForge_http_503());
+    metrics_buf_printf(&buf, "ayder_http_responses_total{code=\"2xx\"} %" PRIu64 "\n", atomic_load(&g_metrics.http_responses_2xx));
+    metrics_buf_printf(&buf, "ayder_http_responses_total{code=\"3xx\"} %" PRIu64 "\n", atomic_load(&g_metrics.http_responses_3xx));
+    metrics_buf_printf(&buf, "ayder_http_responses_total{code=\"4xx\"} %" PRIu64 "\n", atomic_load(&g_metrics.http_responses_4xx));
+    metrics_buf_printf(&buf, "ayder_http_responses_total{code=\"401\"} %" PRIu64 "\n", atomic_load(&g_metrics.http_responses_401));
+    metrics_buf_printf(&buf, "ayder_http_responses_total{code=\"429\"} %" PRIu64 "\n", atomic_load(&g_metrics.http_responses_429));
+    metrics_buf_printf(&buf, "ayder_http_responses_total{code=\"5xx\"} %" PRIu64 "\n", atomic_load(&g_metrics.http_responses_5xx));
+    metrics_buf_printf(&buf, "ayder_http_responses_total{code=\"503\"} %" PRIu64 "\n\n", atomic_load(&g_metrics.http_responses_503));
 
     metrics_buf_printf(&buf, "# HELP ayder_http_active_connections Active connections\n");
     metrics_buf_printf(&buf, "# TYPE ayder_http_active_connections gauge\n");
-    metrics_buf_printf(&buf, "ayder_http_active_connections %" PRIu64 "\n\n", RAMForge_http_active_connections());
+    metrics_buf_printf(&buf, "ayder_http_active_connections %" PRIu64 "\n\n",
+                       atomic_load(&g_metrics.http_active_connections));
+
+    static const double http_le[AYDER_METRIC_HIST_BUCKETS] = {
+        0.0005, 0.001, 0.0025, 0.005, 0.010,
+        0.025, 0.050, 0.100, 0.250, 1.000
+    };
+    uint64_t http_count = atomic_load(&g_metrics.http_duration_count);
+    uint64_t http_cumulative = 0;
+    metrics_buf_printf(&buf, "# HELP ayder_http_request_duration_seconds Server time from first request byte through handler completion\n");
+    metrics_buf_printf(&buf, "# TYPE ayder_http_request_duration_seconds histogram\n");
+    for (int i = 0; i < AYDER_METRIC_HIST_BUCKETS; i++) {
+        http_cumulative += atomic_load(&g_metrics.http_duration_hist[i]);
+        metrics_buf_printf(&buf,
+                           "ayder_http_request_duration_seconds_bucket{le=\"%.4f\"} %" PRIu64 "\n",
+                           http_le[i], http_cumulative);
+    }
+    metrics_buf_printf(&buf,
+                       "ayder_http_request_duration_seconds_bucket{le=\"+Inf\"} %" PRIu64 "\n",
+                       http_count);
+    metrics_buf_printf(&buf, "ayder_http_request_duration_seconds_sum %.9f\n",
+                       (double)atomic_load(&g_metrics.http_duration_sum_us) / 1000000.0);
+    metrics_buf_printf(&buf, "ayder_http_request_duration_seconds_count %" PRIu64 "\n\n",
+                       http_count);
+
+    metrics_buf_printf(&buf, "# HELP ayder_broker_operations_total Broker operations by bounded operation name\n");
+    metrics_buf_printf(&buf, "# TYPE ayder_broker_operations_total counter\n");
+    metrics_buf_printf(&buf, "ayder_broker_operations_total{operation=\"produce\"} %" PRIu64 "\n", atomic_load(&g_metrics.broker_produce_total));
+    metrics_buf_printf(&buf, "ayder_broker_operations_total{operation=\"consume\"} %" PRIu64 "\n", atomic_load(&g_metrics.broker_consume_total));
+    metrics_buf_printf(&buf, "ayder_broker_operations_total{operation=\"commit\"} %" PRIu64 "\n", atomic_load(&g_metrics.broker_commit_total));
+    metrics_buf_printf(&buf, "ayder_broker_operations_total{operation=\"query\"} %" PRIu64 "\n\n", atomic_load(&g_metrics.broker_query_total));
+
+    metrics_buf_printf(&buf, "# HELP ayder_broker_errors_total Broker handler errors\n");
+    metrics_buf_printf(&buf, "# TYPE ayder_broker_errors_total counter\n");
+    metrics_buf_printf(&buf, "ayder_broker_errors_total %" PRIu64 "\n\n", atomic_load(&g_metrics.broker_errors_total));
+
+    metrics_buf_printf(&buf, "# HELP ayder_backpressure_events_total HTTP requests rejected by broker backpressure\n");
+    metrics_buf_printf(&buf, "# TYPE ayder_backpressure_events_total counter\n");
+    metrics_buf_printf(&buf, "ayder_backpressure_events_total %" PRIu64 "\n\n", atomic_load(&g_metrics.backpressure_events_total));
+
+    metrics_buf_printf(&buf, "# HELP ayder_storage_writes_total Storage writes by outcome\n");
+    metrics_buf_printf(&buf, "# TYPE ayder_storage_writes_total counter\n");
+    metrics_buf_printf(&buf, "ayder_storage_writes_total{outcome=\"success\"} %" PRIu64 "\n", atomic_load(&g_metrics.successful_writes));
+    metrics_buf_printf(&buf, "ayder_storage_writes_total{outcome=\"failure\"} %" PRIu64 "\n\n", atomic_load(&g_metrics.write_failures));
+
+    metrics_buf_printf(&buf, "# HELP ayder_recovery_attempts_total Persistence recovery attempts\n");
+    metrics_buf_printf(&buf, "# TYPE ayder_recovery_attempts_total counter\n");
+    metrics_buf_printf(&buf, "ayder_recovery_attempts_total %" PRIu64 "\n", atomic_load(&g_metrics.recovery_attempts));
+    metrics_buf_printf(&buf, "# HELP ayder_recovery_successes_total Successful persistence recoveries\n");
+    metrics_buf_printf(&buf, "# TYPE ayder_recovery_successes_total counter\n");
+    metrics_buf_printf(&buf, "ayder_recovery_successes_total %" PRIu64 "\n\n", atomic_load(&g_metrics.recovery_successes));
 
     /* ---------- Queue depths ---------- */
     metrics_buf_printf(&buf, "# HELP ayder_aof_pending_writes Pending AOF writes (ring + uring)\n");
@@ -681,10 +757,14 @@ void RAMForge_export_prometheus_metrics_buffer(char *buffer, size_t capacity) {
     const double *fsle = AOF_fsync_bucket_bounds(&nfs);
     const double *slele = AOF_seal_bucket_bounds(&nsl);
     uint64_t fsc[HN] = {0}, slc[HN] = {0};
-    double fssum = 0.0, slsum = 0.0;
-    uint64_t fcnt = 0, scnt = 0;
-    AOF_fsync_hist_snapshot(fsc, HN, &fssum, &fcnt);
-    AOF_seal_latency_hist_snapshot(slc, HN, &slsum, &scnt);
+    for (int i = 0; i < HN; i++) {
+        fsc[i] = atomic_load(&g_metrics.fsync_hist[i]);
+        slc[i] = atomic_load(&g_metrics.sealed_latency_hist[i]);
+    }
+    uint64_t fcnt = atomic_load(&g_metrics.fsync_count);
+    uint64_t scnt = atomic_load(&g_metrics.sealed_latency_count);
+    double fssum = (double)atomic_load(&g_metrics.fsync_sum_us) / 1000000.0;
+    double slsum = (double)atomic_load(&g_metrics.sealed_latency_sum_us) / 1000000.0;
 
     // fsync histogram
     metrics_buf_printf(&buf, "# HELP ayder_fsync_duration_seconds fsync group duration\n");
@@ -694,7 +774,7 @@ void RAMForge_export_prometheus_metrics_buffer(char *buffer, size_t capacity) {
         cum += fsc[i];
         metrics_buf_printf(&buf, "ayder_fsync_duration_seconds_bucket{le=\"%.6f\"} %" PRIu64 "\n", fsle[i], cum);
     }
-    metrics_buf_printf(&buf, "ayder_fsync_duration_seconds_bucket{le=\"+Inf\"} %" PRIu64 "\n", cum);
+    metrics_buf_printf(&buf, "ayder_fsync_duration_seconds_bucket{le=\"+Inf\"} %" PRIu64 "\n", fcnt);
     metrics_buf_printf(&buf, "ayder_fsync_duration_seconds_sum %.9f\n", fssum);
     metrics_buf_printf(&buf, "ayder_fsync_duration_seconds_count %" PRIu64 "\n\n", fcnt);
 
@@ -707,7 +787,7 @@ void RAMForge_export_prometheus_metrics_buffer(char *buffer, size_t capacity) {
         metrics_buf_printf(&buf, "ayder_sealed_durable_latency_seconds_bucket{le=\"%.6f\"} %" PRIu64 "\n", slele[i],
                            cum);
     }
-    metrics_buf_printf(&buf, "ayder_sealed_durable_latency_seconds_bucket{le=\"+Inf\"} %" PRIu64 "\n", cum);
+    metrics_buf_printf(&buf, "ayder_sealed_durable_latency_seconds_bucket{le=\"+Inf\"} %" PRIu64 "\n", scnt);
     metrics_buf_printf(&buf, "ayder_sealed_durable_latency_seconds_sum %.9f\n", slsum);
     metrics_buf_printf(&buf, "ayder_sealed_durable_latency_seconds_count %" PRIu64 "\n\n", scnt);
 

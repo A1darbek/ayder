@@ -104,6 +104,11 @@ static inline size_t shared_storage_bytes(uint32_t cap) {
     return offsetof(SharedStorage, entries) + (size_t)cap * sizeof(SharedEntry);
 }
 
+static const char *shared_storage_name(void) {
+    const char *configured = getenv("AYDER_STORAGE_SHM_NAME");
+    return (configured && configured[0] == '/') ? configured : SHARED_STORAGE_NAME;
+}
+
 static int shm_has_space(size_t need_bytes) {
     struct statvfs v;
     if (statvfs("/dev/shm", &v) != 0) return 1; /* if unknown, don't block */
@@ -138,7 +143,7 @@ SharedStorage *shared_storage_init_named(const char *name) {
         return NULL;
     }
 
-    int shm_fd = shm_open(name, O_CREAT | O_RDWR | O_EXCL, 0666);
+    int shm_fd = shm_open(name, O_CREAT | O_RDWR | O_EXCL, 0600);
     if (shm_fd == -1) {
         perror("shm_open init_named");
         return NULL;
@@ -192,17 +197,16 @@ SharedStorage *shared_storage_init_named(const char *name) {
     return ss;
 }
 
-/* fresh create (keeps your old behavior: unlink then create) */
+/* Fresh, exclusively owned process-group segment. */
 SharedStorage *shared_storage_init(void) {
-    shm_unlink(SHARED_STORAGE_NAME);
-    return shared_storage_init_named(SHARED_STORAGE_NAME);
+    return shared_storage_init_named(shared_storage_name());
 }
 
 /* attach existing */
 SharedStorage *shared_storage_attach_named(const char *name) {
     if (!name || !*name) name = SHARED_STORAGE_NAME;
 
-    int shm_fd = shm_open(name, O_RDWR, 0666);
+    int shm_fd = shm_open(name, O_RDWR, 0600);
     if (shm_fd == -1) {
         perror("shm_open attach_named");
         return NULL;
@@ -230,7 +234,7 @@ SharedStorage *shared_storage_attach_named(const char *name) {
 }
 
 SharedStorage *shared_storage_attach(void) {
-    return shared_storage_attach_named(SHARED_STORAGE_NAME);
+    return shared_storage_attach_named(shared_storage_name());
 }
 
 static inline uint32_t capacity_load(const SharedStorage *ss) {
@@ -323,6 +327,63 @@ int shared_storage_try_get_fast(SharedStorage *ss, int key, void *out, size_t ou
     }
 
     return 0;
+}
+
+int shared_storage_atomic_max_u64(SharedStorage *ss, int key, uint64_t value,
+                                  uint64_t *stored_value) {
+    if (!ss || key == 0) return -1;
+
+    uint32_t h = hash_key_fast(key);
+    uint32_t shard_idx = h & (SHARD_COUNT - 1);
+    Shard *shard = &ss->shards[shard_idx];
+    pthread_mutex_lock(&shard->lock);
+
+    uint32_t cap = capacity_load(ss);
+    uint32_t idx = h % cap;
+    uint32_t start_idx = idx;
+    uint32_t distance = 0;
+    uint32_t max_distance = cap / 4;
+
+    while (distance < max_distance) {
+        int existing_key = atomic_load(&ss->entries[idx].key);
+        if (existing_key == 0) {
+            atomic_store(&ss->entries[idx].key, key);
+            atomic_store(&ss->entries[idx].size, (uint32_t)sizeof(value));
+            memcpy(ss->entries[idx].data, &value, sizeof(value));
+            atomic_fetch_add(&ss->entries[idx].version, 1);
+            atomic_fetch_add(&ss->size, 1);
+            atomic_fetch_add(&shard->load_factor, 1);
+            atomic_fetch_add(&ss->write_ops, 1);
+            if (stored_value) *stored_value = value;
+            pthread_mutex_unlock(&shard->lock);
+            return 0;
+        }
+        if (existing_key == key) {
+            uint32_t size = atomic_load(&ss->entries[idx].size);
+            if (size != sizeof(uint64_t)) {
+                pthread_mutex_unlock(&shard->lock);
+                return -1;
+            }
+            uint64_t current = 0;
+            memcpy(&current, ss->entries[idx].data, sizeof(current));
+            if (value > current) {
+                memcpy(ss->entries[idx].data, &value, sizeof(value));
+                atomic_fetch_add(&ss->entries[idx].version, 1);
+                atomic_fetch_add(&ss->write_ops, 1);
+                current = value;
+            }
+            if (stored_value) *stored_value = current;
+            pthread_mutex_unlock(&shard->lock);
+            return 0;
+        }
+        idx = (idx + 1) % cap;
+        distance++;
+        if (idx == start_idx) break;
+    }
+
+    atomic_fetch_add(&ss->collisions, 1);
+    pthread_mutex_unlock(&shard->lock);
+    return -1;
 }
 int shared_storage_get_fast(SharedStorage *ss, int key, void *out, size_t out_sz) {
     if (!ss || !out || key == 0) return 0;
@@ -481,8 +542,7 @@ void shared_storage_destroy(SharedStorage *ss) {
     size_t bytes = ss->shm_bytes ? (size_t)ss->shm_bytes : (size_t)offsetof(SharedStorage, entries);
     munmap(ss, bytes);
 
-    /* keep old behavior: unlink default segment name */
-    shm_unlink(SHARED_STORAGE_NAME);
+    shm_unlink(shared_storage_name());
 }
 
 void shared_storage_stats(SharedStorage *ss) {

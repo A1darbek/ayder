@@ -65,6 +65,8 @@ int  shared_storage_get_fast(SharedStorage *ss, int key, void *out, size_t out_s
 
 uint64_t shared_storage_atomic_inc_u64(SharedStorage *ss, int key);
 uint64_t shared_storage_atomic_add_u64(SharedStorage *ss, int key, uint64_t delta);
+int shared_storage_atomic_max_u64(SharedStorage *ss, int key, uint64_t value,
+                                  uint64_t *stored_value);
 
 void shared_storage_iterate(SharedStorage *ss,
                             void (*cb)(int, const void *, size_t, void *),

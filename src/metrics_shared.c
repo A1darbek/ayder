@@ -10,6 +10,17 @@ void init_shared_metrics(void) {
   if (g_metrics_ptr != NULL)
     return; // Already initialized
 
+  if (!getenv("AYDER_METRICS_SHM_NAME")) {
+    char unique_name[64];
+    int n = snprintf(unique_name, sizeof(unique_name), "/ayder_metrics_%ld",
+                     (long)getpid());
+    if (n < 0 || (size_t)n >= sizeof(unique_name) ||
+        setenv("AYDER_METRICS_SHM_NAME", unique_name, 1) != 0) {
+      LOGE("Failed to create a unique shared-metrics instance name");
+      exit(1);
+    }
+  }
+
   metrics_init_shared(); /* the inline helper in the header */
 
   // Verify it worked

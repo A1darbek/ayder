@@ -88,10 +88,25 @@ int send_message(int peer_index, ha_msg_header_t *header,
                  const void *payload, size_t payload_size);
 int HA_leader_on_ack(int peer_index, uint64_t match_index);
 int HA_wait_for_replication(uint64_t index, uint32_t timeout_ms);
+int HA_wait_for_local_apply(uint64_t index, uint32_t timeout_ms,
+                            uint64_t *aof_batch_id);
 int HA_forward_append_and_replicate(uint32_t rec_type, const void *data, size_t size);
 uint64_t HA_repl_kick_read(void);
 int HA_apply_committed_entries(void);
 void HA_leader_on_nack(int peer_index, uint64_t follower_index);
+
+/* Durable Raft state/log transitions used by the network layer. */
+int HA_step_down_to_term(uint64_t term, int leader_index);
+int HA_grant_vote_durable(uint64_t term, int candidate_index);
+int HA_begin_election_durable(int local_index, uint64_t *new_term);
+int HA_update_commit_index(uint64_t commit_index);
+void HA_get_last_log_info(uint64_t *last_index, uint64_t *last_term);
+int HA_log_matches(uint64_t prev_log_index, uint64_t prev_log_term);
+int HA_follower_store_entries(uint64_t leader_term,
+                              const ha_append_entries_t *append,
+                              const void *entries, size_t entries_size,
+                              uint64_t *match_index);
+int HA_record_vote_response_once(int peer_index, uint64_t term, int granted);
 
 void HA_get_log_stats(uint64_t *last_index, uint64_t *committed, uint64_t *applied);
 int HA_has_fresh_quorum(void);

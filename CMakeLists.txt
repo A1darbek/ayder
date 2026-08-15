@@ -1,7 +1,66 @@
-cmake_minimum_required(VERSION 3.30)
-project(RAMForge C)
+cmake_minimum_required(VERSION 3.18)
+
+project(Ayder VERSION 1.0.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_C_EXTENSIONS ON)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-add_executable(src/main.c src/http_server.c src/http_server.h src/router.c src/router.h src/storage.c src/storage.h src/request.h src/response.h src/user.h src/request.c src/response.c src/cluster.c src/cluster.h src/app_routes.c src/app_routes.h src/object_pool.c src/object_pool.h src/app.h src/slab_alloc.c src/slab_alloc.h src/aof_batch.c src/aof_batch.h src/globals.c src/fast_json.h src/app.c src/crc32c.c src/crc32c.h src/ramforge_rotation_metrics.c src/ramforge_rotation_metrics.h src/shared_storage.c src/shared_storage.h src/metrics_shared.h src/metrics_shared.c src/globals.h src/persistence_zp.c src/persistence_zp.h src/storage_thread_safeguard.c src/storage_thread_safeguard.h src/common.h src/rf_broker.h src/rf_broker.c src/ramforge_ha_config.c src/ramforge_ha_config.h src/ramforge_ha_replication.c src/ramforge_ha_replication.h src/ramforge_ha_integration.c src/ramforge_ha_integration.h src/ramforge_ha_net.c src/ramforge_ha_net.h src/ramforge_ha_tls.c src/ramforge_ha_tls.h src/http_timing.h
-        src/aof_batch.c)
+option(AYDER_ENABLE_NATIVE_OPTIMIZATION
+       "Enable host-specific compiler instructions (non-portable artifact)" OFF)
+option(AYDER_WARNINGS_AS_ERRORS "Treat compiler diagnostics as errors" OFF)
+
+find_package(PkgConfig REQUIRED)
+find_package(Threads REQUIRED)
+pkg_check_modules(LIBUV REQUIRED IMPORTED_TARGET libuv)
+pkg_check_modules(LIBURING REQUIRED IMPORTED_TARGET liburing)
+pkg_check_modules(LIBCURL REQUIRED IMPORTED_TARGET libcurl)
+pkg_check_modules(OPENSSL REQUIRED IMPORTED_TARGET openssl)
+pkg_check_modules(ZLIB REQUIRED IMPORTED_TARGET zlib)
+
+file(GLOB AYDER_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/*.c")
+
+add_executable(ayder
+    ${AYDER_SOURCES}
+    deps/picohttpparser/picohttpparser.c
+)
+
+target_include_directories(ayder PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    "${CMAKE_CURRENT_SOURCE_DIR}/deps/picohttpparser"
+)
+
+target_compile_definitions(ayder PRIVATE HTTP_SERVER_FAST NDEBUG)
+target_compile_options(ayder PRIVATE
+    -Wall
+    -Wextra
+    -Wshadow
+    -Wdouble-promotion
+    $<$<CONFIG:Release>:-O3>
+)
+
+if(AYDER_WARNINGS_AS_ERRORS)
+    target_compile_options(ayder PRIVATE -Werror)
+endif()
+
+if(AYDER_ENABLE_NATIVE_OPTIMIZATION)
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(ayder PRIVATE -march=native)
+    else()
+        message(FATAL_ERROR "AYDER_ENABLE_NATIVE_OPTIMIZATION is unsupported by this compiler")
+    endif()
+endif()
+
+target_link_libraries(ayder PRIVATE
+    Threads::Threads
+    PkgConfig::LIBUV
+    PkgConfig::LIBURING
+    PkgConfig::LIBCURL
+    PkgConfig::OPENSSL
+    PkgConfig::ZLIB
+    m
+)
+
+install(TARGETS ayder RUNTIME DESTINATION bin)

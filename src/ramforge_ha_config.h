@@ -29,6 +29,7 @@ typedef enum {
 #define HA_NODE_MASK(i) (1ULL << (uint64_t)(i))
 
 #define HA_LOG_CFG_CHANGE 0x48414346u /* HACF */
+#define HA_LOG_NOOP       0x48414E4Fu /* HANO: Raft leader no-op */
 #define AOF_REC_HA_MEMBERSHIP 0x48414D31u /* HAM1 */
 
 typedef enum {
@@ -146,6 +147,8 @@ typedef struct {
     pthread_rwlock_t state_lock;
 
     _Atomic int votes_granted;
+    _Atomic uint64_t votes_seen_mask;
+    _Atomic uint64_t votes_granted_mask;
 } ha_runtime_t;
 
 int HA_init_from_env(ha_config_t *config, ha_runtime_t *runtime);

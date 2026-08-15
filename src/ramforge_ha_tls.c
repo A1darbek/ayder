@@ -433,58 +433,13 @@ void HA_tls_graceful_shutdown(SSL *ssl) {
   // Don't wait for response - we're closing anyway
 }
 
-static void split_host_from_advertise(const char *addr, char *host, size_t cap) {
-  if (!addr || !*addr || cap == 0) {
-    if (cap)
-      host[0] = 0;
-    return;
-  }
-  const char *last_colon = strrchr(addr, ':');
-  if (!last_colon || last_colon == addr) {
-    strncpy(host, addr, cap - 1);
-    host[cap - 1] = 0;
-    return;
-  }
-  size_t n = (size_t)(last_colon - addr);
-  if (n >= cap)
-    n = cap - 1;
-  memcpy(host, addr, n);
-  host[n] = 0;
-}
-
-static int cert_matches_expectations(X509 *cert, const char *node_id, const char *adv_host) {
-  if (!cert)
+static int cert_matches_node_id(X509 *cert, const char *node_id) {
+  if (!cert || !node_id || !*node_id)
     return 0;
-  int ok = 0;
-
-  // 1) node_id as DNS/CN (covers common deployments)
-  if (node_id && *node_id) {
-    if (X509_check_host(cert, node_id, 0, 0, NULL) == 1)
-      ok = 1;
-  }
-
-  // 2) advertise host (DNS or IP SAN)
-  if (!ok && adv_host && *adv_host) {
-    // If it's an IP literal, prefer IP SAN match.
-    int is_ip = 0;
-    for (const char *p = adv_host; *p; p++) {
-      if ((*p >= '0' && *p <= '9') || *p == '.' || *p == ':') {
-        is_ip = 1;
-        continue;
-      }
-      is_ip = 0;
-      break;
-    }
-    if (is_ip) {
-      if (X509_check_ip_asc(cert, adv_host, 0) == 1)
-        ok = 1;
-    } else {
-      if (X509_check_host(cert, adv_host, 0, 0, NULL) == 1)
-        ok = 1;
-    }
-  }
-
-  return ok;
+  /* In strict mode, the certificate must authorize the claimed cluster
+     node_id itself. Shared advertise-host SANs are transport coordinates and
+     must never grant permission to impersonate another node index. */
+  return X509_check_host(cert, node_id, 0, 0, NULL) == 1;
 }
 
 int HA_tls_verify_peer_identity(SSL *ssl, const ha_config_t *cfg, int peer_index) {
@@ -499,17 +454,13 @@ int HA_tls_verify_peer_identity(SSL *ssl, const ha_config_t *cfg, int peer_index
   if (!cert)
     return 0;
 
-  char host[256];
-  host[0] = 0;
-  split_host_from_advertise(cfg->nodes[peer_index].advertise_addr, host, sizeof(host));
-
   const char *node_id = cfg->nodes[peer_index].node_id;
-  int ok              = cert_matches_expectations(cert, node_id, host);
+  int ok              = cert_matches_node_id(cert, node_id);
   X509_free(cert);
 
   if (!ok) {
-    LOGE("TLS peer identity mismatch for peer_index=%d expect(node_id='%s' host='%s')", peer_index,
-         node_id ? node_id : "(null)", host);
+    LOGE("TLS peer identity mismatch for peer_index=%d expect(node_id='%s')", peer_index,
+         node_id ? node_id : "(null)");
   }
   return ok;
 }

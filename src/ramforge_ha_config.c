@@ -92,15 +92,29 @@ static int parse_node_list(ha_config_t *config) {
     node->is_voter = 1;
 
     int cluster_port = atoi(port_buf);
+    if (cluster_port <= 0 || cluster_port >= 65535) {
+      LOGE("Invalid HA cluster port '%s'", port_buf);
+      return -1;
+    }
 
     char host_only[256];
     size_t cut = strcspn(node->advertise_addr, ":");
     if (cut >= sizeof(host_only))
       cut = sizeof(host_only) - 1;
+    if (cut > 223) {
+      LOGE("HA node host is too long");
+      return -1;
+    }
     memcpy(host_only, node->advertise_addr, cut);
     host_only[cut] = 0;
 
-    snprintf(node->http_addr, sizeof(node->http_addr), "http://%s:%d", host_only, cluster_port + 1);
+    int http_len = snprintf(node->http_addr, sizeof(node->http_addr),
+                            "http://%.*s:%d", (int)cut, host_only,
+                            cluster_port + 1);
+    if (http_len < 0 || (size_t)http_len >= sizeof(node->http_addr)) {
+      LOGE("Derived HA HTTP address is too long");
+      return -1;
+    }
 
     LOGI("Node[%d] advertise_addr=%s http_addr=%s priority=%d voter=%d", (int)config->node_count, node->advertise_addr,
          node->http_addr, node->priority, node->is_voter);
@@ -262,6 +276,9 @@ int HA_init_from_env(ha_config_t *config, ha_runtime_t *runtime) {
   atomic_store(&runtime->bootstrap_gate_start_us, 0);
   atomic_store(&runtime->last_quorum_ok_us, now_us());
   atomic_store(&runtime->quorum_miss_streak, 0);
+    atomic_store(&runtime->votes_granted, 0);
+    atomic_store(&runtime->votes_seen_mask, 0);
+    atomic_store(&runtime->votes_granted_mask, 0);
 
   if (pthread_rwlock_init(&runtime->state_lock, NULL) != 0) {
     LOGE("Failed to initialize state lock");

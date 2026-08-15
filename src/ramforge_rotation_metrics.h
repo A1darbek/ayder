@@ -6,6 +6,8 @@
 #include <string.h>
 #include <stdint.h>
 
+#define AYDER_METRIC_HIST_BUCKETS 10
+
 typedef struct {
     char* buffer;
     size_t capacity;
@@ -56,6 +58,32 @@ typedef struct {
     _Atomic uint64_t zp_restore_us;                /* cumulative µs          */
     _Atomic uint64_t zp_restore_last_success_unix; /* Unix ts of last success*/
     _Atomic uint64_t zp_restore_inflight;          /* 0|1 gauge              */
+    _Atomic uint64_t process_start_time_unix;
+    _Atomic uint64_t http_requests_total;
+    _Atomic uint64_t http_responses_2xx;
+    _Atomic uint64_t http_responses_3xx;
+    _Atomic uint64_t http_responses_4xx;
+    _Atomic uint64_t http_responses_401;
+    _Atomic uint64_t http_responses_429;
+    _Atomic uint64_t http_responses_5xx;
+    _Atomic uint64_t http_responses_503;
+    _Atomic uint64_t http_active_connections;
+    _Atomic uint64_t http_duration_hist[AYDER_METRIC_HIST_BUCKETS];
+    _Atomic uint64_t http_duration_count;
+    _Atomic uint64_t http_duration_sum_us;
+    _Atomic uint64_t broker_produce_total;
+    _Atomic uint64_t broker_consume_total;
+    _Atomic uint64_t broker_commit_total;
+    _Atomic uint64_t broker_query_total;
+    _Atomic uint64_t broker_errors_total;
+    _Atomic uint64_t backpressure_events_total;
+    _Atomic uint64_t persistence_failures_total;
+    _Atomic uint64_t fsync_hist[AYDER_METRIC_HIST_BUCKETS];
+    _Atomic uint64_t fsync_count;
+    _Atomic uint64_t fsync_sum_us;
+    _Atomic uint64_t sealed_latency_hist[AYDER_METRIC_HIST_BUCKETS];
+    _Atomic uint64_t sealed_latency_count;
+    _Atomic uint64_t sealed_latency_sum_us;
 } RAMForgeMetrics;
 static inline __attribute__((unused))
 void metrics_buf_init(metrics_buffer_t* buf, char* buffer, size_t cap) {

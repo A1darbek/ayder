@@ -22,7 +22,7 @@ void storage_init(Storage *st);
 /// Destroy a Storage, freeing all memory.
 void storage_destroy(Storage *st);
 /// Save or update entry `id` with a copy of `data` (size bytes).
-void storage_save(Storage *st, int id, const void *data, size_t size);
+int storage_save(Storage *st, int id, const void *data, size_t size);
 /// Retrieve entry `id` into `out` (must be ≥ size bytes). Returns 1 if found.
 int storage_get(Storage *st, int id, void *out, size_t size);
 /// Remove entry `id`, freeing its data.

@@ -11,6 +11,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <errno.h>
 #include <stdatomic.h>
 #include <time.h>
 #include <sys/mman.h>
@@ -19,6 +20,7 @@
 #include <stddef.h>   // max_align_t
 #include <stdalign.h> // _Alignof
 #include <stdbool.h>
+#include <openssl/evp.h>
 
 // SIMD support detection
 #ifdef __AVX2__
@@ -43,6 +45,14 @@
 #define RF_SLOT_FLAG_VALID 0x1u
 #define RF_SLOT_FLAG_LARGE 0x2u
 #define RF_SLOT_FLAG_TOMBSTONE 0x4u
+#define RF_SHARED_TOPIC_PENDING 1u
+#define RF_SHARED_TOPIC_READY 2u
+
+typedef struct {
+    uint32_t id;
+    uint16_t parts;
+    char name[RF_MAX_TOPIC_LEN];
+} aof_topic_rec_t;
 
 
 
@@ -75,6 +85,40 @@ static pthread_t g_promoter;
 static _Thread_local uint64_t tls_read_seq = 0;
 static int g_worker_id = -1;
 static _Atomic uint64_t g_last_ha_read_barrier_req = 0;
+static _Atomic uint64_t g_ha_fwd_req_seq = 1;
+static _Thread_local rf_write_receipt_t g_last_write_receipt;
+static _Thread_local int g_replay_apply_error;
+
+static int replay_idemp_v2(uint32_t rec_id, const void *data, size_t size);
+static int replay_plain_batch_atomic(const void *data, size_t size);
+static rf_topic_t *rf_topic_require_by_id(uint32_t id);
+
+/* Fault injection is deliberately unavailable unless both the global test
+ * switch and a specific fault are set. Production configuration cannot enable
+ * these paths accidentally through a partially populated environment. */
+static int rf_test_faults_enabled(void) {
+    const char *value = getenv("RF_TEST_FAULTS");
+    return value && strcmp(value, "1") == 0;
+}
+
+static int rf_test_bus_apply_should_fail(uint32_t record_type) {
+    if (!rf_test_faults_enabled()) return 0;
+    const char *value = getenv("RF_TEST_BUS_APPLY_FAIL_REC_ID");
+    if (!value || !*value) return 0;
+    errno = 0;
+    char *end = NULL;
+    unsigned long parsed = strtoul(value, &end, 0);
+    return errno == 0 && end != value && *end == '\0' &&
+           parsed <= UINT32_MAX && (uint32_t)parsed == record_type;
+}
+
+#define SHMEM_HA_WRITE_RSP_BASE 0x5A170000u
+
+static int ha_fwd_rsp_key(uint64_t req_id) {
+    uint32_t folded = (uint32_t)req_id ^ (uint32_t)(req_id >> 32);
+    uint32_t key = (SHMEM_HA_WRITE_RSP_BASE ^ folded) | 1u;
+    return -(int)(key & 0x7fffffffu);
+}
 
 static inline void init_worker_id_from_env(void) {
     if (g_worker_id >= 0) return;
@@ -220,38 +264,35 @@ static inline void rf_size_sweep_maybe(rf_partition_t *p) {
     }
 
 
-static uint32_t reserve_heap(size_t sz){
-    if (sz == 0) return 0;
-
-    /* If a payload can never fit, fail early (prevents infinite loop). */
-    if (sz > g_bus->heap_size) return UINT32_MAX;
-
-    const size_t A = RF_BUS_HEAP_ALIGN;
-    const size_t sz_a = align_up_sz(sz, A);
-
-    for(;;){
-        uint64_t cur = atomic_load_explicit(&g_bus->data_head, memory_order_relaxed);
-
-        uint32_t raw = (uint32_t)(cur % g_bus->heap_size);
-        uint32_t off = (uint32_t)align_up_sz(raw, A);
-
-        uint64_t adv;
-        uint32_t out;
-
-        if ((uint64_t)off + sz <= g_bus->heap_size) {
-            /* pad up to alignment + reserve aligned payload */
-            adv = (uint64_t)(off - raw) + (uint64_t)sz_a;
-            out = off;
-        } else {
-            /* wrap: consume remainder, then reserve from 0 (already aligned) */
-            adv = (uint64_t)(g_bus->heap_size - raw) + (uint64_t)sz_a;
-            out = 0;
-        }
-
-        if (atomic_compare_exchange_weak_explicit(&g_bus->data_head, &cur, cur + adv,
-                                                  memory_order_acq_rel, memory_order_relaxed))
-            return out;
+static uint32_t rf_bus_timeout_ms(uint32_t requested) {
+    if (requested) return requested;
+    const char *e = getenv("RF_BUS_PUBLISH_TIMEOUT_MS");
+    if (e && *e) {
+        unsigned long v = strtoul(e, NULL, 10);
+        if (v > 0 && v <= UINT32_MAX) return (uint32_t)v;
     }
+    return 5000;
+}
+
+static int rf_lock_shared(pthread_mutex_t *lock) {
+    int rc = pthread_mutex_lock(lock);
+#ifdef EOWNERDEAD
+    if (rc == EOWNERDEAD) {
+        if (pthread_mutex_consistent(lock) != 0) return -1;
+        return 0;
+    }
+#endif
+    return rc == 0 ? 0 : -1;
+}
+
+static uint64_t rf_bus_min_cursor(const _Atomic uint64_t *cursors) {
+    uint32_t workers = g_bus->worker_count;
+    uint64_t min = UINT64_MAX;
+    for (uint32_t i = 0; i < workers; i++) {
+        uint64_t v = atomic_load_explicit(&cursors[i], memory_order_acquire);
+        if (v < min) min = v;
+    }
+    return min == UINT64_MAX ? 0 : min;
 }
 
 static rf_msg_slot_t* rf_ring_alloc(size_t cap) {
@@ -320,55 +361,382 @@ int rf_bus_init_pre_fork(size_t heap_bytes, size_t desc_count){
     g_bus->heap = (uint8_t*)mem + off_heap;
     g_bus->heap_size = (uint32_t)heap_bytes;
 
+    const char *worker_env = getenv("RF_EFFECTIVE_WORKER_COUNT");
+    unsigned long workers = worker_env && *worker_env ? strtoul(worker_env, NULL, 10) : 1;
+    if (workers == 0) workers = 1;
+    if (workers > RF_MAX_WORKERS) {
+        munmap(mem, total);
+        errno = E2BIG;
+        return -1;
+    }
+    g_bus->worker_count = (uint32_t)workers;
+
+    pthread_mutexattr_t mattr;
+    if (pthread_mutexattr_init(&mattr) != 0 ||
+        pthread_mutexattr_setpshared(&mattr, PTHREAD_PROCESS_SHARED) != 0) {
+        munmap(mem, total);
+        return -1;
+    }
+#if defined(__linux__)
+    if (pthread_mutexattr_setrobust(&mattr, PTHREAD_MUTEX_ROBUST) != 0) {
+        pthread_mutexattr_destroy(&mattr);
+        munmap(mem, total);
+        return -1;
+    }
+#endif
+    if (pthread_mutex_init(&g_bus->publish_lock, &mattr) != 0 ||
+        pthread_mutex_init(&g_bus->topic_lock, &mattr) != 0) {
+        pthread_mutexattr_destroy(&mattr);
+        munmap(mem, total);
+        return -1;
+    }
+    for (uint32_t i = 0; i < RF_IDEMP_LOCKS; i++) {
+        if (pthread_mutex_init(&g_bus->idemp_locks[i], &mattr) != 0) {
+            pthread_mutexattr_destroy(&mattr);
+            munmap(mem, total);
+            return -1;
+        }
+    }
+    pthread_mutexattr_destroy(&mattr);
+
     atomic_store(&g_bus->data_head, 0);
     atomic_store(&g_bus->desc_head, 0);
     atomic_store(&g_bus->drops, 0);
+    atomic_store(&g_bus->topic_count, 0);
+    for (uint32_t i = 0; i < RF_MAX_WORKERS; i++) {
+        atomic_store(&g_bus->consumer_seq[i], 0);
+        atomic_store(&g_bus->consumer_data_tail[i], 0);
+        atomic_store(&g_bus->consumer_failed_seq[i], 0);
+    }
 
     return 0;
 }
 
+
+static int rf_bus_publish_seq(int rec_id, const void *payload, uint32_t size,
+                              uint32_t timeout_ms, uint64_t *seq_out) {
+    if (!g_bus || !payload || !size) return -1;
+    if (size > g_bus->heap_size) {
+        errno = EMSGSIZE;
+        return -1;
+    }
+
+    timeout_ms = rf_bus_timeout_ms(timeout_ms);
+    uint64_t start = now_us();
+    const size_t aligned_size = align_up_sz(size, RF_BUS_HEAP_ALIGN);
+
+    for (;;) {
+        if (rf_lock_shared(&g_bus->publish_lock) != 0) return -1;
+
+        uint64_t d = atomic_load_explicit(&g_bus->desc_head, memory_order_acquire);
+        uint64_t min_seq = rf_bus_min_cursor(g_bus->consumer_seq);
+        uint64_t cur = atomic_load_explicit(&g_bus->data_head, memory_order_acquire);
+        uint64_t min_tail = rf_bus_min_cursor(g_bus->consumer_data_tail);
+
+        uint32_t raw = (uint32_t)(cur % g_bus->heap_size);
+        uint32_t off = (uint32_t)align_up_sz(raw, RF_BUS_HEAP_ALIGN);
+        uint64_t advance;
+        if ((uint64_t)off + size <= g_bus->heap_size) {
+            advance = (uint64_t)(off - raw) + (uint64_t)aligned_size;
+        } else {
+            advance = (uint64_t)(g_bus->heap_size - raw) + (uint64_t)aligned_size;
+            off = 0;
+        }
+        uint64_t data_end = cur + advance;
+
+        int desc_full = (d - min_seq) >= (uint64_t)(g_bus->desc_mask + 1);
+        int heap_full = (data_end - min_tail) > (uint64_t)g_bus->heap_size;
+        if (!desc_full && !heap_full) {
+            uint32_t idx = (uint32_t)d & g_bus->desc_mask;
+            bus_desc_t *ds = &g_bus->desc[idx];
+            atomic_store_explicit(&ds->valid, 0, memory_order_relaxed);
+            memcpy(g_bus->heap + off, payload, size);
+            ds->rec_id = (uint32_t)rec_id;
+            ds->size = size;
+            ds->off = off;
+            ds->seq = d;
+            ds->data_end = data_end;
+            atomic_store_explicit(&g_bus->data_head, data_end, memory_order_release);
+            atomic_store_explicit(&ds->valid, 1, memory_order_release);
+            atomic_store_explicit(&g_bus->desc_head, d + 1, memory_order_release);
+            pthread_mutex_unlock(&g_bus->publish_lock);
+            if (seq_out) *seq_out = d;
+            return 0;
+        }
+
+        pthread_mutex_unlock(&g_bus->publish_lock);
+        if ((now_us() - start) >= (uint64_t)timeout_ms * 1000ULL) {
+            atomic_fetch_add_explicit(&g_bus->drops, 1, memory_order_relaxed);
+            errno = ETIMEDOUT;
+            return -1;
+        }
+        struct timespec ts = {0, 200000};
+        nanosleep(&ts, NULL);
+    }
+}
 
 int rf_bus_publish(int rec_id, const void *payload, uint32_t size){
-    if (!g_bus || !payload || !size) return -1;
+    return rf_bus_publish_seq(rec_id, payload, size, 0, NULL);
+}
 
-    /* reserve payload space and copy */
-    uint32_t off = reserve_heap(size);
-    if (off == UINT32_MAX) return -1;
-    memcpy(g_bus->heap + off, payload, size);
+int rf_bus_publish_wait_except(int rec_id, const void *payload, uint32_t size,
+                               uint32_t timeout_ms, int except_worker,
+                               uint64_t *seq_out) {
+    uint64_t seq = 0;
+    timeout_ms = rf_bus_timeout_ms(timeout_ms);
+    uint64_t start = now_us();
+    if (rf_bus_publish_seq(rec_id, payload, size, timeout_ms, &seq) != 0) return -1;
 
-    /* claim descriptor slot */
-    uint64_t d = atomic_fetch_add_explicit(&g_bus->desc_head, 1, memory_order_acq_rel);
-    uint32_t idx = (uint32_t)d & g_bus->desc_mask;
-    bus_desc_t *ds = &g_bus->desc[idx];
+    for (;;) {
+        int complete = 1;
+        for (uint32_t i = 0; i < g_bus->worker_count; i++) {
+            if ((int)i == except_worker) continue;
+            uint64_t failed = atomic_load_explicit(
+                &g_bus->consumer_failed_seq[i], memory_order_acquire);
+            if (failed != 0 && failed <= seq + 1) {
+                errno = EIO;
+                return -1;
+            }
+            if (atomic_load_explicit(&g_bus->consumer_seq[i], memory_order_acquire) <= seq) {
+                complete = 0;
+                break;
+            }
+        }
+        if (complete) {
+            if (seq_out) *seq_out = seq;
+            return 0;
+        }
+        if ((now_us() - start) >= (uint64_t)timeout_ms * 1000ULL) {
+            errno = ETIMEDOUT;
+            return -1;
+        }
+        struct timespec ts = {0, 200000};
+        nanosleep(&ts, NULL);
+    }
+}
 
-    /* overwrite is allowed (broadcast bus), consumers must keep up */
-    ds->rec_id = (uint32_t)rec_id;
-    ds->size   = size;
-    ds->off    = off;
-    ds->seq    = d;
+int rf_bus_publish_wait(int rec_id, const void *payload, uint32_t size,
+                        uint32_t timeout_ms, uint64_t *seq_out) {
+    return rf_bus_publish_wait_except(rec_id, payload, size, timeout_ms, -1,
+                                      seq_out);
+}
 
-    /* publish */
-    atomic_thread_fence(memory_order_release);
-    atomic_store_explicit(&ds->valid, 1, memory_order_release);
+int rf_mutation_lock(uint64_t key) {
+    if (!g_bus) return -1;
+    uint32_t stripe = (uint32_t)(key ^ (key >> 32)) & (RF_IDEMP_LOCKS - 1);
+    return rf_lock_shared(&g_bus->idemp_locks[stripe]);
+}
+
+void rf_mutation_unlock(uint64_t key) {
+    if (!g_bus) return;
+    uint32_t stripe = (uint32_t)(key ^ (key >> 32)) & (RF_IDEMP_LOCKS - 1);
+    (void)pthread_mutex_unlock(&g_bus->idemp_locks[stripe]);
+}
+
+int rf_persist_apply_record(uint32_t record_type, const void *data, uint32_t size,
+                            uint32_t timeout_ms, rf_write_receipt_t *receipt) {
+    rf_write_receipt_t result;
+    memset(&result, 0, sizeof(result));
+    g_last_write_receipt = result;
+    if (receipt) *receipt = result;
+    if ((!data && size) || !g_bus) return -1;
+    init_worker_id_from_env();
+
+    if (RAMForge_HA_is_enabled()) {
+        ha_write_receipt_t ha_receipt;
+        int rc = RAMForge_HA_replicate_write_checked(record_type, data, size,
+                                                      timeout_ms, &ha_receipt);
+        result.batch_id = ha_receipt.aof_batch_id;
+        result.raft_index = ha_receipt.raft_index;
+        result.local_fsync = ha_receipt.local_fsync;
+        result.quorum_committed = ha_receipt.quorum_committed;
+        result.failover_safe = ha_receipt.quorum_committed;
+        result.applied_all_workers = ha_receipt.applied_all_workers;
+        if (receipt) *receipt = result;
+        g_last_write_receipt = result;
+        return rc;
+    }
+
+    const char *rocket = getenv("RF_ROCKET");
+    int rocket_on = rocket && *rocket && *rocket != '0';
+    if (!rocket_on) {
+        result.batch_id = AOF_append_sealed((int)record_type, data, size);
+        if (result.batch_id == 0 || AOF_sealed_wait(result.batch_id) != 0) {
+            if (receipt) *receipt = result;
+            g_last_write_receipt = result;
+            return -2;
+        }
+        result.local_fsync = 1;
+    }
+
+    int handled = RAMForge_HA_replay_record(record_type, data, size);
+    if (handled < 0 ||
+        (handled == 0 &&
+         rf_broker_apply_aof_checked(record_type, data, size) != 0)) {
+        if (receipt) *receipt = result;
+        g_last_write_receipt = result;
+        return -4;
+    }
+    if (rf_bus_publish_wait_except((int)record_type, data, size,
+                                   timeout_ms, g_worker_id, NULL) != 0) {
+        if (receipt) *receipt = result;
+        g_last_write_receipt = result;
+        return -3;
+    }
+    result.applied_all_workers = 1;
+    if (receipt) *receipt = result;
+    g_last_write_receipt = result;
     return 0;
 }
 
-int ha_fwd_send(uint32_t type, const void *payload, uint32_t size) {
+void rf_last_write_receipt(rf_write_receipt_t *receipt) {
+    if (receipt) *receipt = g_last_write_receipt;
+}
+
+int rf_kv_put_transaction(int32_t skey, int has_expected_cas,
+                          uint64_t expected_cas, uint64_t expires_us,
+                          const void *value, uint32_t value_len,
+                          uint32_t timeout_ms, uint64_t *new_cas,
+                          uint64_t *current_cas, rf_write_receipt_t *receipt) {
+    if ((!value && value_len) ||
+        sizeof(kvrec_t) + (size_t)value_len > MAX_DATA_SIZE) return -1;
+    uint64_t lock_key = (uint64_t)(uint32_t)skey;
+    if (rf_mutation_lock(lock_key) != 0) return -1;
+
+    uint8_t current[MAX_DATA_SIZE];
+    uint64_t observed_cas = 0;
+    if (shared_storage_get_fast(g_shared_storage, skey, current, sizeof(current)))
+        observed_cas = ((const kvrec_t *)current)->cas;
+    if (current_cas) *current_cas = observed_cas;
+    if (has_expected_cas && expected_cas != observed_cas) {
+        rf_mutation_unlock(lock_key);
+        return 1;
+    }
+
+    uint64_t next_cas = observed_cas + 1;
+    size_t payload_size = sizeof(aof_kv_put_t) + (size_t)value_len;
+    uint8_t payload[MAX_DATA_SIZE];
+    aof_kv_put_t *header = (aof_kv_put_t *)payload;
+    *header = (aof_kv_put_t){
+        .skey = skey,
+        .cas = next_cas,
+        .expires_us = expires_us,
+        .flags = 0,
+        .value_len = value_len
+    };
+    if (value_len) memcpy(payload + sizeof(*header), value, value_len);
+
+    int rc = rf_persist_apply_record(AOF_REC_KV_PUT, payload,
+                                     (uint32_t)payload_size, timeout_ms, receipt);
+    if (rc == 0) {
+        uint8_t verify[MAX_DATA_SIZE];
+        if (!shared_storage_get_fast(g_shared_storage, skey, verify, sizeof(verify))) {
+            rc = -4;
+        } else {
+            const kvrec_t *stored = (const kvrec_t *)verify;
+            if (stored->cas != next_cas || stored->flags != 0 ||
+                stored->expires_us != expires_us || stored->value_len != value_len ||
+                (value_len && memcmp(stored->value, value, value_len) != 0))
+                rc = -4;
+        }
+    }
+    if (new_cas) *new_cas = next_cas;
+    rf_mutation_unlock(lock_key);
+    return rc;
+}
+
+int rf_kv_delete_transaction(int32_t skey, int has_expected_cas,
+                             uint64_t expected_cas, uint32_t timeout_ms,
+                             uint64_t *new_cas, uint64_t *current_cas,
+                             rf_write_receipt_t *receipt) {
+    uint64_t lock_key = (uint64_t)(uint32_t)skey;
+    if (rf_mutation_lock(lock_key) != 0) return -1;
+    uint8_t current[MAX_DATA_SIZE];
+    if (!shared_storage_get_fast(g_shared_storage, skey, current, sizeof(current)) ||
+        (((const kvrec_t *)current)->flags & KV_FLAG_TOMBSTONE)) {
+        rf_mutation_unlock(lock_key);
+        return 2;
+    }
+    uint64_t observed_cas = ((const kvrec_t *)current)->cas;
+    if (current_cas) *current_cas = observed_cas;
+    if (has_expected_cas && expected_cas != observed_cas) {
+        rf_mutation_unlock(lock_key);
+        return 1;
+    }
+
+    uint64_t next_cas = observed_cas + 1;
+    aof_kv_del_t record = {
+        .skey = skey,
+        .cas = next_cas,
+        .flags = KV_FLAG_TOMBSTONE
+    };
+    int rc = rf_persist_apply_record(AOF_REC_KV_DEL, &record, sizeof(record),
+                                     timeout_ms, receipt);
+    if (rc == 0) {
+        uint8_t verify[MAX_DATA_SIZE];
+        if (!shared_storage_get_fast(g_shared_storage, skey, verify, sizeof(verify))) {
+            rc = -4;
+        } else {
+            const kvrec_t *stored = (const kvrec_t *)verify;
+            if (stored->cas != next_cas ||
+                !(stored->flags & KV_FLAG_TOMBSTONE)) rc = -4;
+        }
+    }
+    if (new_cas) *new_cas = next_cas;
+    rf_mutation_unlock(lock_key);
+    return rc;
+}
+
+int ha_fwd_store_response(const ha_fwd_write_rsp_t *response) {
+    if (!g_shared_storage || !response || response->req_id == 0) return -1;
+    return shared_storage_set(g_shared_storage, ha_fwd_rsp_key(response->req_id),
+                              response, sizeof(*response));
+}
+
+int ha_fwd_send_checked(uint32_t type, const void *payload, uint32_t size,
+                        uint32_t timeout_ms, ha_fwd_write_rsp_t *response) {
+    if (!g_shared_storage || (!payload && size)) return -1;
+    if (timeout_ms == 0) timeout_ms = 3000;
     size_t tot = sizeof(ha_fwd_rec_t) + size;
     void *buf = slab_alloc(tot);
     if (!buf) return -1;
     ha_fwd_rec_t *h = (ha_fwd_rec_t *) buf;
+    h->req_id = ((uint64_t)(uint32_t)getpid() << 32) ^
+                atomic_fetch_add(&g_ha_fwd_req_seq, 1);
     h->type = type;
     h->size = size;
+    h->timeout_ms = timeout_ms;
+    h->reserved = 0;
+    uint64_t req_id = h->req_id;
     if (size) memcpy((uint8_t *) buf + sizeof(*h), payload, size);
     int rc = rf_bus_publish(AOF_REC_HA_FORWARD, buf, (uint32_t) tot);
     slab_free(buf);
-    return rc;
+    if (rc != 0) return rc;
+
+    uint64_t start = now_us();
+    uint64_t timeout_us = (uint64_t)timeout_ms * 1000ULL;
+    for (;;) {
+        ha_fwd_write_rsp_t found;
+        if (shared_storage_try_get_fast(g_shared_storage, ha_fwd_rsp_key(req_id),
+                                        &found, sizeof(found)) &&
+            found.req_id == req_id) {
+            if (response) *response = found;
+            return found.rc;
+        }
+        if (now_us() - start >= timeout_us) return -5;
+        usleep(200);
+    }
+}
+
+int ha_fwd_send(uint32_t type, const void *payload, uint32_t size) {
+    return ha_fwd_send_checked(type, payload, size, 3000, NULL);
 }
 
 static void *promoter_loop(void *arg){
     (void)arg;
-    uint64_t r = tls_read_seq; /* start from 0 */
+    if (g_worker_id < 0 || (uint32_t)g_worker_id >= g_bus->worker_count) return NULL;
+    uint64_t r = atomic_load_explicit(&g_bus->consumer_seq[g_worker_id], memory_order_acquire);
+    tls_read_seq = r;
     for(;;){
         uint32_t idx = (uint32_t)r & g_bus->desc_mask;
         bus_desc_t *ds = &g_bus->desc[idx];
@@ -379,30 +747,43 @@ static void *promoter_loop(void *arg){
             uint32_t sz  = ds->size;
             uint32_t off = ds->off;
 
+            int apply_failed = 0;
             if ((uint64_t) off + sz <= g_bus->heap_size) {
                 if (id == AOF_REC_HA_FORWARD) {
                     /* Only worker 0 handles HA forward → append to RAFT log, replicate */
-                    if (g_worker_id == 0) {
+                    if (g_worker_id == 0 && sz >= sizeof(ha_fwd_rec_t)) {
                         const ha_fwd_rec_t *f = (const ha_fwd_rec_t *) (g_bus->heap + off);
-                        const uint8_t *p = (const uint8_t *) f + sizeof(*f);
-                        /* Call into HA: append locally + replicate (async) */
-                        extern int HA_forward_append_and_replicate(uint32_t type, const void *pl, size_t psz);
-                        (void) HA_forward_append_and_replicate(f->type, p, f->size);
+                        if (f->size == sz - sizeof(*f))
+                            (void)RAMForge_HA_handle_write_forward(f, sz);
                     }
                 } else if (id == AOF_REC_HA_MEMBERSHIP_FORWARD) {
                     if (g_worker_id == 0) {
                         (void)RAMForge_HA_handle_membership_forward(g_bus->heap + off, sz);
                     }
+                } else if (rf_test_bus_apply_should_fail(id)) {
+                    apply_failed = 1;
                 } else {
-                    if (!RAMForge_HA_replay_record(id, g_bus->heap + off, sz)) {
-                        rf_broker_replay_aof(id, g_bus->heap + off, sz);
-                    }
+                    int handled = RAMForge_HA_replay_record(id, g_bus->heap + off, sz);
+                    if (handled < 0 ||
+                        (handled == 0 &&
+                         rf_broker_apply_aof_checked(id, g_bus->heap + off, sz) != 0))
+                        apply_failed = 1;
                 }
             } else {
                 /* wrapped payload should never happen with reserve_heap() */
+                apply_failed = 1;
+            }
+            if (apply_failed) {
+                uint64_t expected = 0;
+                (void)atomic_compare_exchange_strong_explicit(
+                    &g_bus->consumer_failed_seq[g_worker_id], &expected, r + 1,
+                    memory_order_release, memory_order_relaxed);
             }
             r++;
             tls_read_seq = r;
+            atomic_store_explicit(&g_bus->consumer_data_tail[g_worker_id], ds->data_end,
+                                  memory_order_release);
+            atomic_store_explicit(&g_bus->consumer_seq[g_worker_id], r, memory_order_release);
             continue;
         }
 
@@ -410,8 +791,16 @@ static void *promoter_loop(void *arg){
         uint64_t head = atomic_load_explicit(&g_bus->desc_head, memory_order_acquire);
         if (head - r > (uint64_t)(g_bus->desc_mask + 1)){
             atomic_fetch_add_explicit(&g_bus->drops, head - r, memory_order_relaxed);
+            uint64_t expected = 0;
+            (void)atomic_compare_exchange_strong_explicit(
+                &g_bus->consumer_failed_seq[g_worker_id], &expected, r + 1,
+                memory_order_release, memory_order_relaxed);
             r = head;
             tls_read_seq = r;
+            atomic_store_explicit(&g_bus->consumer_seq[g_worker_id], r, memory_order_release);
+            atomic_store_explicit(&g_bus->consumer_data_tail[g_worker_id],
+                                  atomic_load_explicit(&g_bus->data_head, memory_order_acquire),
+                                  memory_order_release);
             continue;
         }
 
@@ -487,12 +876,17 @@ static inline int simd_strcmp(const char *a, const char *b, size_t len) {
 // Global State with Cache-Line Alignment
 // ═══════════════════════════════════════════════════════════════════════════════
 
-#define MAX_TOPICS 1024
-static rf_topic_t g_topics[MAX_TOPICS] __attribute__((aligned(64)));
+static rf_topic_t g_topics[RF_MAX_TOPICS] __attribute__((aligned(64)));
 static _Atomic int g_topic_count = 0;
 static _Atomic uint64_t g_idempotency_index_writes = 0;
 static int g_default_partitions = 8; // Increased for better parallelism
 static size_t g_ring_cap = 1048576;  // 1M slots, power of 2
+static pthread_mutex_t g_local_topic_lock = PTHREAD_MUTEX_INITIALIZER;
+static int init_partition_lockfree(rf_partition_t *p);
+static rf_topic_t *find_topic_by_id_local(uint32_t id);
+static int rf_topic_apply_local(const char *name, uint32_t id, int partitions);
+static int rf_shared_topic_publish_replay(const aof_topic_rec_t *rec);
+static rf_topic_t *rf_topic_require_by_id(uint32_t id);
 
 // Fast topic lookup hash table
 #define TOPIC_HASH_SIZE 2048
@@ -621,9 +1015,119 @@ static int idemp_put(const char *topic, int part, const void *unused_key, size_t
     if (!g_shared_storage) return 0;
     int skey = idemp_hash32_fp(topic, part, fp64_in);
     aof_idemp_val_t v = { .fp64 = fp64_in, .offset = offset };
-    int ok = shared_storage_set(g_shared_storage, skey, &v, sizeof v);
-    if (ok) atomic_fetch_add_explicit(&g_idempotency_index_writes, 1, memory_order_relaxed);
-    return ok;
+    int rc = shared_storage_set(g_shared_storage, skey, &v, sizeof v);
+    if (rc == 0)
+        atomic_fetch_add_explicit(&g_idempotency_index_writes, 1, memory_order_relaxed);
+    return rc == 0;
+}
+
+static int digest_u32(EVP_MD_CTX *ctx, uint32_t value) {
+    uint8_t b[4] = {
+        (uint8_t)(value >> 24), (uint8_t)(value >> 16),
+        (uint8_t)(value >> 8), (uint8_t)value
+    };
+    return EVP_DigestUpdate(ctx, b, sizeof(b)) == 1 ? 0 : -1;
+}
+
+static int digest_u64(EVP_MD_CTX *ctx, uint64_t value) {
+    uint8_t b[8];
+    for (int i = 7; i >= 0; i--) {
+        b[i] = (uint8_t)value;
+        value >>= 8;
+    }
+    return EVP_DigestUpdate(ctx, b, sizeof(b)) == 1 ? 0 : -1;
+}
+
+static int idemp_key_digest(const char *topic, int part,
+                            const void *key, size_t key_len, uint8_t out[32]) {
+    static const char domain[] = "AYDER-IDEMP-KEY-v2";
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    unsigned int out_len = 0;
+    if (!ctx) return -1;
+    int ok = EVP_DigestInit_ex(ctx, EVP_sha256(), NULL) == 1 &&
+             EVP_DigestUpdate(ctx, domain, sizeof(domain) - 1) == 1 &&
+             digest_u64(ctx, strlen(topic)) == 0 &&
+             EVP_DigestUpdate(ctx, topic, strlen(topic)) == 1 &&
+             digest_u32(ctx, (uint32_t)part) == 0 &&
+             digest_u64(ctx, key_len) == 0 &&
+             EVP_DigestUpdate(ctx, key, key_len) == 1 &&
+             EVP_DigestFinal_ex(ctx, out, &out_len) == 1 && out_len == 32;
+    EVP_MD_CTX_free(ctx);
+    return ok ? 0 : -1;
+}
+
+static int idemp_payload_digest(const char *topic, int part,
+                                const rf_msg_view_t *messages, size_t count,
+                                uint8_t out[32]) {
+    static const char domain[] = "AYDER-IDEMP-PAYLOAD-v2";
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    unsigned int out_len = 0;
+    if (!ctx) return -1;
+    int ok = EVP_DigestInit_ex(ctx, EVP_sha256(), NULL) == 1 &&
+             EVP_DigestUpdate(ctx, domain, sizeof(domain) - 1) == 1 &&
+             digest_u64(ctx, strlen(topic)) == 0 &&
+             EVP_DigestUpdate(ctx, topic, strlen(topic)) == 1 &&
+             digest_u32(ctx, (uint32_t)part) == 0 &&
+             digest_u64(ctx, count) == 0;
+    for (size_t i = 0; ok && i < count; i++) {
+        ok = digest_u64(ctx, messages[i].key_len) == 0 &&
+             (!messages[i].key_len ||
+              EVP_DigestUpdate(ctx, messages[i].key, messages[i].key_len) == 1) &&
+             digest_u64(ctx, messages[i].val_len) == 0 &&
+             (!messages[i].val_len ||
+              EVP_DigestUpdate(ctx, messages[i].val, messages[i].val_len) == 1);
+    }
+    ok = ok && EVP_DigestFinal_ex(ctx, out, &out_len) == 1 && out_len == 32;
+    EVP_MD_CTX_free(ctx);
+    return ok ? 0 : -1;
+}
+
+static int idemp_state_key(const uint8_t digest[32]) {
+    uint32_t folded = simd_hash_djb2((const char *)digest, 32);
+    uint32_t key = (folded & 0x1fffffffu) | 0x20000000u;
+    return -(int)key;
+}
+
+static int idemp_state_load(const uint8_t key_digest[32], uint32_t topic_id,
+                            int part, rf_idemp_state_t *out) {
+    if (!g_shared_storage || !out) return 0;
+    memset(out, 0, sizeof(*out));
+    if (!shared_storage_get_fast(g_shared_storage, idemp_state_key(key_digest),
+                                 out, sizeof(*out))) return 0;
+    if (out->magic != RF_IDEMP_V2_MAGIC || out->version != RF_IDEMP_V2_VERSION ||
+        out->topic_id != topic_id || out->partition != (uint16_t)part ||
+        memcmp(out->key_digest, key_digest, 32) != 0) return -1;
+    return 1;
+}
+
+static int idemp_state_store(const rf_idemp_state_t *state) {
+    if (!g_shared_storage || !state) return -1;
+    const char *fail_committed = getenv("RF_TEST_IDEMP_FAIL_COMMITTED_STORE");
+    if (rf_test_faults_enabled() && fail_committed &&
+        strcmp(fail_committed, "1") == 0 &&
+        state->status == RF_IDEMP_STATE_COMMITTED &&
+        state->applied_all_workers) {
+        errno = EIO;
+        return -1;
+    }
+    int rc = shared_storage_set(g_shared_storage,
+                                idemp_state_key(state->key_digest),
+                                state, sizeof(*state));
+    if (rc == 0 && state->status == RF_IDEMP_STATE_COMMITTED)
+        atomic_fetch_add_explicit(&g_idempotency_index_writes, 1,
+                                  memory_order_relaxed);
+    return rc;
+}
+
+static void receipt_from_idemp_state(const rf_idemp_state_t *state,
+                                     rf_write_receipt_t *receipt) {
+    memset(receipt, 0, sizeof(*receipt));
+    receipt->batch_id = state->batch_id;
+    receipt->raft_index = state->raft_index;
+    receipt->local_fsync = state->local_fsync != 0;
+    receipt->quorum_committed = state->quorum_committed != 0;
+    receipt->failover_safe = state->quorum_committed != 0;
+    receipt->applied_all_workers = state->applied_all_workers != 0;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -858,70 +1362,117 @@ static inline int rf_msg_is_expired(rf_partition_t *p, rf_msg_slot_t *slot) {
     return (ts + ttl * 1000ULL) < now;
 }
 int rf_topic_ensure(const char *name, int partitions) {
-    if (!name || !*name) return -1;
+    if (!name || !*name || strnlen(name, RF_MAX_TOPIC_LEN) >= RF_MAX_TOPIC_LEN) return -1;
     uint32_t id = rf_topic_id(name);
     rf_topic_t *t = find_topic_lockfree(name, id);
-    if (t) return 0; // Already exists
+    int requested_parts = partitions > 0 ? partitions : g_default_partitions;
+    if (requested_parts <= 0 || requested_parts > RF_MAX_PARTITIONS) return -1;
+    if (t) return (partitions <= 0 || t->partitions == requested_parts) ? 0 : -5;
+    if (!g_bus) return -6;
 
-    /* Reserve a unique slot atomically (fixes race with weak CAS) */
-    int idx = (int) atomic_fetch_add_explicit(&g_topic_count, 1, memory_order_acq_rel);
-    if (idx >= MAX_TOPICS) {
-        /* roll back the reservation */
-        atomic_fetch_sub_explicit(&g_topic_count, 1, memory_order_acq_rel);
-        return -2;
-    }
-
-    rf_topic_t *slot = &g_topics[idx];
-    memset(slot, 0, sizeof(*slot));
-    strncpy(slot->name, name, RF_MAX_TOPIC_LEN - 1);
-    slot->id = id;
-    slot->hash = id; // Precomputed for fast lookup
-    slot->partitions = partitions > 0 ? partitions : g_default_partitions;
-
-    // Allocate partitions with cache-line alignment
-    size_t parts_size = slot->partitions * sizeof(rf_partition_t);
-    slot->parts = aligned_alloc(64, parts_size);
-    if (!slot->parts) return -3;
-    memset(slot->parts, 0, parts_size);
-    for (int i = 0; i < slot->partitions; i++) {
-        if (init_partition_lockfree(&slot->parts[i]) != 0) return -4;
-    }
-
-    // Insert into hash table
-    uint32_t hash_idx = id & (TOPIC_HASH_SIZE - 1);
-    for (int probe = 0; probe < 8; probe++) {
-        uint32_t idx_hash = (hash_idx + probe) & (TOPIC_HASH_SIZE - 1);
-        rf_topic_t *expected = NULL;
-        if (atomic_compare_exchange_weak_explicit(
-                &g_topic_hash[idx_hash], &expected, slot,
-                memory_order_release, memory_order_relaxed)) {
+    uint64_t start = now_us();
+    rf_shared_topic_t *reserved = NULL;
+    for (;;) {
+        if (rf_lock_shared(&g_bus->topic_lock) != 0) return -6;
+        rf_shared_topic_t *empty = NULL;
+        rf_shared_topic_t *found = NULL;
+        int collision = 0;
+        for (uint32_t i = 0; i < RF_MAX_TOPICS; i++) {
+            rf_shared_topic_t *candidate = &g_bus->topics[i];
+            uint32_t state = atomic_load_explicit(&candidate->ready, memory_order_acquire);
+            if (state == 0) {
+                if (!empty) empty = candidate;
+                continue;
+            }
+            if (candidate->id != id) continue;
+            if (strncmp(candidate->name, name, RF_MAX_TOPIC_LEN) != 0) {
+                collision = 1;
+                break;
+            }
+            found = candidate;
             break;
         }
+        if (collision) {
+            pthread_mutex_unlock(&g_bus->topic_lock);
+            return -5;
+        }
+        if (found) {
+            uint32_t state = atomic_load_explicit(&found->ready, memory_order_acquire);
+            int canonical_parts = found->partitions;
+            pthread_mutex_unlock(&g_bus->topic_lock);
+            if (state == RF_SHARED_TOPIC_READY) {
+                if (partitions > 0 && canonical_parts != requested_parts) return -5;
+                return rf_topic_apply_local(name, id, canonical_parts);
+            }
+            if ((now_us() - start) >= 5000000ULL) return -6;
+            struct timespec ts = {0, 200000};
+            nanosleep(&ts, NULL);
+            continue;
+        }
+        if (!empty) {
+            pthread_mutex_unlock(&g_bus->topic_lock);
+            return -2;
+        }
+        empty->id = id;
+        empty->partitions = (uint16_t)requested_parts;
+        empty->reserved = 0;
+        memset(empty->name, 0, sizeof(empty->name));
+        memcpy(empty->name, name, strlen(name));
+        atomic_store_explicit(&empty->ready, RF_SHARED_TOPIC_PENDING, memory_order_release);
+        reserved = empty;
+        pthread_mutex_unlock(&g_bus->topic_lock);
+        break;
     }
 
-    // Persist topic metadata
-    struct {
-        uint32_t id;
-        uint16_t parts;
-        char name[RF_MAX_TOPIC_LEN];
-    } rec = { .id = slot->id, .parts = (uint16_t)slot->partitions };
-    strncpy(rec.name, slot->name, RF_MAX_TOPIC_LEN - 1);
-    AOF_append_sealed(AOF_REC_BROKER_TOPIC, &rec, sizeof(rec));
-    if (RAMForge_HA_is_enabled() && RAMForge_HA_is_leader()) {
-        (void) RAMForge_HA_replicate_write(AOF_REC_BROKER_TOPIC, &rec, sizeof(rec));
+    aof_topic_rec_t rec;
+    memset(&rec, 0, sizeof(rec));
+    rec.id = id;
+    rec.parts = (uint16_t)requested_parts;
+    memcpy(rec.name, name, strlen(name));
+
+    rf_write_receipt_t receipt;
+    int persist_rc = rf_persist_apply_record(AOF_REC_BROKER_TOPIC, &rec,
+                                             (uint32_t)sizeof(rec), 5000,
+                                             &receipt);
+    int keep_committed = persist_rc == 0 || receipt.local_fsync ||
+                         receipt.quorum_committed;
+
+    if (rf_lock_shared(&g_bus->topic_lock) == 0) {
+        if (keep_committed) {
+            atomic_store_explicit(&reserved->ready, RF_SHARED_TOPIC_READY, memory_order_release);
+            atomic_fetch_add_explicit(&g_bus->topic_count, 1, memory_order_relaxed);
+        } else {
+            memset(reserved->name, 0, sizeof(reserved->name));
+            reserved->id = 0;
+            reserved->partitions = 0;
+            atomic_store_explicit(&reserved->ready, 0, memory_order_release);
+        }
+        pthread_mutex_unlock(&g_bus->topic_lock);
+    } else {
+        return -6;
     }
-    return 0;
+    return persist_rc == 0 ? 0 : -6;
 }
 
-int rf_delete_before(const char *topic, int partition, uint64_t before_offset,
-                     uint64_t *deleted_count, uint64_t *freed_bytes)
+int rf_delete_before_checked(const char *topic, int partition,
+                             uint64_t before_offset, uint32_t timeout_ms,
+                             uint64_t *deleted_count, uint64_t *freed_bytes,
+                             rf_write_receipt_t *receipt)
 {
+    rf_write_receipt_t result;
+    memset(&result, 0, sizeof(result));
+    if (deleted_count) *deleted_count = 0;
+    if (freed_bytes) *freed_bytes = 0;
+    if (receipt) *receipt = result;
     if (!topic) return -1;
 
     rf_topic_t *t = find_topic_lockfree(topic, rf_topic_id(topic));
     if (!t || partition < 0 || partition >= t->partitions) return -2;
 
     rf_partition_t *p = &t->parts[partition];
+    uint64_t transaction_key = ((uint64_t)t->id << 32) ^
+                               (uint64_t)(uint32_t)partition;
+    if (rf_mutation_lock(transaction_key) != 0) return -4;
     rf_msg_slot_t *ring = atomic_load_explicit(&p->ring, memory_order_acquire);
     uint64_t wh = atomic_load_explicit(&p->write_head, memory_order_acquire);
 
@@ -940,76 +1491,116 @@ int rf_delete_before(const char *topic, int partition, uint64_t before_offset,
             uint64_t so = atomic_load_explicit(&s->offset, memory_order_acquire);
             if (so != o) continue; /* wrong logical occupant */
 
-            freed   += slot_payload_bytes(s);
-            rf_invalidate_slot(p, s);
+            freed += slot_payload_bytes(s);
             deleted++;
         }
     }
 
-    /* Raise the hard floor so readers/replay won’t surface old data */
-    atomic_max_u64(&p->delete_floor, before_offset);
-
-    /* Persist truncation so it survives crashes */
     aof_truncate_rec_t rec = {
             .topic_id = t->id,
             .partition = (uint16_t)partition,
             .reserved = 0,
             .before_offset = before_offset
     };
-    AOF_append_sealed(AOF_REC_BROKER_TRUNCATE, &rec, sizeof(rec));
-
-    if (RAMForge_HA_is_enabled()) {
-        RAMForge_HA_replicate_write(AOF_REC_BROKER_TRUNCATE, &rec, sizeof(rec));
-    }
+    int rc = rf_persist_apply_record(AOF_REC_BROKER_TRUNCATE, &rec,
+                                     (uint32_t)sizeof(rec), timeout_ms, &result);
+    rf_mutation_unlock(transaction_key);
+    if (receipt) *receipt = result;
+    if (rc != 0) return rc;
 
     if (deleted_count) *deleted_count = deleted;
     if (freed_bytes)   *freed_bytes   = freed;
     return 0;
 }
 
+int rf_set_retention_checked(const char *topic, int partition,
+                             int has_ttl, uint64_t ttl_ms,
+                             int has_max_bytes, uint64_t max_bytes,
+                             uint32_t timeout_ms,
+                             rf_write_receipt_t *receipt) {
+    rf_write_receipt_t result;
+    memset(&result, 0, sizeof(result));
+    if (receipt) *receipt = result;
+    if (!has_ttl && !has_max_bytes) return -1;
+
+    int global = !topic || !*topic || strcmp(topic, "*") == 0;
+    rf_topic_t *resolved = NULL;
+    if (!global) {
+        if (strnlen(topic, RF_MAX_TOPIC_LEN) >= RF_MAX_TOPIC_LEN) return -1;
+        resolved = rf_topic_require_by_id(rf_topic_id(topic));
+        if (!resolved || strcmp(resolved->name, topic) != 0 || partition < -1 ||
+            partition >= resolved->partitions) return -2;
+    } else if (partition != -1) {
+        return -1;
+    }
+
+    aof_ttl_rec_t record;
+    memset(&record, 0, sizeof(record));
+    record.partition = global ? -1 : partition;
+    record.ttl_ms = ttl_ms;
+    record.max_bytes = max_bytes;
+    record.present_flags = (has_ttl ? RF_RETENTION_HAS_TTL : 0) |
+                           (has_max_bytes ? RF_RETENTION_HAS_MAX_BYTES : 0);
+    if (global) {
+        record.topic[0] = '*';
+    } else {
+        memcpy(record.topic, topic, strlen(topic) + 1);
+    }
+
+    uint64_t lock_key = UINT64_C(0x5254454e54494f4e); /* "RTENTION" */
+    if (rf_mutation_lock(lock_key) != 0) return -4;
+    int rc = rf_persist_apply_record(AOF_REC_BROKER_TTL, &record,
+                                     (uint32_t)sizeof(record), timeout_ms,
+                                     &result);
+    rf_mutation_unlock(lock_key);
+    if (receipt) *receipt = result;
+    return rc;
+}
+
+int rf_delete_before(const char *topic, int partition, uint64_t before_offset,
+                     uint64_t *deleted_count, uint64_t *freed_bytes) {
+    return rf_delete_before_checked(topic, partition, before_offset, 0,
+                                    deleted_count, freed_bytes, NULL);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // Zero-Copy Message Production with Lock-Free Ring Buffer
 // ═══════════════════════════════════════════════════════════════════════════════
 
-static inline void replay_one_msg_rec(const aof_msg_rec_t *r, const uint8_t *kv) {
-    rf_topic_t *t = NULL;
-    int n = atomic_load_explicit(&g_topic_count, memory_order_acquire);
-    for (int i = 0; i < n; i++) {
-        if (g_topics[i].id == r->topic_id) {
-            t = &g_topics[i];
-            break;
-        }
-    }
-    if (!t || r->partition >= t->partitions) return;
+static inline int replay_one_msg_rec(const aof_msg_rec_t *r, const uint8_t *kv) {
+    rf_topic_t *t = rf_topic_require_by_id(r->topic_id);
+    if (!t || r->partition >= t->partitions) return -1;
     rf_partition_t *p = &t->parts[r->partition];
 
-    if (rf_partition_ensure_ring(p) != 0) return;
+    if (rf_partition_ensure_ring(p) != 0) return -1;
     rf_msg_slot_t *ring = atomic_load_explicit(&p->ring, memory_order_acquire);
-    if (!ring) return;
+    if (!ring) return -1;
 
     uint64_t floor = atomic_load_explicit(&p->delete_floor, memory_order_acquire);
-    if (r->offset < floor) return;  // NEW: honor truncate floor
+    if (r->offset < floor) return 0;  // honor truncate floor
 
     size_t total_size = r->key_len + r->val_len;
     uint64_t slot_idx = (r->offset) & p->capacity_mask;
     rf_msg_slot_t *slot = &ring[slot_idx];
 
+    if (rf_slot_ready_for_offset(slot, r->offset)) return 0;
+    void *large_blob = NULL;
+    if (total_size > sizeof(slot->inline_data)) {
+        large_blob = slab_alloc(total_size);
+        if (!large_blob) return -1;
+        memcpy(large_blob, kv, total_size);
+    }
     uint64_t want = r->offset + 1;
     seed_shared_next_offset(r->topic_id, r->partition, want);
     atomic_max_u64(&p->next_offset, want);
     atomic_max_u64(&p->write_head, want);
-    if (rf_slot_ready_for_offset(slot, r->offset)) return;
     rf_slot_evict_if_needed(p, slot, r->offset);
 
     if (total_size <= sizeof(slot->inline_data)) {
         memcpy(slot->inline_data, kv, total_size);
         slot->blob = slot->inline_data;
     } else {
-        void *blob = slab_alloc(total_size);
-        if (blob) {
-            memcpy(blob, kv, total_size);
-            slot->blob = blob;
-        }
+        slot->blob = large_blob;
     }
 
     /* Defensive: normalize ts so TTL won't purge immediately if it's 0 */
@@ -1024,140 +1615,13 @@ static inline void replay_one_msg_rec(const aof_msg_rec_t *r, const uint8_t *kv)
 
     /* size accounting on replay */
     atomic_fetch_add_explicit(&p->live_bytes, (uint64_t)total_size, memory_order_relaxed);
-
+    return 0;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
 // SEALED SINGLE MESSAGE PRODUCE - ZERO-LOSS GUARANTEE
 // ═══════════════════════════════════════════════════════════════════════════
 
-int rf_produce_sealed(const char *topic, int partition,
-                      const void *key, size_t key_len,
-                      const void *val, size_t val_len,
-                      uint64_t *out_offset, uint64_t *batch_id) {
-    if (!topic || (!val && val_len)) return -1;
-    rf_topic_ensure(topic, 0);
-    rf_topic_t *t = find_topic_lockfree(topic, rf_topic_id(topic));
-    if (!t) return -2;
-
-    if (partition < 0) {
-        partition = simd_hash_djb2(topic, strlen(topic)) & (t->partitions - 1);
-    }
-    if (partition >= t->partitions) return -3;
-
-    rf_partition_t *p = &t->parts[partition];
-    if (rf_partition_ensure_ring(p) != 0) return -4;
-
-    rf_msg_slot_t *ring = atomic_load_explicit(&p->ring, memory_order_acquire);
-    if (!ring) return -4;
-
-    uint64_t offset = alloc_offset_shared(t, p, partition);
-    uint64_t slot_idx = offset & p->capacity_mask;
-    rf_msg_slot_t *slot = &ring[slot_idx];
-    rf_slot_evict_if_needed(p, slot, offset);
-    atomic_max_u64(&p->next_offset, offset + 1);
-
-    size_t total_size = key_len + val_len;
-    uint64_t ts_wall = wall_us_raw();
-    int inline_payload = (total_size <= sizeof(slot->inline_data));
-
-    if (inline_payload) {
-        if (key && key_len) memcpy(slot->inline_data, key, key_len);
-        if (val && val_len) memcpy(slot->inline_data + key_len, val, val_len);
-        slot->blob = slot->inline_data;
-    } else {
-        void *blob = slab_alloc(total_size);
-        if (!blob) {
-            slot->blob = NULL;
-            atomic_store_explicit(&slot->offset, offset, memory_order_release);
-            atomic_store_explicit(&slot->ts_us, ts_wall, memory_order_release);
-            atomic_store_explicit(&slot->key_len, 0, memory_order_release);
-            atomic_store_explicit(&slot->val_len, 0, memory_order_release);
-            atomic_store_explicit(&slot->partition, partition, memory_order_release);
-            atomic_store_explicit(&slot->flags, RF_SLOT_FLAG_TOMBSTONE, memory_order_release);
-            rf_advance_write_head_after_publish_relaxed(p, offset);
-            return -4;
-        }
-        if (key && key_len) memcpy(blob, key, key_len);
-        if (val && val_len) memcpy((uint8_t *)blob + key_len, val, val_len);
-        slot->blob = blob;
-    }
-
-    size_t aof_size = sizeof(aof_msg_rec_t) + total_size;
-    void *sealed_buffer = slab_alloc(aof_size);
-    if (!sealed_buffer) {
-        if (!inline_payload && slot->blob) {
-            slab_free(slot->blob);
-            slot->blob = NULL;
-        }
-        atomic_store_explicit(&slot->offset, offset, memory_order_release);
-        atomic_store_explicit(&slot->ts_us, ts_wall, memory_order_release);
-        atomic_store_explicit(&slot->key_len, 0, memory_order_release);
-        atomic_store_explicit(&slot->val_len, 0, memory_order_release);
-        atomic_store_explicit(&slot->partition, partition, memory_order_release);
-        atomic_store_explicit(&slot->flags, RF_SLOT_FLAG_TOMBSTONE, memory_order_release);
-        rf_advance_write_head_after_publish_relaxed(p, offset);
-        return -5;
-    }
-
-    aof_msg_rec_t *aof_rec = (aof_msg_rec_t *)sealed_buffer;
-    aof_rec->topic_id = t->id;
-    aof_rec->partition = (uint16_t)partition;
-    aof_rec->reserved = RF_TS_FLAG_WALL;
-    aof_rec->offset = offset;
-    aof_rec->ts_us = ts_wall;
-    aof_rec->key_len = key_len;
-    aof_rec->val_len = val_len;
-    memcpy((uint8_t *)sealed_buffer + sizeof(aof_msg_rec_t), slot->blob, total_size);
-
-    if (RAMForge_HA_is_enabled()) {
-        int hrc = RAMForge_HA_replicate_write(AOF_REC_BROKER_MSG, sealed_buffer, (uint32_t)aof_size);
-        if (hrc != 0) {
-            slab_free(sealed_buffer);
-            if (!inline_payload && slot->blob) {
-                slab_free(slot->blob);
-                slot->blob = NULL;
-            }
-            atomic_store_explicit(&slot->offset, offset, memory_order_release);
-            atomic_store_explicit(&slot->ts_us, ts_wall, memory_order_release);
-            atomic_store_explicit(&slot->key_len, 0, memory_order_release);
-            atomic_store_explicit(&slot->val_len, 0, memory_order_release);
-            atomic_store_explicit(&slot->partition, partition, memory_order_release);
-            atomic_store_explicit(&slot->flags, RF_SLOT_FLAG_TOMBSTONE, memory_order_release);
-            rf_advance_write_head_after_publish_relaxed(p, offset);
-            return -6;
-        }
-    }
-
-    uint64_t out_bid = 0;
-    const char *rocket_env = getenv("RF_ROCKET");
-    const int rocket_on = (rocket_env && rocket_env[0] != '\0' && rocket_env[0] != '0');
-    if (rocket_on) {
-        out_bid = 0;
-    } else {
-        out_bid = AOF_append_sealed(AOF_REC_BROKER_MSG, sealed_buffer, aof_size);
-    }
-    (void)rf_bus_publish(AOF_REC_BROKER_MSG, sealed_buffer, (uint32_t)aof_size);
-
-    atomic_store_explicit(&slot->offset, offset, memory_order_release);
-    atomic_store_explicit(&slot->ts_us, ts_wall, memory_order_release);
-    atomic_store_explicit(&slot->key_len, key_len, memory_order_release);
-    atomic_store_explicit(&slot->val_len, val_len, memory_order_release);
-    atomic_store_explicit(&slot->partition, partition, memory_order_release);
-    atomic_store_explicit(&slot->flags,
-                          inline_payload ? RF_SLOT_FLAG_VALID : (RF_SLOT_FLAG_VALID | RF_SLOT_FLAG_LARGE),
-                          memory_order_release);
-
-    atomic_fetch_add_explicit(&p->live_bytes, (uint64_t)total_size, memory_order_relaxed);
-    rf_size_sweep_maybe(p);
-    rf_advance_write_head_after_publish_strict(p, offset);
-
-    if (batch_id) *batch_id = out_bid;
-    if (out_offset) *out_offset = offset;
-
-    slab_free(sealed_buffer);
-    return 0;
-}
 
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1288,9 +1752,163 @@ int rf_offset_load(const char *topic, const char *group, int partition, uint64_t
 }
 
 int rf_offset_store(const char *topic, const char *group, int partition, uint64_t off) {
-    if (!g_shared_storage) return 0;
+    if (!g_shared_storage) return -1;
     int k = offset_key_hash(topic, group, partition);
-    return shared_storage_set(g_shared_storage, k, &off, sizeof(off));
+    return shared_storage_atomic_max_u64(g_shared_storage, k, off, NULL);
+    return 0;
+}
+
+static rf_topic_t *find_topic_by_id_local(uint32_t id) {
+    int n = atomic_load_explicit(&g_topic_count, memory_order_acquire);
+    for (int i = 0; i < n; i++) {
+        if (g_topics[i].id == id) return &g_topics[i];
+    }
+    return NULL;
+}
+
+static int rf_topic_apply_local(const char *name, uint32_t id, int partitions) {
+    if (!name || !*name || strnlen(name, RF_MAX_TOPIC_LEN) >= RF_MAX_TOPIC_LEN) return -1;
+    if (partitions <= 0 || partitions > RF_MAX_PARTITIONS) return -1;
+
+    pthread_mutex_lock(&g_local_topic_lock);
+    rf_topic_t *existing = find_topic_lockfree(name, id);
+    if (existing) {
+        int rc = existing->partitions == partitions ? 0 : -5;
+        pthread_mutex_unlock(&g_local_topic_lock);
+        return rc;
+    }
+    rf_topic_t *same_id = find_topic_by_id_local(id);
+    if (same_id) {
+        pthread_mutex_unlock(&g_local_topic_lock);
+        return -5;
+    }
+
+    int idx = atomic_load_explicit(&g_topic_count, memory_order_relaxed);
+    if (idx >= RF_MAX_TOPICS) {
+        pthread_mutex_unlock(&g_local_topic_lock);
+        return -2;
+    }
+
+    rf_topic_t *slot = &g_topics[idx];
+    memset(slot, 0, sizeof(*slot));
+    memcpy(slot->name, name, strlen(name) + 1);
+    slot->id = id;
+    slot->hash = id;
+    slot->partitions = partitions;
+
+    size_t parts_size = (size_t)partitions * sizeof(rf_partition_t);
+    slot->parts = aligned_alloc(64, parts_size);
+    if (!slot->parts) {
+        pthread_mutex_unlock(&g_local_topic_lock);
+        return -3;
+    }
+    memset(slot->parts, 0, parts_size);
+    for (int i = 0; i < partitions; i++) {
+        if (init_partition_lockfree(&slot->parts[i]) != 0) {
+            free(slot->parts);
+            slot->parts = NULL;
+            pthread_mutex_unlock(&g_local_topic_lock);
+            return -4;
+        }
+    }
+
+    uint32_t hash_idx = id & (TOPIC_HASH_SIZE - 1);
+    int inserted = 0;
+    for (int probe = 0; probe < 8; probe++) {
+        uint32_t idx_hash = (hash_idx + (uint32_t)probe) & (TOPIC_HASH_SIZE - 1);
+        rf_topic_t *expected = NULL;
+        if (atomic_compare_exchange_strong_explicit(
+                &g_topic_hash[idx_hash], &expected, slot,
+                memory_order_release, memory_order_relaxed)) {
+            inserted = 1;
+            break;
+        }
+    }
+    if (!inserted) {
+        free(slot->parts);
+        slot->parts = NULL;
+        memset(slot, 0, sizeof(*slot));
+        pthread_mutex_unlock(&g_local_topic_lock);
+        return -5;
+    }
+
+    atomic_store_explicit(&g_topic_count, idx + 1, memory_order_release);
+    pthread_mutex_unlock(&g_local_topic_lock);
+    return 0;
+}
+
+static int rf_shared_topic_find(uint32_t id, const char *name,
+                                aof_topic_rec_t *out, uint32_t *state_out) {
+    if (!g_bus) return 0;
+    for (uint32_t i = 0; i < RF_MAX_TOPICS; i++) {
+        uint32_t state = atomic_load_explicit(&g_bus->topics[i].ready, memory_order_acquire);
+        if (state == 0) continue;
+        rf_shared_topic_t *shared = &g_bus->topics[i];
+        if (shared->id != id) continue;
+        if (name && strncmp(shared->name, name, RF_MAX_TOPIC_LEN) != 0) return -1;
+        if (out) {
+            memset(out, 0, sizeof(*out));
+            out->id = shared->id;
+            out->parts = shared->partitions;
+            memcpy(out->name, shared->name, RF_MAX_TOPIC_LEN);
+        }
+        if (state_out) *state_out = state;
+        return 1;
+    }
+    return 0;
+}
+
+static int rf_shared_topic_publish_replay(const aof_topic_rec_t *rec) {
+    if (!g_bus || !rec) return -1;
+    if (rf_lock_shared(&g_bus->topic_lock) != 0) return -1;
+    int found = rf_shared_topic_find(rec->id, rec->name, NULL, NULL);
+    if (found < 0) {
+        pthread_mutex_unlock(&g_bus->topic_lock);
+        return -1;
+    }
+    if (found == 1) {
+        for (uint32_t i = 0; i < RF_MAX_TOPICS; i++) {
+            if (g_bus->topics[i].id == rec->id &&
+                strncmp(g_bus->topics[i].name, rec->name, RF_MAX_TOPIC_LEN) == 0) {
+                atomic_store_explicit(&g_bus->topics[i].ready, RF_SHARED_TOPIC_READY,
+                                      memory_order_release);
+                break;
+            }
+        }
+        pthread_mutex_unlock(&g_bus->topic_lock);
+        return 0;
+    }
+    for (uint32_t i = 0; i < RF_MAX_TOPICS; i++) {
+        uint32_t expected = 0;
+        if (!atomic_compare_exchange_strong_explicit(&g_bus->topics[i].ready, &expected,
+                                                     RF_SHARED_TOPIC_PENDING,
+                                                     memory_order_acq_rel,
+                                                     memory_order_relaxed)) continue;
+        g_bus->topics[i].id = rec->id;
+        g_bus->topics[i].partitions = rec->parts;
+        g_bus->topics[i].reserved = 0;
+        memcpy(g_bus->topics[i].name, rec->name, RF_MAX_TOPIC_LEN);
+        atomic_store_explicit(&g_bus->topics[i].ready, RF_SHARED_TOPIC_READY,
+                              memory_order_release);
+        atomic_fetch_add_explicit(&g_bus->topic_count, 1, memory_order_relaxed);
+        pthread_mutex_unlock(&g_bus->topic_lock);
+        return 0;
+    }
+    pthread_mutex_unlock(&g_bus->topic_lock);
+    return -1;
+}
+
+static rf_topic_t *rf_topic_require_by_id(uint32_t id) {
+    rf_topic_t *topic = find_topic_by_id_local(id);
+    if (topic) return topic;
+
+    aof_topic_rec_t rec;
+    uint32_t state = 0;
+    if (rf_shared_topic_find(id, NULL, &rec, &state) != 1 ||
+        state != RF_SHARED_TOPIC_READY) return NULL;
+    rec.name[RF_MAX_TOPIC_LEN - 1] = 0;
+    if (rf_topic_apply_local(rec.name, rec.id, rec.parts) != 0) return NULL;
+    return find_topic_by_id_local(id);
 }
 
 int rf_partition_snapshot(const char *topic, int partition, rf_partition_snapshot_t *out) {
@@ -1308,131 +1926,78 @@ int rf_partition_snapshot(const char *topic, int partition, rf_partition_snapsho
     return 1;
 }
 
-int rf_commit(const char *topic, const char *group, int partition, uint64_t offset) {
-    if (!topic || !group) return -1;
-
-    uint64_t prev = 0;
-    if (rf_offset_load(topic, group, partition, &prev) && offset < prev) {
-        return 0; /* ignore backwards commit */
-    }
-    rf_offset_store(topic, group, partition, offset);
+int rf_commit_checked(const char *topic, const char *group, int partition,
+                      uint64_t offset, uint32_t timeout_ms, uint64_t *batch_id,
+                      rf_write_receipt_t *receipt) {
+    rf_write_receipt_t result;
+    memset(&result, 0, sizeof(result));
+    if (receipt) *receipt = result;
+    if (batch_id) *batch_id = 0;
+    if (!topic || !*topic || !group || !*group || partition < 0 ||
+        partition > UINT16_MAX ||
+        strnlen(topic, RF_MAX_TOPIC_LEN) >= RF_MAX_TOPIC_LEN ||
+        strnlen(group, RF_MAX_GROUP_LEN) >= RF_MAX_GROUP_LEN) return -1;
+    rf_topic_t *existing = rf_topic_require_by_id(rf_topic_id(topic));
+    if (!existing || strcmp(existing->name, topic) != 0 ||
+        partition >= existing->partitions) return -1;
 
     aof_commit_rec_t c = {0};
-    c.topic_id = rf_topic_id(topic);
+    c.topic_id = existing->id;
     c.partition = (uint16_t)partition;
     c.offset = offset;
     strncpy(c.topic, topic, RF_MAX_TOPIC_LEN - 1);
     strncpy(c.group, group, RF_MAX_GROUP_LEN - 1);
-    AOF_append_sealed(AOF_REC_BROKER_COMMIT, &c, sizeof(c));
-
-    return 0;
+    uint64_t lock_key = (uint64_t)(uint32_t)offset_key_hash(topic, group, partition);
+    if (rf_mutation_lock(lock_key) != 0) return -4;
+    int rc = rf_persist_apply_record(AOF_REC_BROKER_COMMIT, &c,
+                                     (uint32_t)sizeof(c), timeout_ms, &result);
+    uint64_t observed = 0;
+    if (rc == 0 && (!rf_offset_load(topic, group, partition, &observed) ||
+                    observed < offset)) rc = -4;
+    rf_mutation_unlock(lock_key);
+    if (batch_id) *batch_id = result.batch_id;
+    if (receipt) *receipt = result;
+    return rc;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Optimized AOF Replay with Batch Processing
-// ═══════════════════════════════════════════════════════════════════════════════
-
-static void rf_broker_replay_aof_batch(uint32_t rec_id, const void *data, size_t sz) {
-    (void)rec_id;
-    if (sz < sizeof(aof_msg_rec_t)) return;
-
-    const uint8_t *ptr = (const uint8_t*)data;
-    const uint8_t *end = ptr + sz;
-    uint64_t now_wall = ttl_now_wall_us();
-
-    // We’ll track per-(topic,partition) max offset we see in this batch
-    // (small cache, linear scan is fine for small topic counts)
-    while (ptr + sizeof(aof_msg_rec_t) <= end) {
-        const aof_msg_rec_t *r = (const aof_msg_rec_t*)ptr;
-        size_t record_size = sizeof(aof_msg_rec_t) + r->key_len + r->val_len;
-        if (ptr + record_size > end) break; // truncated tail → stop
-
-        // Find topic by id
-        rf_topic_t *t = NULL;
-        int n = atomic_load_explicit(&g_topic_count, memory_order_acquire);
-        for (int i = 0; i < n; i++) {
-            if (g_topics[i].id == r->topic_id) {
-                t = &g_topics[i];
-                break;
-            }
-        }
-
-        if (!t || r->partition >= t->partitions) {
-            ptr += record_size;
-            continue;
-        }
-
-        rf_partition_t *p = &t->parts[r->partition];
-        if (rf_partition_ensure_ring(p) != 0) { ptr += record_size; continue; }
-        rf_msg_slot_t *ring = atomic_load_explicit(&p->ring, memory_order_acquire);
-        if (!ring) { ptr += record_size; continue; }
-        uint64_t floor = atomic_load_explicit(&p->delete_floor, memory_order_acquire);
-        if (r->offset < floor) {
-            /* skip replaying messages below the floor */
-            ptr += record_size;
-            continue;
-        }
-        const uint8_t *kv = ptr + sizeof(*r);
-        size_t total_size = r->key_len + r->val_len;
-
-        // *** KEY CHANGE: index ring by logical offset, not by write_head ***
-        uint64_t slot_idx = (r->offset) & p->capacity_mask;
-        rf_msg_slot_t *slot = &ring[slot_idx];
-
-        uint64_t want = r->offset + 1;
-        seed_shared_next_offset(r->topic_id, r->partition, want);
-        atomic_max_u64(&p->next_offset, want);
-        atomic_max_u64(&p->write_head, want);
-        if (rf_slot_ready_for_offset(slot, r->offset)) {
-            ptr += record_size;
-            continue;
-        }
-        rf_slot_evict_if_needed(p, slot, r->offset);
-
-        if (total_size <= sizeof(slot->inline_data)) {
-            memcpy(slot->inline_data, kv, total_size);
-            slot->blob = slot->inline_data;
-        } else {
-            void *blob = slab_alloc(total_size);
-            if (blob) {
-                memcpy(blob, kv, total_size);
-                slot->blob = blob;
-            }
-        }
-
-        // Publish metadata (release stores)
-        uint64_t ts_norm = normalize_persisted_ts_us(r->ts_us, r->reserved, now_wall);
-        atomic_store_explicit(&slot->offset, r->offset, memory_order_release);
-        atomic_store_explicit(&slot->ts_us, ts_norm, memory_order_release);
-        atomic_store_explicit(&slot->key_len, r->key_len, memory_order_release);
-        atomic_store_explicit(&slot->val_len, r->val_len, memory_order_release);
-        atomic_store_explicit(&slot->partition, r->partition, memory_order_release);
-        atomic_store_explicit(&slot->flags, (total_size <= sizeof(slot->inline_data)) ? 1 : 3, memory_order_release);
-
-        atomic_fetch_add_explicit(&p->live_bytes, (uint64_t)total_size, memory_order_relaxed);
-
-        ptr += record_size;
-    }
+int rf_commit(const char *topic, const char *group, int partition, uint64_t offset,
+              uint64_t *batch_id) {
+    return rf_commit_checked(topic, group, partition, offset, 0, batch_id, NULL);
 }
 
 void rf_broker_replay_aof(uint32_t rec_id, const void *data, size_t sz) {
+    if (!data) {
+        g_replay_apply_error = 1;
+        return;
+    }
     if (rec_id == AOF_REC_HA_READ_BARRIER) {
-        if (sz >= sizeof(ha_read_barrier_rec_t)) {
-            const ha_read_barrier_rec_t *rb = (const ha_read_barrier_rec_t *)data;
-            atomic_max_u64(&g_last_ha_read_barrier_req, rb->req_id);
+        if (sz != sizeof(ha_read_barrier_rec_t)) {
+            g_replay_apply_error = 1;
+            return;
         }
+        const ha_read_barrier_rec_t *rb = (const ha_read_barrier_rec_t *)data;
+        atomic_max_u64(&g_last_ha_read_barrier_req, rb->req_id);
         return;
     }
 
     if (rec_id == AOF_REC_KV_PUT) {
         /* payload: aof_kv_put_t + value bytes */
-        if (sz < sizeof(aof_kv_put_t)) return;
+        if (sz < sizeof(aof_kv_put_t)) {
+            g_replay_apply_error = 1;
+            return;
+        }
         const aof_kv_put_t *h = (const aof_kv_put_t *) data;
         size_t need = sizeof(kvrec_t) + h->value_len;
-        if (sizeof(aof_kv_put_t) + h->value_len > sz) return;
+        if (sizeof(aof_kv_put_t) + (size_t)h->value_len != sz) {
+            g_replay_apply_error = 1;
+            return;
+        }
         /* stack buffer is fine (values are bounded by MAX_DATA_SIZE upstream) */
         uint8_t tmp[MAX_DATA_SIZE];
-        if (need > sizeof(tmp)) return; /* defensive */
+        if (need > sizeof(tmp)) {
+            g_replay_apply_error = 1;
+            return;
+        }
         kvrec_t *r = (kvrec_t *) tmp;
         r->cas = h->cas;
         r->expires_us = h->expires_us;
@@ -1441,12 +2006,16 @@ void rf_broker_replay_aof(uint32_t rec_id, const void *data, size_t sz) {
         if (h->value_len)
             memcpy(r->value, (const uint8_t *) data + sizeof(*h), h->value_len);
         /* write into shared table */
-        (void) shared_storage_set(g_shared_storage, h->skey, r, need);
+        if (shared_storage_set(g_shared_storage, h->skey, r, need) != 0)
+            g_replay_apply_error = 1;
         return;
     }
 
     if (rec_id == AOF_REC_KV_DEL) {
-        if (sz < sizeof(aof_kv_del_t)) return;
+        if (sz != sizeof(aof_kv_del_t)) {
+            g_replay_apply_error = 1;
+            return;
+        }
         const aof_kv_del_t *d = (const aof_kv_del_t *) data;
         uint8_t tmp[sizeof(kvrec_t)];
         kvrec_t *r = (kvrec_t *) tmp;
@@ -1454,36 +2023,35 @@ void rf_broker_replay_aof(uint32_t rec_id, const void *data, size_t sz) {
         r->expires_us = 0;
         r->flags = KV_FLAG_TOMBSTONE;
         r->value_len = 0;
-        (void) shared_storage_set(g_shared_storage, d->skey, r, sizeof(tmp));
+        if (shared_storage_set(g_shared_storage, d->skey, r, sizeof(tmp)) != 0)
+            g_replay_apply_error = 1;
         return;
     }
 
     if (rec_id == AOF_REC_BROKER_TRUNCATE) {
-        if (sz < sizeof(aof_truncate_rec_t)) return;
+        if (sz != sizeof(aof_truncate_rec_t)) {
+            g_replay_apply_error = 1;
+            return;
+        }
         const aof_truncate_rec_t *r = (const aof_truncate_rec_t *) data;
 
-        rf_topic_t *t = NULL;
-        int n = atomic_load_explicit(&g_topic_count, memory_order_acquire);
-        for (int i = 0; i < n; i++) {
-            if (g_topics[i].id == r->topic_id) {
-                t = &g_topics[i];
-                break;
-            }
+        rf_topic_t *t = rf_topic_require_by_id(r->topic_id);
+        if (!t || r->partition >= t->partitions) {
+            g_replay_apply_error = 1;
+            return;
         }
-        if (!t || r->partition >= t->partitions) return;
 
         rf_partition_t *p = &t->parts[r->partition];
-
-
         atomic_max_u64(&p->delete_floor, r->before_offset);
 
         /* Opportunistically invalidate any already-replayed slots below the floor */
+        rf_msg_slot_t *ring = atomic_load_explicit(&p->ring, memory_order_acquire);
         uint64_t wh = atomic_load_explicit(&p->write_head, memory_order_acquire);
         uint64_t oldest = (wh > p->capacity) ? (wh - p->capacity) : 0;
         uint64_t limit = (r->before_offset < wh) ? r->before_offset : wh;
-        if (limit > oldest) {
+        if (ring && limit > oldest) {
             for (uint64_t o = oldest; o < limit; o++) {
-                rf_msg_slot_t *s = &p->ring[o & p->capacity_mask];
+                rf_msg_slot_t *s = &ring[o & p->capacity_mask];
                 uint16_t f = atomic_load_explicit(&s->flags, memory_order_acquire);
                 if (!(f & 1)) continue;
                 uint64_t so = atomic_load_explicit(&s->offset, memory_order_acquire);
@@ -1495,149 +2063,164 @@ void rf_broker_replay_aof(uint32_t rec_id, const void *data, size_t sz) {
     }
 
     if (rec_id == AOF_REC_BROKER_TTL) {
-        if (sz < offsetof(aof_ttl_rec_t, topic)) return;
+        if (sz < offsetof(aof_ttl_rec_t, topic)) {
+            g_replay_apply_error = 1;
+            return;
+        }
         aof_ttl_rec_t r = {0};
         size_t copy = sz;
         if (copy > sizeof(r)) copy = sizeof(r);
         memcpy(&r, data, copy);
-
-        r.topic[RF_MAX_TOPIC_LEN - 1] = 0;
-        uint64_t ttl_ms = r.ttl_ms;
-        uint64_t maxb = (sz >= offsetof(aof_ttl_rec_t, max_bytes) + sizeof(uint64_t)) ? r.max_bytes : 0;
-
-        if (r.topic[0] == 0 || (r.topic[0] == '*' && r.topic[1] == 0)) {
-            if (ttl_ms) rf_set_ttl_ms_all(ttl_ms);
-            rf_set_max_bytes_all(maxb);
-        } else {
-            if (ttl_ms) rf_set_ttl_ms(r.topic, r.partition, ttl_ms);
-            rf_set_max_bytes(r.topic, r.partition, maxb);
+        if (sz >= offsetof(aof_ttl_rec_t, topic) + RF_MAX_TOPIC_LEN &&
+            r.topic[RF_MAX_TOPIC_LEN - 1] != '\0') {
+            g_replay_apply_error = 1;
+            return;
         }
+        r.topic[RF_MAX_TOPIC_LEN - 1] = '\0';
+        uint32_t flags = 0;
+        if (sz >= offsetof(aof_ttl_rec_t, present_flags) + sizeof(uint32_t)) {
+            flags = r.present_flags;
+            if (flags == 0 ||
+                (flags & ~(RF_RETENTION_HAS_TTL |
+                           RF_RETENTION_HAS_MAX_BYTES)) != 0) {
+                g_replay_apply_error = 1;
+                return;
+            }
+        } else {
+            if (r.ttl_ms) flags |= RF_RETENTION_HAS_TTL;
+            if (sz >= offsetof(aof_ttl_rec_t, max_bytes) + sizeof(uint64_t))
+                flags |= RF_RETENTION_HAS_MAX_BYTES;
+        }
+        int rc = 0;
+        if (r.topic[0] == 0 || (r.topic[0] == '*' && r.topic[1] == 0)) {
+            if (r.partition != -1) rc = -1;
+            if (rc == 0 && (flags & RF_RETENTION_HAS_TTL))
+                rc = rf_set_ttl_ms_all(r.ttl_ms);
+            if (rc == 0 && (flags & RF_RETENTION_HAS_MAX_BYTES))
+                rc = rf_set_max_bytes_all(r.max_bytes);
+        } else {
+            rf_topic_t *topic = rf_topic_require_by_id(rf_topic_id(r.topic));
+            if (!topic || strcmp(topic->name, r.topic) != 0 || r.partition < -1 ||
+                r.partition >= topic->partitions) rc = -1;
+            if (rc == 0 && (flags & RF_RETENTION_HAS_TTL))
+                rc = rf_set_ttl_ms(r.topic, r.partition, r.ttl_ms);
+            if (rc == 0 && (flags & RF_RETENTION_HAS_MAX_BYTES))
+                rc = rf_set_max_bytes(r.topic, r.partition, r.max_bytes);
+        }
+        if (rc != 0) g_replay_apply_error = 1;
         return;
     }
     // Handle batch messages first
     if (rec_id == AOF_REC_BROKER_MSG_BATCH) {
-        rf_broker_replay_aof_batch(rec_id, data, sz);
+        if (replay_plain_batch_atomic(data, sz) != 0)
+            g_replay_apply_error = 1;
         return;
     }
 
     // Original single message handling
     if (rec_id == AOF_REC_BROKER_TOPIC) {
-        if (sz < sizeof(uint32_t) + sizeof(uint16_t)) return;
-        struct {
-            uint32_t id;
-            uint16_t parts;
-            char name[RF_MAX_TOPIC_LEN];
-        } rec;
-        memcpy(&rec, data, MIN(sz, sizeof(rec)));
-        rf_topic_ensure(rec.name, rec.parts);
+        if (sz != sizeof(aof_topic_rec_t)) {
+            g_replay_apply_error = 1;
+            return;
+        }
+        aof_topic_rec_t rec;
+        memcpy(&rec, data, sizeof(rec));
+        if (rec.name[0] == '\0' || rec.name[RF_MAX_TOPIC_LEN - 1] != '\0' ||
+            rec.id != rf_topic_id(rec.name) || rec.parts == 0 ||
+            rec.parts > RF_MAX_PARTITIONS) {
+            g_replay_apply_error = 1;
+            return;
+        }
+        if (rf_shared_topic_publish_replay(&rec) != 0 ||
+            rf_topic_apply_local(rec.name, rec.id, rec.parts) != 0)
+            g_replay_apply_error = 1;
         return;
     }
 
     if (rec_id == AOF_REC_BROKER_MSG) {
-        if (sz < sizeof(aof_msg_rec_t)) return;
+        if (sz < sizeof(aof_msg_rec_t)) {
+            g_replay_apply_error = 1;
+            return;
+        }
         const aof_msg_rec_t *r = (const aof_msg_rec_t*)data;
-        uint64_t now_wall = ttl_now_wall_us();
-
-        rf_topic_t *t = NULL;
-        int n = atomic_load_explicit(&g_topic_count, memory_order_acquire);
-        for (int i = 0; i < n; i++) {
-            if (g_topics[i].id == r->topic_id) {
-                t = &g_topics[i];
-                break;
-            }
+        size_t total_size = (size_t)r->key_len + (size_t)r->val_len;
+        if (total_size != sz - sizeof(*r)) {
+            g_replay_apply_error = 1;
+            return;
         }
-        if (!t || r->partition >= t->partitions) return;
-
-        rf_partition_t *p = &t->parts[r->partition];
-        if (rf_partition_ensure_ring(p) != 0) return;
-        rf_msg_slot_t *ring = atomic_load_explicit(&p->ring, memory_order_acquire);
-        if (!ring) return;
-
-        /* ===== NEW: honor persisted truncate floor ===== */
-        uint64_t floor = atomic_load_explicit(&p->delete_floor, memory_order_acquire);
-        if (r->offset < floor) return;
         const uint8_t *kv = (const uint8_t*)data + sizeof(*r);
-        size_t total_size = r->key_len + r->val_len;
-
-        uint64_t slot_idx = (r->offset) & p->capacity_mask; // <-- change
-        rf_msg_slot_t *slot = &ring[slot_idx];
-
-        uint64_t want = r->offset + 1;
-        seed_shared_next_offset(r->topic_id, r->partition, want);
-        atomic_max_u64(&p->next_offset, want);
-        atomic_max_u64(&p->write_head, want);
-        if (rf_slot_ready_for_offset(slot, r->offset)) return;
-        rf_slot_evict_if_needed(p, slot, r->offset);
-
-        if (total_size <= sizeof(slot->inline_data)) {
-            memcpy(slot->inline_data, kv, total_size);
-            slot->blob = slot->inline_data;
-        } else {
-            void *blob = slab_alloc(total_size);
-            if (blob) {
-                memcpy(blob, kv, total_size);
-                slot->blob = blob;
-            }
-        }
-
-        atomic_store_explicit(&slot->offset, r->offset, memory_order_release);
-        uint64_t ts_norm = normalize_persisted_ts_us(r->ts_us, r->reserved, now_wall);
-        atomic_store_explicit(&slot->ts_us, ts_norm, memory_order_release);
-        atomic_store_explicit(&slot->key_len, r->key_len, memory_order_release);
-        atomic_store_explicit(&slot->val_len, r->val_len, memory_order_release);
-        atomic_store_explicit(&slot->partition, r->partition, memory_order_release);
-        atomic_store_explicit(&slot->flags, (total_size <= sizeof(slot->inline_data)) ? 1 : 3, memory_order_release);
-
-        atomic_fetch_add_explicit(&p->live_bytes, (uint64_t)total_size, memory_order_relaxed);
-
-        /* tails already bumped above */
+        if (replay_one_msg_rec(r, kv) != 0)
+            g_replay_apply_error = 1;
         return;
     }
 
     if (rec_id == AOF_REC_BROKER_COMMIT) {
-        if (sz < sizeof(aof_commit_rec_t)) return;
+        if (sz != sizeof(aof_commit_rec_t)) {
+            g_replay_apply_error = 1;
+            return;
+        }
         const aof_commit_rec_t *c = (const aof_commit_rec_t*)data;
-        rf_offset_store(c->topic, c->group, c->partition, c->offset);
+        if (c->topic[0] == '\0' || c->group[0] == '\0' ||
+            c->topic[RF_MAX_TOPIC_LEN - 1] != '\0' ||
+            c->group[RF_MAX_GROUP_LEN - 1] != '\0' ||
+            c->topic_id != rf_topic_id(c->topic) ||
+            rf_offset_store(c->topic, c->group, c->partition, c->offset) != 0)
+            g_replay_apply_error = 1;
         return;
     }
 
     if (rec_id == AOF_REC_BROKER_MSG_IDEMP) {
-        if (sz < sizeof(aof_msg_rec_t) + sizeof(uint64_t)) return;
+        int v2 = replay_idemp_v2(rec_id, data, sz);
+        if (v2 != 0) {
+            if (v2 < 0) g_replay_apply_error = 1;
+            return;
+        }
+        if (sz < sizeof(aof_msg_rec_t) + sizeof(uint64_t)) {
+            g_replay_apply_error = 1;
+            return;
+        }
         const aof_msg_rec_t *r = (const aof_msg_rec_t*)data;
         const uint8_t *kv = (const uint8_t*)data + sizeof(*r);
-        size_t tot = r->key_len + r->val_len;
-        if (sizeof(*r) + tot + sizeof(uint64_t) > sz) return;
+        size_t tot = (size_t)r->key_len + (size_t)r->val_len;
+        if (tot < (size_t)r->key_len ||
+            sizeof(*r) + tot + sizeof(uint64_t) != sz) {
+            g_replay_apply_error = 1;
+            return;
+        }
         uint64_t fp64;
         memcpy(&fp64, kv + tot, sizeof fp64);
 
         /* reuse your single-message replay logic */
-        replay_one_msg_rec(r, kv);
+        if (replay_one_msg_rec(r, kv) != 0) {
+            g_replay_apply_error = 1;
+            return;
+        }
 
         /* install idempotency mapping */
-        rf_topic_t *t = NULL;
-        int n = atomic_load_explicit(&g_topic_count, memory_order_acquire);
-        for (int i=0;i<n;i++)
-            if (g_topics[i].id == r->topic_id) { t = &g_topics[i]; break; }
-        if (t) {
-            idemp_put(t->name, r->partition, &fp64, sizeof fp64, fp64, r->offset);
-        }
+        rf_topic_t *t = rf_topic_require_by_id(r->topic_id);
+        if (!t || r->partition >= t->partitions ||
+            !idemp_put(t->name, r->partition, &fp64, sizeof fp64, fp64,
+                       r->offset))
+            g_replay_apply_error = 1;
         return;
     }
 
     if (rec_id == AOF_REC_BROKER_MSG_BATCH_IDEMP) {
+        int v2 = replay_idemp_v2(rec_id, data, sz);
+        if (v2 != 0) {
+            if (v2 < 0) g_replay_apply_error = 1;
+            return;
+        }
         /* walk messages, last 8 bytes are fp64 trailer */
-        if (sz < sizeof(uint64_t)) return;
-        const uint8_t *ptr = (const uint8_t*)data;
-        const uint8_t *end = (const uint8_t*)data + sz - sizeof(uint64_t);
-
-        /* Rebuild messages */
-        while (ptr + sizeof(aof_msg_rec_t) <= end) {
-            const aof_msg_rec_t *r = (const aof_msg_rec_t*)ptr;
-            size_t tot = sizeof(*r) + r->key_len + r->val_len;
-            if (ptr + tot > end) break;
-            const uint8_t *kv = ptr + sizeof(*r);
-            replay_one_msg_rec(r, kv);
-            ptr += tot;
+        if (sz < sizeof(aof_msg_rec_t) + sizeof(uint64_t)) {
+            g_replay_apply_error = 1;
+            return;
+        }
+        size_t messages_size = sz - sizeof(uint64_t);
+        const uint8_t *end = (const uint8_t*)data + messages_size;
+        if (replay_plain_batch_atomic(data, messages_size) != 0) {
+            g_replay_apply_error = 1;
+            return;
         }
 
         /* grab fp64 trailer */
@@ -1647,15 +2230,20 @@ void rf_broker_replay_aof(uint32_t rec_id, const void *data, size_t sz) {
         /* install mapping using the batch first_offset */
         /* We can find first_offset by scanning first message in the batch: */
         const aof_msg_rec_t *first = (const aof_msg_rec_t*)data;
-        rf_topic_t *t = NULL;
-        int n = atomic_load_explicit(&g_topic_count, memory_order_acquire);
-        for (int i=0;i<n;i++)
-            if (g_topics[i].id == first->topic_id) { t = &g_topics[i]; break; }
-        if (t) {
-            idemp_put(t->name, first->partition, &fp64, sizeof fp64, fp64, first->offset);
-        }
+        rf_topic_t *t = rf_topic_require_by_id(first->topic_id);
+        if (!t || first->partition >= t->partitions ||
+            !idemp_put(t->name, first->partition, &fp64, sizeof fp64, fp64,
+                       first->offset))
+            g_replay_apply_error = 1;
         return;
     }
+    g_replay_apply_error = 1;
+}
+
+int rf_broker_apply_aof_checked(uint32_t rec_id, const void *data, size_t size) {
+    g_replay_apply_error = 0;
+    rf_broker_replay_aof(rec_id, data, size);
+    return g_replay_apply_error ? -1 : 0;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1721,371 +2309,777 @@ void rf_broker_shutdown(void) {
 // Batch Operations for Maximum Throughput
 // ═══════════════════════════════════════════════════════════════════════════════
 
+
+int rf_produce_sealed_checked(const char *topic, int partition,
+                              const void *key, size_t key_len,
+                              const void *val, size_t val_len,
+                              uint32_t timeout_ms, uint64_t *out_offset,
+                              uint64_t *batch_id) {
+    memset(&g_last_write_receipt, 0, sizeof(g_last_write_receipt));
+    if (out_offset) *out_offset = 0;
+    if (batch_id) *batch_id = 0;
+    if (!topic || (!key && key_len) || (!val && val_len)) return -1;
+    if (rf_topic_ensure(topic, 0) != 0) return -2;
+    rf_topic_t *t = find_topic_lockfree(topic, rf_topic_id(topic));
+    if (!t) return -2;
+    if (partition < 0)
+        partition = simd_hash_djb2(topic, strlen(topic)) & (t->partitions - 1);
+    if (partition >= t->partitions) return -3;
+    rf_partition_t *p = &t->parts[partition];
+    if (rf_partition_ensure_ring(p) != 0) return -4;
+
+    size_t payload_size = key_len + val_len;
+    size_t record_size = sizeof(aof_msg_rec_t) + payload_size;
+    if (record_size < sizeof(aof_msg_rec_t) || record_size > UINT32_MAX)
+        return -4;
+    uint8_t *record = slab_alloc(record_size);
+    if (!record) return -4;
+    uint64_t transaction_key = ((uint64_t)t->id << 32) ^
+                               (uint64_t)(uint32_t)partition;
+    if (rf_mutation_lock(transaction_key) != 0) {
+        slab_free(record);
+        return -4;
+    }
+    uint64_t offset = alloc_offset_shared(t, p, partition);
+    aof_msg_rec_t *header = (aof_msg_rec_t *)record;
+    *header = (aof_msg_rec_t){
+        .topic_id = t->id,
+        .partition = (uint16_t)partition,
+        .reserved = RF_TS_FLAG_WALL,
+        .offset = offset,
+        .ts_us = wall_us_raw(),
+        .key_len = (uint32_t)key_len,
+        .val_len = (uint32_t)val_len
+    };
+    uint8_t *writep = record + sizeof(*header);
+    if (key_len) memcpy(writep, key, key_len);
+    if (val_len) memcpy(writep + key_len, val, val_len);
+    rf_write_receipt_t receipt;
+    int rc = rf_persist_apply_record(AOF_REC_BROKER_MSG, record,
+                                     (uint32_t)record_size, timeout_ms, &receipt);
+    if (out_offset) *out_offset = offset;
+    if (batch_id) *batch_id = receipt.batch_id;
+    slab_free(record);
+    rf_mutation_unlock(transaction_key);
+    if (rc == 0) rf_size_sweep_maybe(p);
+    return rc;
+}
+
+int rf_produce_sealed(const char *topic, int partition,
+                      const void *key, size_t key_len,
+                      const void *val, size_t val_len,
+                      uint64_t *out_offset, uint64_t *batch_id) {
+    return rf_produce_sealed_checked(topic, partition, key, key_len, val,
+                                     val_len, 0, out_offset, batch_id);
+}
+
+int rf_produce_batch_sealed_checked(const char *topic, int partition,
+                                    const rf_msg_view_t *messages, size_t count,
+                                    uint32_t timeout_ms, uint64_t *first_offset,
+                                    uint64_t *batch_id) {
+    memset(&g_last_write_receipt, 0, sizeof(g_last_write_receipt));
+    if (first_offset) *first_offset = 0;
+    if (batch_id) *batch_id = 0;
+    if (!topic || !messages || count == 0) return -1;
+    if (rf_topic_ensure(topic, 0) != 0) return -2;
+    rf_topic_t *t = find_topic_lockfree(topic, rf_topic_id(topic));
+    if (!t) return -2;
+    if (partition < 0)
+        partition = simd_hash_djb2(topic, strlen(topic)) & (t->partitions - 1);
+    if (partition >= t->partitions) return -3;
+    rf_partition_t *p = &t->parts[partition];
+    if (rf_partition_ensure_ring(p) != 0) return -4;
+
+    size_t record_size = 0;
+    for (size_t i = 0; i < count; i++) {
+        if ((!messages[i].key && messages[i].key_len) ||
+            (!messages[i].val && messages[i].val_len)) return -1;
+        size_t bytes = sizeof(aof_msg_rec_t) + messages[i].key_len +
+                       messages[i].val_len;
+        if (bytes < sizeof(aof_msg_rec_t) || SIZE_MAX - record_size < bytes)
+            return -4;
+        record_size += bytes;
+    }
+    if (record_size > UINT32_MAX) return -4;
+    uint8_t *record = slab_alloc(record_size);
+    if (!record) return -4;
+    uint64_t transaction_key = ((uint64_t)t->id << 32) ^
+                               (uint64_t)(uint32_t)partition;
+    if (rf_mutation_lock(transaction_key) != 0) {
+        slab_free(record);
+        return -4;
+    }
+    uint64_t offset = alloc_offsets_shared(t, p, partition, count);
+    uint64_t timestamp = wall_us_raw();
+    uint8_t *writep = record;
+    for (size_t i = 0; i < count; i++) {
+        aof_msg_rec_t *header = (aof_msg_rec_t *)writep;
+        *header = (aof_msg_rec_t){
+            .topic_id = t->id,
+            .partition = (uint16_t)partition,
+            .reserved = RF_TS_FLAG_WALL,
+            .offset = offset + i,
+            .ts_us = timestamp,
+            .key_len = (uint32_t)messages[i].key_len,
+            .val_len = (uint32_t)messages[i].val_len
+        };
+        writep += sizeof(*header);
+        if (messages[i].key_len) {
+            memcpy(writep, messages[i].key, messages[i].key_len);
+            writep += messages[i].key_len;
+        }
+        if (messages[i].val_len) {
+            memcpy(writep, messages[i].val, messages[i].val_len);
+            writep += messages[i].val_len;
+        }
+    }
+    rf_write_receipt_t receipt;
+    int rc = rf_persist_apply_record(AOF_REC_BROKER_MSG_BATCH, record,
+                                     (uint32_t)record_size, timeout_ms, &receipt);
+    if (first_offset) *first_offset = offset;
+    if (batch_id) *batch_id = receipt.batch_id;
+    slab_free(record);
+    rf_mutation_unlock(transaction_key);
+    if (rc == 0) rf_size_sweep_maybe(p);
+    return rc;
+}
+
 int rf_produce_batch_sealed(const char *topic, int partition,
                             const rf_msg_view_t *messages, size_t count,
                             uint64_t *first_offset, uint64_t *batch_id) {
-    if (!topic || !messages || count == 0) return -1;
-    rf_topic_ensure(topic, 0);
+    return rf_produce_batch_sealed_checked(topic, partition, messages, count,
+                                           0, first_offset, batch_id);
+}
+
+static int idemp_existing_result(rf_idemp_state_t *state,
+                                 const uint8_t payload_digest[32],
+                                 uint64_t *offset, uint64_t *batch_id,
+                                 int *is_duplicate, uint32_t timeout_ms) {
+    if (memcmp(state->payload_digest, payload_digest, 32) != 0)
+        return RF_ERR_IDEMP_CONFLICT;
+    if (offset) *offset = state->first_offset;
+    if (batch_id) *batch_id = state->batch_id;
+    if (is_duplicate) *is_duplicate = 1;
+    if (state->status != RF_IDEMP_STATE_COMMITTED)
+        return RF_ERR_IDEMP_PENDING;
+    if (!state->local_fsync ||
+        ((state->flags & RF_IDEMP_FLAG_HA) && !state->quorum_committed))
+        return RF_ERR_IDEMP_PENDING;
+
+    if (!state->applied_all_workers) {
+        ha_read_barrier_rec_t barrier = {
+            .req_id = ((uint64_t)state->topic_id << 32) ^ state->first_offset,
+            .issued_us = now_us()
+        };
+        if (rf_bus_publish_wait_except(AOF_REC_HA_READ_BARRIER, &barrier,
+                                       sizeof(barrier), timeout_ms,
+                                       g_worker_id, NULL) != 0)
+            return RF_ERR_IDEMP_PENDING;
+        state->applied_all_workers = 1;
+        if (idemp_state_store(state) != 0)
+            return RF_ERR_IDEMP_PENDING;
+    }
+    rf_write_receipt_t receipt;
+    receipt_from_idemp_state(state, &receipt);
+    g_last_write_receipt = receipt;
+    return 0;
+}
+
+int rf_produce_sealed_idemp_checked(const char *topic, int partition,
+                                    const void *key, size_t key_len,
+                                    const void *val, size_t val_len,
+                                    const void *idemp_key, size_t idemp_key_len,
+                                    uint32_t timeout_ms, uint64_t *out_offset,
+                                    uint64_t *batch_id, int *is_duplicate) {
+    memset(&g_last_write_receipt, 0, sizeof(g_last_write_receipt));
+    if (out_offset) *out_offset = 0;
+    if (batch_id) *batch_id = 0;
+    if (is_duplicate) *is_duplicate = 0;
+    if (!topic || (!key && key_len) || (!val && val_len) ||
+        !idemp_key || idemp_key_len == 0) return -1;
+    if (rf_topic_ensure(topic, 0) != 0) return -2;
     rf_topic_t *t = find_topic_lockfree(topic, rf_topic_id(topic));
     if (!t) return -2;
-
-    if (partition < 0) {
+    if (partition < 0)
         partition = simd_hash_djb2(topic, strlen(topic)) & (t->partitions - 1);
-    }
     if (partition >= t->partitions) return -3;
-
     rf_partition_t *p = &t->parts[partition];
-
     if (rf_partition_ensure_ring(p) != 0) return -4;
-    rf_msg_slot_t *ring = atomic_load_explicit(&p->ring, memory_order_acquire);
-    if (!ring) return -4;
 
-    /* Reserve slots atomically */
-    uint64_t offset_start = alloc_offsets_shared(t, p, partition, (uint64_t)count);
-    if (first_offset) *first_offset = offset_start;
-    uint64_t ts_wall = wall_us_raw();
+    rf_msg_view_t message = {
+        .key = key, .key_len = key_len, .val = val, .val_len = val_len
+    };
+    uint8_t key_digest[32], payload_digest[32];
+    if (idemp_key_digest(topic, partition, idemp_key, idemp_key_len,
+                         key_digest) != 0 ||
+        idemp_payload_digest(topic, partition, &message, 1,
+                             payload_digest) != 0) return -4;
 
-    /* Calculate total AOF size for sealed batch */
-    size_t total_aof_size = 0;
-    for (size_t i = 0; i < count; i++) {
-        total_aof_size += sizeof(aof_msg_rec_t) + messages[i].key_len + messages[i].val_len;
+    uint64_t transaction_key = ((uint64_t)t->id << 32) ^
+                               (uint64_t)(uint32_t)partition;
+    if (rf_mutation_lock(transaction_key) != 0) return -4;
+    rf_idemp_state_t state;
+    int found = idemp_state_load(key_digest, t->id, partition, &state);
+    if (found > 0 && state.status == RF_IDEMP_STATE_ABORTED) found = 0;
+    if (found != 0) {
+        int rc = found < 0 ? -7 :
+                 idemp_existing_result(&state, payload_digest, out_offset,
+                                       batch_id, is_duplicate, timeout_ms);
+        rf_mutation_unlock(transaction_key);
+        return rc;
     }
 
-    /* Allocate sealed batch buffer */
-    void *sealed_batch_buffer = slab_alloc(total_aof_size);
-    if (!sealed_batch_buffer) return -4;
-    uint8_t *aof_write_ptr = (uint8_t*)sealed_batch_buffer;
-
-    /* Process messages with minimal overhead - store in ring + build AOF */
-    for (size_t i = 0; i < count; i++) {
-        uint64_t msg_offset = offset_start + i;
-        uint64_t slot_idx = msg_offset & p->capacity_mask;
-        rf_msg_slot_t *slot = &ring[slot_idx];
-        rf_slot_evict_if_needed(p, slot, msg_offset);
-        const rf_msg_view_t *msg = &messages[i];
-
-        size_t total_size = msg->key_len + msg->val_len;
-        /* Zero-copy message storage in ring buffer */
-        if (total_size <= sizeof(slot->inline_data)) {
-            /* Inline storage - true zero-copy */
-            if (msg->key && msg->key_len) {
-                memcpy(slot->inline_data, msg->key, msg->key_len);
-            }
-            if (msg->val && msg->val_len) {
-                memcpy(slot->inline_data + msg->key_len, msg->val, msg->val_len);
-            }
-            slot->blob = slot->inline_data;
-        } else {
-            /* Large message - use slab allocator */
-            void *blob = slab_alloc(total_size);
-            if (!blob) {
-                slab_free(sealed_batch_buffer);
-                return -5;
-            }
-            if (msg->key && msg->key_len) memcpy(blob, msg->key, msg->key_len);
-            if (msg->val && msg->val_len) memcpy((uint8_t*)blob + msg->key_len, msg->val, msg->val_len);
-            slot->blob = blob;
-        }
-
-        /* Store message metadata atomically */
-        atomic_store_explicit(&slot->offset, msg_offset, memory_order_release);
-        atomic_store_explicit(&slot->ts_us, ts_wall, memory_order_release);
-        atomic_store_explicit(&slot->key_len, msg->key_len, memory_order_release);
-        atomic_store_explicit(&slot->val_len, msg->val_len, memory_order_release);
-        atomic_store_explicit(&slot->partition, partition, memory_order_release);
-        atomic_store_explicit(&slot->flags, (total_size <= sizeof(slot->inline_data)) ? 1 : 3, memory_order_release);
-        atomic_fetch_add_explicit(&p->live_bytes, (uint64_t)total_size, memory_order_relaxed);
-
-        /* Build AOF record in sealed batch buffer */
-        aof_msg_rec_t *aof_rec = (aof_msg_rec_t*)aof_write_ptr;
-        aof_rec->topic_id = t->id;
-        aof_rec->partition = (uint16_t)partition;
-        aof_rec->reserved = RF_TS_FLAG_WALL;
-        aof_rec->offset = msg_offset;
-        aof_rec->ts_us = ts_wall;
-        aof_rec->key_len = msg->key_len;
-        aof_rec->val_len = msg->val_len;
-        aof_write_ptr += sizeof(aof_msg_rec_t);
-
-        /* Copy key/value data to AOF record */
-        if (total_size <= sizeof(slot->inline_data)) {
-            memcpy(aof_write_ptr, slot->inline_data, total_size);
-        } else {
-            memcpy(aof_write_ptr, slot->blob, total_size);
-        }
-        aof_write_ptr += total_size;
+    /* Legacy entries cannot prove payload binding.  Preserve at-most-once by
+     * refusing to execute an ambiguous retry. */
+    uint64_t legacy_offset = 0;
+    uint64_t legacy_fp = idemp_fp64(topic, partition, idemp_key, idemp_key_len);
+    if (idemp_get(topic, partition, idemp_key, idemp_key_len,
+                  legacy_fp, &legacy_offset)) {
+        if (out_offset) *out_offset = legacy_offset;
+        if (is_duplicate) *is_duplicate = 1;
+        rf_mutation_unlock(transaction_key);
+        return RF_ERR_IDEMP_PENDING;
     }
 
-    atomic_max_u64(&p->next_offset, offset_start + count);
-    atomic_max_u64(&p->write_head, offset_start + count);
+    size_t message_bytes = sizeof(aof_msg_rec_t) + key_len + val_len;
+    if (message_bytes < sizeof(aof_msg_rec_t) ||
+        message_bytes > UINT32_MAX - sizeof(aof_idemp_v2_trailer_t)) {
+        rf_mutation_unlock(transaction_key);
+        return -4;
+    }
+    size_t record_bytes = message_bytes + sizeof(aof_idemp_v2_trailer_t);
+    uint8_t *record = slab_alloc(record_bytes);
+    if (!record) {
+        rf_mutation_unlock(transaction_key);
+        return -4;
+    }
+    uint64_t offset = alloc_offset_shared(t, p, partition);
+    aof_msg_rec_t *message_record = (aof_msg_rec_t *)record;
+    *message_record = (aof_msg_rec_t){
+        .topic_id = t->id,
+        .partition = (uint16_t)partition,
+        .reserved = RF_TS_FLAG_WALL,
+        .offset = offset,
+        .ts_us = wall_us_raw(),
+        .key_len = (uint32_t)key_len,
+        .val_len = (uint32_t)val_len
+    };
+    uint8_t *payload = record + sizeof(*message_record);
+    if (key_len) memcpy(payload, key, key_len);
+    if (val_len) memcpy(payload + key_len, val, val_len);
+    aof_idemp_v2_trailer_t *trailer =
+        (aof_idemp_v2_trailer_t *)(record + message_bytes);
+    memset(trailer, 0, sizeof(*trailer));
+    trailer->magic = RF_IDEMP_V2_MAGIC;
+    trailer->version = RF_IDEMP_V2_VERSION;
+    trailer->flags = RAMForge_HA_is_enabled() ? RF_IDEMP_FLAG_HA : 0;
+    trailer->message_count = 1;
+    memcpy(trailer->key_digest, key_digest, 32);
+    memcpy(trailer->payload_digest, payload_digest, 32);
 
-    /* SEALED APPEND: Write to AOF with zero-loss guarantee */
-    /* ROCKET MODE: promote to all workers' memory without fsync */
-#if 1
-    const char *rocket = getenv("RF_ROCKET");
-    if (rocket && atoi(rocket) != 0) {
-        rf_bus_publish(AOF_REC_BROKER_MSG_BATCH, sealed_batch_buffer, (uint32_t)total_aof_size);
-        if (batch_id) *batch_id = 0; /* no durable batch id */
-    } else
-#endif
-    {
-        /* default durable path (unchanged) */
-        uint64_t aof_batch_id = AOF_append_sealed(AOF_REC_BROKER_MSG_BATCH, sealed_batch_buffer, total_aof_size);
-
-        (void)rf_bus_publish(AOF_REC_BROKER_MSG_BATCH, sealed_batch_buffer, (uint32_t)total_aof_size);
-        if (batch_id) *batch_id = aof_batch_id;
+    memset(&state, 0, sizeof(state));
+    state.magic = RF_IDEMP_V2_MAGIC;
+    state.version = RF_IDEMP_V2_VERSION;
+    state.status = RF_IDEMP_STATE_PENDING;
+    state.topic_id = t->id;
+    state.partition = (uint16_t)partition;
+    state.flags = trailer->flags;
+    state.message_count = 1;
+    memcpy(state.key_digest, key_digest, 32);
+    memcpy(state.payload_digest, payload_digest, 32);
+    state.first_offset = offset;
+    if (idemp_state_store(&state) != 0) {
+        slab_free(record);
+        rf_mutation_unlock(transaction_key);
+        return -7;
     }
 
-    /* Clean up */
-    if (RAMForge_HA_is_enabled()) {
-        int hrc = RAMForge_HA_replicate_write(AOF_REC_BROKER_MSG_BATCH, sealed_batch_buffer, total_aof_size);
-        if (hrc != 0) {
-            slab_free(sealed_batch_buffer);
-            return -6;
-        }
-    }
-    slab_free(sealed_batch_buffer);
-
-    rf_size_sweep_maybe(p);
-    return 0; /* Success - batch is sealed and will be synced by background thread */
+    rf_write_receipt_t receipt;
+    int rc = rf_persist_apply_record(AOF_REC_BROKER_MSG_IDEMP, record,
+                                     (uint32_t)record_bytes, timeout_ms, &receipt);
+    state.batch_id = receipt.batch_id;
+    state.raft_index = receipt.raft_index;
+    state.local_fsync = receipt.local_fsync ? 1u : 0u;
+    state.quorum_committed = receipt.quorum_committed ? 1u : 0u;
+    state.applied_all_workers = receipt.applied_all_workers ? 1u : 0u;
+    if (rc == 0) state.status = RF_IDEMP_STATE_COMMITTED;
+    int final_state_rc = idemp_state_store(&state);
+    if (out_offset) *out_offset = offset;
+    if (batch_id) *batch_id = receipt.batch_id;
+    slab_free(record);
+    rf_mutation_unlock(transaction_key);
+    if (final_state_rc != 0) return RF_ERR_IDEMP_PENDING;
+    if (rc != 0 && (receipt.quorum_committed || receipt.raft_index != 0 ||
+                    receipt.batch_id != 0 || receipt.local_fsync))
+        return RF_ERR_IDEMP_PENDING;
+    return rc;
 }
 
 int rf_produce_sealed_idemp(const char *topic, int partition,
                             const void *key, size_t key_len,
                             const void *val, size_t val_len,
                             const void *idemp_key, size_t idemp_key_len,
-                            uint64_t *out_offset, uint64_t *batch_id, int *is_duplicate) {
-    if (is_duplicate) *is_duplicate = 0;
-    if (!topic || (!val && val_len) || !idemp_key || idemp_key_len == 0) return -1;
+                            uint64_t *out_offset, uint64_t *batch_id,
+                            int *is_duplicate) {
+    return rf_produce_sealed_idemp_checked(
+        topic, partition, key, key_len, val, val_len,
+        idemp_key, idemp_key_len, 0, out_offset, batch_id, is_duplicate);
+}
 
-    rf_topic_ensure(topic, 0);
+int rf_produce_batch_sealed_idemp_checked(const char *topic, int partition,
+                                          const rf_msg_view_t *messages,
+                                          size_t count, const void *idemp_key,
+                                          size_t idemp_key_len,
+                                          uint32_t timeout_ms,
+                                          uint64_t *first_offset,
+                                          uint64_t *batch_id,
+                                          int *is_duplicate) {
+    memset(&g_last_write_receipt, 0, sizeof(g_last_write_receipt));
+    if (first_offset) *first_offset = 0;
+    if (batch_id) *batch_id = 0;
+    if (is_duplicate) *is_duplicate = 0;
+    if (!topic || !messages || count == 0 || count > UINT32_MAX ||
+        !idemp_key || idemp_key_len == 0) return -1;
+    if (rf_topic_ensure(topic, 0) != 0) return -2;
     rf_topic_t *t = find_topic_lockfree(topic, rf_topic_id(topic));
     if (!t) return -2;
-
-    if (partition < 0) {
+    if (partition < 0)
         partition = simd_hash_djb2(topic, strlen(topic)) & (t->partitions - 1);
-    }
     if (partition >= t->partitions) return -3;
-
-    uint64_t fp64 = idemp_fp64(topic, partition, idemp_key, idemp_key_len);
-    uint64_t existing_off = 0;
-    if (idemp_get(topic, partition, idemp_key, idemp_key_len, fp64, &existing_off)) {
-        if (out_offset) *out_offset = existing_off;
-        if (is_duplicate) *is_duplicate = 1;
-        return 0;
-    }
-
     rf_partition_t *p = &t->parts[partition];
     if (rf_partition_ensure_ring(p) != 0) return -4;
-    rf_msg_slot_t *ring = atomic_load_explicit(&p->ring, memory_order_acquire);
-    if (!ring) return -4;
 
-    uint64_t offset = alloc_offset_shared(t, p, partition);
-    uint64_t slot_idx = offset & p->capacity_mask;
-    rf_msg_slot_t *slot = &ring[slot_idx];
-    rf_slot_evict_if_needed(p, slot, offset);
-    atomic_max_u64(&p->next_offset, offset + 1);
+    uint8_t key_digest[32], payload_digest[32];
+    if (idemp_key_digest(topic, partition, idemp_key, idemp_key_len,
+                         key_digest) != 0 ||
+        idemp_payload_digest(topic, partition, messages, count,
+                             payload_digest) != 0) return -4;
+    uint64_t transaction_key = ((uint64_t)t->id << 32) ^
+                               (uint64_t)(uint32_t)partition;
+    if (rf_mutation_lock(transaction_key) != 0) return -4;
+    rf_idemp_state_t state;
+    int found = idemp_state_load(key_digest, t->id, partition, &state);
+    if (found > 0 && state.status == RF_IDEMP_STATE_ABORTED) found = 0;
+    if (found != 0) {
+        int rc = found < 0 ? -7 :
+                 idemp_existing_result(&state, payload_digest, first_offset,
+                                       batch_id, is_duplicate, timeout_ms);
+        rf_mutation_unlock(transaction_key);
+        return rc;
+    }
+    uint64_t legacy_offset = 0;
+    uint64_t legacy_fp = idemp_fp64(topic, partition, idemp_key, idemp_key_len);
+    if (idemp_get(topic, partition, idemp_key, idemp_key_len,
+                  legacy_fp, &legacy_offset)) {
+        if (first_offset) *first_offset = legacy_offset;
+        if (is_duplicate) *is_duplicate = 1;
+        rf_mutation_unlock(transaction_key);
+        return RF_ERR_IDEMP_PENDING;
+    }
 
-    size_t total = key_len + val_len;
-    uint64_t ts_wall = wall_us_raw();
-    int inline_payload = (total <= sizeof(slot->inline_data));
-
-    if (inline_payload) {
-        if (key && key_len) memcpy(slot->inline_data, key, key_len);
-        if (val && val_len) memcpy(slot->inline_data + key_len, val, val_len);
-        slot->blob = slot->inline_data;
-    } else {
-        void *blob = slab_alloc(total);
-        if (!blob) {
-            slot->blob = NULL;
-            atomic_store_explicit(&slot->offset, offset, memory_order_release);
-            atomic_store_explicit(&slot->ts_us, ts_wall, memory_order_release);
-            atomic_store_explicit(&slot->key_len, 0, memory_order_release);
-            atomic_store_explicit(&slot->val_len, 0, memory_order_release);
-            atomic_store_explicit(&slot->partition, partition, memory_order_release);
-            atomic_store_explicit(&slot->flags, RF_SLOT_FLAG_TOMBSTONE, memory_order_release);
-            rf_advance_write_head_after_publish_relaxed(p, offset);
+    size_t messages_bytes = 0;
+    for (size_t i = 0; i < count; i++) {
+        if ((!messages[i].key && messages[i].key_len) ||
+            (!messages[i].val && messages[i].val_len)) {
+            rf_mutation_unlock(transaction_key);
+            return -1;
+        }
+        size_t bytes = sizeof(aof_msg_rec_t) + messages[i].key_len +
+                       messages[i].val_len;
+        if (bytes < sizeof(aof_msg_rec_t) || SIZE_MAX - messages_bytes < bytes) {
+            rf_mutation_unlock(transaction_key);
             return -4;
         }
-        if (key && key_len) memcpy(blob, key, key_len);
-        if (val && val_len) memcpy((uint8_t *)blob + key_len, val, val_len);
-        slot->blob = blob;
+        messages_bytes += bytes;
     }
-
-    size_t aof_sz = sizeof(aof_msg_rec_t) + total + sizeof(uint64_t);
-    void *buf = slab_alloc(aof_sz);
-    if (!buf) {
-        if (!inline_payload && slot->blob) {
-            slab_free(slot->blob);
-            slot->blob = NULL;
-        }
-        atomic_store_explicit(&slot->offset, offset, memory_order_release);
-        atomic_store_explicit(&slot->ts_us, ts_wall, memory_order_release);
-        atomic_store_explicit(&slot->key_len, 0, memory_order_release);
-        atomic_store_explicit(&slot->val_len, 0, memory_order_release);
-        atomic_store_explicit(&slot->partition, partition, memory_order_release);
-        atomic_store_explicit(&slot->flags, RF_SLOT_FLAG_TOMBSTONE, memory_order_release);
-        rf_advance_write_head_after_publish_relaxed(p, offset);
-        return -5;
+    if (messages_bytes > UINT32_MAX - sizeof(aof_idemp_v2_trailer_t)) {
+        rf_mutation_unlock(transaction_key);
+        return -4;
     }
-
-    aof_msg_rec_t *r = (aof_msg_rec_t *)buf;
-    r->topic_id = t->id;
-    r->partition = (uint16_t)partition;
-    r->reserved = RF_TS_FLAG_WALL;
-    r->offset = offset;
-    r->ts_us = ts_wall;
-    r->key_len = key_len;
-    r->val_len = val_len;
-
-    uint8_t *w = (uint8_t *)buf + sizeof(*r);
-    memcpy(w, slot->blob, total);
-    memcpy(w + total, &fp64, sizeof(fp64));
-
-    if (RAMForge_HA_is_enabled()) {
-        int hrc = RAMForge_HA_replicate_write(AOF_REC_BROKER_MSG_IDEMP, buf, (uint32_t)aof_sz);
-        if (hrc != 0) {
-            slab_free(buf);
-            if (!inline_payload && slot->blob) {
-                slab_free(slot->blob);
-                slot->blob = NULL;
-            }
-            atomic_store_explicit(&slot->offset, offset, memory_order_release);
-            atomic_store_explicit(&slot->ts_us, ts_wall, memory_order_release);
-            atomic_store_explicit(&slot->key_len, 0, memory_order_release);
-            atomic_store_explicit(&slot->val_len, 0, memory_order_release);
-            atomic_store_explicit(&slot->partition, partition, memory_order_release);
-            atomic_store_explicit(&slot->flags, RF_SLOT_FLAG_TOMBSTONE, memory_order_release);
-            rf_advance_write_head_after_publish_relaxed(p, offset);
-            return -6;
-        }
+    size_t record_bytes = messages_bytes + sizeof(aof_idemp_v2_trailer_t);
+    uint8_t *record = slab_alloc(record_bytes);
+    if (!record) {
+        rf_mutation_unlock(transaction_key);
+        return -4;
     }
-
-    uint64_t out_bid = 0;
-    const char *rocket_env = getenv("RF_ROCKET");
-    const int rocket_on = (rocket_env && rocket_env[0] != '\0' && rocket_env[0] != '0');
-    if (!rocket_on) {
-        out_bid = AOF_append_sealed(AOF_REC_BROKER_MSG_IDEMP, buf, aof_sz);
-    }
-
-    (void)rf_bus_publish(AOF_REC_BROKER_MSG_IDEMP, buf, (uint32_t)aof_sz);
-
-    atomic_store_explicit(&slot->offset, offset, memory_order_release);
-    atomic_store_explicit(&slot->ts_us, ts_wall, memory_order_release);
-    atomic_store_explicit(&slot->key_len, key_len, memory_order_release);
-    atomic_store_explicit(&slot->val_len, val_len, memory_order_release);
-    atomic_store_explicit(&slot->partition, partition, memory_order_release);
-    atomic_store_explicit(&slot->flags,
-                          inline_payload ? RF_SLOT_FLAG_VALID : (RF_SLOT_FLAG_VALID | RF_SLOT_FLAG_LARGE),
-                          memory_order_release);
-
-    atomic_fetch_add_explicit(&p->live_bytes, (uint64_t)total, memory_order_relaxed);
-    rf_size_sweep_maybe(p);
-    rf_advance_write_head_after_publish_strict(p, offset);
-
-    if (batch_id) *batch_id = out_bid;
-    if (out_offset) *out_offset = offset;
-
-    idemp_put(topic, partition, idemp_key, idemp_key_len, fp64, offset);
-    slab_free(buf);
-    return 0;
-}
-int rf_produce_batch_sealed_idemp(const char *topic, int partition, const rf_msg_view_t *messages, size_t count,
-                                  const void *idemp_key, size_t idemp_key_len, uint64_t *first_offset,
-                                  uint64_t *batch_id, int *is_duplicate) {
-    *is_duplicate = 0;
-    rf_topic_ensure(topic, 0);
-    rf_topic_t *t = find_topic_lockfree(topic, rf_topic_id(topic));
-    if (!t) return -2;
-    if (partition < 0) partition = simd_hash_djb2(topic, strlen(topic)) & (t->partitions - 1);
-    if (partition >= t->partitions) return -3;
-    uint64_t fp64 = idemp_fp64(topic, partition, idemp_key, idemp_key_len);
-    uint64_t existing_first = 0;
-    if (idemp_get(topic, partition, idemp_key, idemp_key_len, fp64, &existing_first)) {
-        if (first_offset) *first_offset = existing_first;
-        *is_duplicate = 1;
-        return 0;
-    }
-    rf_partition_t *p = &t->parts[partition];
-
-    if (rf_partition_ensure_ring(p) != 0) return -4;
-    rf_msg_slot_t *ring = atomic_load_explicit(&p->ring, memory_order_acquire);
-    if (!ring) return -4;
-    uint64_t off0 = alloc_offsets_shared(t, p, partition, (uint64_t)count);
-    if (first_offset) *first_offset = off0;
-    uint64_t ts_wall = wall_us_raw();
-    /* Compute sealed payload size: for each msg: [aof_msg_rec_t][kv] and after the last msg, append fp64 once */ size_t total_aof = sizeof(uint64_t);
-    /* fp64 trailer */ for (size_t i = 0; i < count; i++) total_aof += sizeof(aof_msg_rec_t) + messages[i].key_len +
-                                                                       messages[i].val_len;
-    void *buf = slab_alloc(total_aof);
-    if (!buf) return -4;
-    uint8_t *w = (uint8_t *) buf;
-    uint64_t batch_bytes = 0;  /* ---- NEW: accumulate for live_bytes ---- */
+    uint64_t offset = alloc_offsets_shared(t, p, partition, count);
+    uint64_t timestamp = wall_us_raw();
+    uint8_t *writep = record;
     for (size_t i = 0; i < count; i++) {
-        uint64_t o        = off0 + i;
-        uint64_t slot_idx = o & p->capacity_mask;
-        rf_msg_slot_t *slot = &ring[slot_idx];
-        rf_slot_evict_if_needed(p, slot, o);
-        const rf_msg_view_t *m = &messages[i];
-        size_t tot = m->key_len + m->val_len;
-        if (tot <= sizeof(slot->inline_data)) {
-            if (m->key && m->key_len) memcpy(slot->inline_data, m->key, m->key_len);
-            if (m->val && m->val_len) memcpy(slot->inline_data + m->key_len, m->val, m->val_len);
+        aof_msg_rec_t *message_record = (aof_msg_rec_t *)writep;
+        *message_record = (aof_msg_rec_t){
+            .topic_id = t->id,
+            .partition = (uint16_t)partition,
+            .reserved = RF_TS_FLAG_WALL,
+            .offset = offset + i,
+            .ts_us = timestamp,
+            .key_len = (uint32_t)messages[i].key_len,
+            .val_len = (uint32_t)messages[i].val_len
+        };
+        writep += sizeof(*message_record);
+        if (messages[i].key_len) {
+            memcpy(writep, messages[i].key, messages[i].key_len);
+            writep += messages[i].key_len;
+        }
+        if (messages[i].val_len) {
+            memcpy(writep, messages[i].val, messages[i].val_len);
+            writep += messages[i].val_len;
+        }
+    }
+    aof_idemp_v2_trailer_t *trailer = (aof_idemp_v2_trailer_t *)writep;
+    memset(trailer, 0, sizeof(*trailer));
+    trailer->magic = RF_IDEMP_V2_MAGIC;
+    trailer->version = RF_IDEMP_V2_VERSION;
+    trailer->flags = RAMForge_HA_is_enabled() ? RF_IDEMP_FLAG_HA : 0;
+    trailer->message_count = (uint32_t)count;
+    memcpy(trailer->key_digest, key_digest, 32);
+    memcpy(trailer->payload_digest, payload_digest, 32);
+
+    memset(&state, 0, sizeof(state));
+    state.magic = RF_IDEMP_V2_MAGIC;
+    state.version = RF_IDEMP_V2_VERSION;
+    state.status = RF_IDEMP_STATE_PENDING;
+    state.topic_id = t->id;
+    state.partition = (uint16_t)partition;
+    state.flags = trailer->flags;
+    state.message_count = (uint32_t)count;
+    memcpy(state.key_digest, key_digest, 32);
+    memcpy(state.payload_digest, payload_digest, 32);
+    state.first_offset = offset;
+    if (idemp_state_store(&state) != 0) {
+        slab_free(record);
+        rf_mutation_unlock(transaction_key);
+        return -7;
+    }
+
+    rf_write_receipt_t receipt;
+    int rc = rf_persist_apply_record(AOF_REC_BROKER_MSG_BATCH_IDEMP, record,
+                                     (uint32_t)record_bytes, timeout_ms, &receipt);
+    state.batch_id = receipt.batch_id;
+    state.raft_index = receipt.raft_index;
+    state.local_fsync = receipt.local_fsync ? 1u : 0u;
+    state.quorum_committed = receipt.quorum_committed ? 1u : 0u;
+    state.applied_all_workers = receipt.applied_all_workers ? 1u : 0u;
+    if (rc == 0) state.status = RF_IDEMP_STATE_COMMITTED;
+    int final_state_rc = idemp_state_store(&state);
+    if (first_offset) *first_offset = offset;
+    if (batch_id) *batch_id = receipt.batch_id;
+    slab_free(record);
+    rf_mutation_unlock(transaction_key);
+    if (final_state_rc != 0) return RF_ERR_IDEMP_PENDING;
+    if (rc != 0 && (receipt.quorum_committed || receipt.raft_index != 0 ||
+                    receipt.batch_id != 0 || receipt.local_fsync))
+        return RF_ERR_IDEMP_PENDING;
+    return rc;
+}
+
+int rf_produce_batch_sealed_idemp(const char *topic, int partition,
+                                  const rf_msg_view_t *messages, size_t count,
+                                  const void *idemp_key, size_t idemp_key_len,
+                                  uint64_t *first_offset, uint64_t *batch_id,
+                                  int *is_duplicate) {
+    return rf_produce_batch_sealed_idemp_checked(
+        topic, partition, messages, count, idemp_key, idemp_key_len, 0,
+        first_offset, batch_id, is_duplicate);
+}
+
+static int replay_message_set_atomic(const aof_msg_rec_t *const *records,
+                                     const rf_msg_view_t *messages,
+                                     size_t count) {
+    if (!records || !messages || count == 0) return -1;
+    const aof_msg_rec_t *first = records[0];
+    rf_topic_t *topic = rf_topic_require_by_id(first->topic_id);
+    if (!topic || first->partition >= topic->partitions) return -1;
+    rf_partition_t *partition = &topic->parts[first->partition];
+    if (rf_partition_ensure_ring(partition) != 0) return -1;
+    rf_msg_slot_t *ring = atomic_load_explicit(&partition->ring, memory_order_acquire);
+    if (!ring) return -1;
+
+    void **large_blobs = calloc(count, sizeof(*large_blobs));
+    if (!large_blobs) return -1;
+    uint64_t floor = atomic_load_explicit(&partition->delete_floor,
+                                          memory_order_acquire);
+    for (size_t i = 0; i < count; i++) {
+        const aof_msg_rec_t *record = records[i];
+        if (record->topic_id != first->topic_id ||
+            record->partition != first->partition) goto fail;
+        if (record->offset < floor) continue;
+        rf_msg_slot_t *slot = &ring[record->offset & partition->capacity_mask];
+        if (rf_slot_ready_for_offset(slot, record->offset)) continue;
+        size_t total = messages[i].key_len + messages[i].val_len;
+        if (total > sizeof(slot->inline_data)) {
+            large_blobs[i] = slab_alloc(total);
+            if (!large_blobs[i]) goto fail;
+            if (messages[i].key_len)
+                memcpy(large_blobs[i], messages[i].key, messages[i].key_len);
+            if (messages[i].val_len)
+                memcpy((uint8_t *)large_blobs[i] + messages[i].key_len,
+                       messages[i].val, messages[i].val_len);
+        }
+    }
+
+    for (size_t i = 0; i < count; i++) {
+        const aof_msg_rec_t *record = records[i];
+        if (record->offset < floor) {
+            if (large_blobs[i]) slab_free(large_blobs[i]);
+            continue;
+        }
+        rf_msg_slot_t *slot = &ring[record->offset & partition->capacity_mask];
+        if (rf_slot_ready_for_offset(slot, record->offset)) {
+            if (large_blobs[i]) slab_free(large_blobs[i]);
+            continue;
+        }
+        size_t total = messages[i].key_len + messages[i].val_len;
+        uint64_t want = record->offset + 1;
+        seed_shared_next_offset(record->topic_id, record->partition, want);
+        atomic_max_u64(&partition->next_offset, want);
+        atomic_max_u64(&partition->write_head, want);
+        rf_slot_evict_if_needed(partition, slot, record->offset);
+        if (total <= sizeof(slot->inline_data)) {
+            if (messages[i].key_len)
+                memcpy(slot->inline_data, messages[i].key, messages[i].key_len);
+            if (messages[i].val_len)
+                memcpy(slot->inline_data + messages[i].key_len,
+                       messages[i].val, messages[i].val_len);
             slot->blob = slot->inline_data;
         } else {
-            void *blob = slab_alloc(tot);
-            if (!blob) {
-                slab_free(buf);
-                return -5;
-            }
-            if (m->key && m->key_len) memcpy(blob, m->key, m->key_len);
-            if (m->val && m->val_len) memcpy((uint8_t *) blob + m->key_len, m->val, m->val_len);
-            slot->blob = blob;
+            slot->blob = large_blobs[i];
+            large_blobs[i] = NULL;
         }
-        atomic_store_explicit(&slot->offset, o, memory_order_release);
-        atomic_store_explicit(&slot->ts_us, ts_wall, memory_order_release);
-        atomic_store_explicit(&slot->key_len, m->key_len, memory_order_release);
-        atomic_store_explicit(&slot->val_len, m->val_len, memory_order_release);
-        atomic_store_explicit(&slot->partition, partition, memory_order_release);
-        atomic_store_explicit(&slot->flags, (tot <= sizeof(slot->inline_data)) ? 1 : 3, memory_order_release);
-
-
-        batch_bytes += (uint64_t)tot;  /* ---- NEW ---- */
-        aof_msg_rec_t *r = (aof_msg_rec_t *) w;
-        r->topic_id = t->id;
-        r->partition = (uint16_t) partition;
-        r->reserved = RF_TS_FLAG_WALL;
-        r->offset = o;
-        r->ts_us = ts_wall;
-        r->key_len = m->key_len;
-        r->val_len = m->val_len;
-        w += sizeof(*r);
-        if (tot <= sizeof(slot->inline_data)) {
-            memcpy(w, slot->inline_data, tot);
-        } else {
-            memcpy(w, slot->blob, tot);
-        }
-        w += tot;
+        atomic_store_explicit(&slot->offset, record->offset, memory_order_release);
+        atomic_store_explicit(&slot->ts_us,
+                              normalize_persisted_ts_us(record->ts_us,
+                                                        record->reserved,
+                                                        ttl_now_wall_us()),
+                              memory_order_release);
+        atomic_store_explicit(&slot->key_len, record->key_len, memory_order_release);
+        atomic_store_explicit(&slot->val_len, record->val_len, memory_order_release);
+        atomic_store_explicit(&slot->partition, record->partition, memory_order_release);
+        atomic_store_explicit(&slot->flags,
+                              total <= sizeof(slot->inline_data)
+                              ? RF_SLOT_FLAG_VALID
+                              : (RF_SLOT_FLAG_VALID | RF_SLOT_FLAG_LARGE),
+                              memory_order_release);
+        atomic_fetch_add_explicit(&partition->live_bytes, total, memory_order_relaxed);
     }
-
-    atomic_max_u64(&p->next_offset, off0 + count);
-    atomic_max_u64(&p->write_head, off0 + count);
-    memcpy(w, &fp64, sizeof fp64);
-    uint64_t bid = AOF_append_sealed(AOF_REC_BROKER_MSG_BATCH_IDEMP, buf, total_aof);
-
-    (void)rf_bus_publish(AOF_REC_BROKER_MSG_BATCH_IDEMP, buf, (uint32_t)total_aof);
-    if (RAMForge_HA_is_enabled()) {
-        RAMForge_HA_replicate_write(AOF_REC_BROKER_MSG_BATCH_IDEMP, buf, total_aof);
-    }
-
-    slab_free(buf);
-    if (batch_id) *batch_id = bid;
-
-    atomic_fetch_add_explicit(&p->live_bytes, batch_bytes, memory_order_relaxed);
-    rf_size_sweep_maybe(p);
-
-    /* immediate best-effort insert for live dedupe; crash-safe via replay */
-    idemp_put(topic, partition, idemp_key,
-              idemp_key_len, fp64, off0);
+    free(large_blobs);
     return 0;
+
+fail:
+    for (size_t i = 0; i < count; i++)
+        if (large_blobs[i]) slab_free(large_blobs[i]);
+    free(large_blobs);
+    return -1;
+}
+
+static int replay_plain_batch_atomic(const void *data, size_t size) {
+    if (!data || size < sizeof(aof_msg_rec_t)) return -1;
+    const uint8_t *begin = (const uint8_t *)data;
+    const uint8_t *end = begin + size;
+    const uint8_t *p = begin;
+    size_t count = 0;
+
+    while (p < end) {
+        size_t remaining = (size_t)(end - p);
+        if (remaining < sizeof(aof_msg_rec_t)) return -1;
+        const aof_msg_rec_t *record = (const aof_msg_rec_t *)p;
+        size_t payload = (size_t)record->key_len + (size_t)record->val_len;
+        if (payload < (size_t)record->key_len) return -1;
+        size_t bytes = sizeof(*record) + payload;
+        if (bytes < sizeof(*record) || bytes > remaining) return -1;
+        if (count == SIZE_MAX) return -1;
+        count++;
+        p += bytes;
+    }
+    if (p != end || count == 0 ||
+        count > SIZE_MAX / sizeof(aof_msg_rec_t *) ||
+        count > SIZE_MAX / sizeof(rf_msg_view_t)) return -1;
+
+    const aof_msg_rec_t **records = calloc(count, sizeof(*records));
+    rf_msg_view_t *messages = calloc(count, sizeof(*messages));
+    if (!records || !messages) {
+        free(records);
+        free(messages);
+        return -1;
+    }
+
+    p = begin;
+    for (size_t i = 0; i < count; i++) {
+        const aof_msg_rec_t *record = (const aof_msg_rec_t *)p;
+        size_t payload = (size_t)record->key_len + (size_t)record->val_len;
+        records[i] = record;
+        messages[i].key = p + sizeof(*record);
+        messages[i].key_len = record->key_len;
+        messages[i].val = p + sizeof(*record) + record->key_len;
+        messages[i].val_len = record->val_len;
+        p += sizeof(*record) + payload;
+    }
+    int rc = replay_message_set_atomic(records, messages, count);
+    free(records);
+    free(messages);
+    return rc;
+}
+
+static int replay_idemp_v2(uint32_t rec_id, const void *data, size_t size) {
+    if (size < sizeof(aof_msg_rec_t) + sizeof(aof_idemp_v2_trailer_t)) return 0;
+    const uint8_t *begin = (const uint8_t *)data;
+    const aof_idemp_v2_trailer_t *trailer =
+        (const aof_idemp_v2_trailer_t *)(begin + size - sizeof(*trailer));
+    if (trailer->magic != RF_IDEMP_V2_MAGIC ||
+        trailer->version != RF_IDEMP_V2_VERSION) return 0;
+    if (trailer->message_count == 0 ||
+        (rec_id == AOF_REC_BROKER_MSG_IDEMP && trailer->message_count != 1))
+        return -1;
+
+    size_t count = trailer->message_count;
+    if (count > (size - sizeof(*trailer)) / sizeof(aof_msg_rec_t)) return -1;
+    const aof_msg_rec_t **records = calloc(count, sizeof(*records));
+    rf_msg_view_t *messages = calloc(count, sizeof(*messages));
+    if (!records || !messages) {
+        free(records);
+        free(messages);
+        return -1;
+    }
+    const uint8_t *p = begin;
+    const uint8_t *end = (const uint8_t *)trailer;
+    int rc = -1;
+    for (size_t i = 0; i < count; i++) {
+        if ((size_t)(end - p) < sizeof(aof_msg_rec_t)) goto done;
+        const aof_msg_rec_t *record = (const aof_msg_rec_t *)p;
+        size_t payload = (size_t)record->key_len + (size_t)record->val_len;
+        size_t bytes = sizeof(*record) + payload;
+        if (bytes < sizeof(*record) || bytes > (size_t)(end - p)) goto done;
+        records[i] = record;
+        messages[i].key = p + sizeof(*record);
+        messages[i].key_len = record->key_len;
+        messages[i].val = p + sizeof(*record) + record->key_len;
+        messages[i].val_len = record->val_len;
+        p += bytes;
+    }
+    if (p != end) goto done;
+    const aof_msg_rec_t *first = records[0];
+    rf_topic_t *topic = rf_topic_require_by_id(first->topic_id);
+    if (!topic || first->partition >= topic->partitions) goto done;
+    uint8_t payload_digest[32];
+    if (idemp_payload_digest(topic->name, first->partition, messages, count,
+                             payload_digest) != 0 ||
+        memcmp(payload_digest, trailer->payload_digest, 32) != 0) goto done;
+    if (replay_message_set_atomic(records, messages, count) != 0) goto done;
+
+    rf_idemp_state_t state;
+    memset(&state, 0, sizeof(state));
+    state.magic = RF_IDEMP_V2_MAGIC;
+    state.version = RF_IDEMP_V2_VERSION;
+    state.status = RF_IDEMP_STATE_COMMITTED;
+    state.topic_id = first->topic_id;
+    state.partition = first->partition;
+    state.flags = trailer->flags;
+    state.message_count = trailer->message_count;
+    memcpy(state.key_digest, trailer->key_digest, 32);
+    memcpy(state.payload_digest, trailer->payload_digest, 32);
+    state.first_offset = first->offset;
+    state.local_fsync = 1;
+    state.quorum_committed = (trailer->flags & RF_IDEMP_FLAG_HA) ? 1u : 0u;
+    if (idemp_state_store(&state) != 0) goto done;
+    rc = 1;
+
+done:
+    free(records);
+    free(messages);
+    return rc;
+}
+
+static int idemp_state_from_raft_record(uint32_t rec_id, const void *data,
+                                        size_t size, rf_idemp_state_t *state) {
+    if (rec_id != AOF_REC_BROKER_MSG_IDEMP &&
+        rec_id != AOF_REC_BROKER_MSG_BATCH_IDEMP) return 0;
+    if (!data || !state ||
+        size < sizeof(aof_msg_rec_t) + sizeof(aof_idemp_v2_trailer_t)) return -1;
+    const uint8_t *begin = (const uint8_t *)data;
+    const aof_idemp_v2_trailer_t *trailer =
+        (const aof_idemp_v2_trailer_t *)(begin + size - sizeof(*trailer));
+    if (trailer->magic != RF_IDEMP_V2_MAGIC ||
+        trailer->version != RF_IDEMP_V2_VERSION) return 0;
+    if (trailer->message_count == 0 ||
+        (rec_id == AOF_REC_BROKER_MSG_IDEMP && trailer->message_count != 1))
+        return -1;
+
+    const uint8_t *p = begin;
+    const uint8_t *end = (const uint8_t *)trailer;
+    const aof_msg_rec_t *first = NULL;
+    for (uint32_t i = 0; i < trailer->message_count; i++) {
+        if ((size_t)(end - p) < sizeof(aof_msg_rec_t)) return -1;
+        const aof_msg_rec_t *record = (const aof_msg_rec_t *)p;
+        size_t payload = (size_t)record->key_len + (size_t)record->val_len;
+        size_t bytes = sizeof(*record) + payload;
+        if (bytes < sizeof(*record) || bytes > (size_t)(end - p)) return -1;
+        if (!first) first = record;
+        else if (record->topic_id != first->topic_id ||
+                 record->partition != first->partition) return -1;
+        p += bytes;
+    }
+    if (!first || p != end) return -1;
+
+    memset(state, 0, sizeof(*state));
+    state->magic = RF_IDEMP_V2_MAGIC;
+    state->version = RF_IDEMP_V2_VERSION;
+    state->status = RF_IDEMP_STATE_PENDING;
+    state->topic_id = first->topic_id;
+    state->partition = first->partition;
+    state->flags = trailer->flags;
+    state->message_count = trailer->message_count;
+    memcpy(state->key_digest, trailer->key_digest, 32);
+    memcpy(state->payload_digest, trailer->payload_digest, 32);
+    state->first_offset = first->offset;
+    return 1;
+}
+
+int rf_idemp_restore_raft_state(uint32_t rec_id, const void *data, size_t size,
+                                uint64_t raft_index, int quorum_committed,
+                                int applied) {
+    rf_idemp_state_t restored;
+    int parsed = idemp_state_from_raft_record(rec_id, data, size, &restored);
+    if (parsed <= 0) return parsed;
+    restored.raft_index = raft_index;
+    restored.quorum_committed = quorum_committed ? 1u : 0u;
+    restored.local_fsync = applied ? 1u : 0u;
+    restored.status = applied ? RF_IDEMP_STATE_COMMITTED : RF_IDEMP_STATE_PENDING;
+
+    rf_idemp_state_t existing;
+    int found = idemp_state_load(restored.key_digest, restored.topic_id,
+                                  restored.partition, &existing);
+    if (found < 0) return -1;
+    if (found > 0 &&
+        memcmp(existing.payload_digest, restored.payload_digest,
+               sizeof(existing.payload_digest)) != 0) return -1;
+    if (found > 0 && existing.status == RF_IDEMP_STATE_COMMITTED) {
+        if (applied) {
+            existing.raft_index = raft_index;
+            existing.local_fsync = 1;
+            existing.quorum_committed = quorum_committed ? 1u : 0u;
+            if (idemp_state_store(&existing) != 0) return -1;
+        }
+        return 0;
+    }
+    if (found > 0 && existing.status == RF_IDEMP_STATE_PENDING &&
+        existing.raft_index != 0 && existing.raft_index != raft_index) return -1;
+    return idemp_state_store(&restored);
+}
+
+void rf_idemp_abort_raft_state(uint32_t rec_id, const void *data, size_t size,
+                               uint64_t raft_index) {
+    rf_idemp_state_t parsed;
+    if (idemp_state_from_raft_record(rec_id, data, size, &parsed) != 1) return;
+    rf_idemp_state_t existing;
+    if (idemp_state_load(parsed.key_digest, parsed.topic_id, parsed.partition,
+                         &existing) != 1) return;
+    if (existing.status != RF_IDEMP_STATE_PENDING ||
+        (existing.raft_index != 0 && existing.raft_index != raft_index)) return;
+    existing.status = RF_IDEMP_STATE_ABORTED;
+    existing.raft_index = 0;
+    existing.batch_id = 0;
+    existing.local_fsync = 0;
+    existing.quorum_committed = 0;
+    existing.applied_all_workers = 0;
+    (void)idemp_state_store(&existing);
 }

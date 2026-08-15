@@ -148,6 +148,17 @@ int main(int argc, char **argv) {
     }
     setup_signal_handlers();
 
+    if (!getenv("AYDER_STORAGE_SHM_NAME")) {
+        char storage_name[64];
+        int n = snprintf(storage_name, sizeof(storage_name), "/ayder_storage_%ld",
+                         (long)getpid());
+        if (n < 0 || (size_t)n >= sizeof(storage_name) ||
+            setenv("AYDER_STORAGE_SHM_NAME", storage_name, 1) != 0) {
+            fprintf(stderr, "❌ Failed to create a unique shared-storage instance name\n");
+            return 1;
+        }
+    }
+
 
     printf("   AOF mode: %s\n",
            g_aof_mode == 0 ? "never" :

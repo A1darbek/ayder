@@ -7,6 +7,9 @@
 #define RF_MAX_TOPIC_LEN     64
 #define RF_MAX_GROUP_LEN     64
 #define RF_MAX_PARTITIONS    128
+#define RF_MAX_TOPICS        1024
+#define RF_MAX_WORKERS       256
+#define RF_IDEMP_LOCKS       256
 
 // AOF record types for broker
 #define AOF_REC_BROKER_MSG      0xB10C0001u
@@ -19,12 +22,74 @@
 #define AOF_REC_HA_FORWARD 0xA0F00D  /* arbitrary new bus record id */
 #define AOF_REC_HA_MEMBERSHIP_FORWARD 0xA0F00E /* agent->worker0 membership control */
 #define AOF_REC_HA_READ_BARRIER 0xA0F00F /* linearizable read-index barrier */
+#define RF_IDEMP_V2_MAGIC 0x49445032u /* IDP2 */
+#define RF_IDEMP_V2_VERSION 2u
+#define RF_IDEMP_STATE_PENDING 1u
+#define RF_IDEMP_STATE_COMMITTED 2u
+#define RF_IDEMP_STATE_ABORTED 3u
+#define RF_IDEMP_FLAG_HA 0x1u
+#define RF_ERR_IDEMP_CONFLICT -8
+#define RF_ERR_IDEMP_PENDING -9
 
 typedef struct {
-    uint32_t type;   /* e.g. AOF_REC_BROKER_MSG or _BATCH */
-    uint32_t size;   /* payload bytes */
+    uint64_t req_id;
+    uint32_t type;       /* e.g. AOF_REC_BROKER_MSG or _BATCH */
+    uint32_t size;       /* payload bytes */
+    uint32_t timeout_ms;
+    uint32_t reserved;
     /* uint8_t data[size] follows */
 } ha_fwd_rec_t;
+
+typedef struct {
+    uint64_t req_id;
+    int32_t rc;
+    uint32_t reserved;
+    uint64_t raft_index;
+    uint64_t aof_batch_id;
+    uint32_t raft_log_fsynced;
+    uint32_t quorum_committed;
+    uint32_t local_fsync;
+    uint32_t applied_all_workers;
+} __attribute__((packed)) ha_fwd_write_rsp_t;
+
+typedef struct {
+    uint64_t batch_id;
+    uint64_t raft_index;
+    int local_fsync;
+    int quorum_committed;
+    int failover_safe;
+    int applied_all_workers;
+} rf_write_receipt_t;
+
+typedef struct {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t flags;
+    uint32_t message_count;
+    uint32_t reserved;
+    uint8_t key_digest[32];
+    uint8_t payload_digest[32];
+} __attribute__((packed)) aof_idemp_v2_trailer_t;
+
+typedef struct {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t status;
+    uint32_t topic_id;
+    uint16_t partition;
+    uint16_t flags;
+    uint32_t message_count;
+    uint32_t reserved;
+    uint8_t key_digest[32];
+    uint8_t payload_digest[32];
+    uint64_t first_offset;
+    uint64_t batch_id;
+    uint64_t raft_index;
+    uint32_t local_fsync;
+    uint32_t quorum_committed;
+    uint32_t applied_all_workers;
+    uint32_t proof_reserved;
+} __attribute__((packed)) rf_idemp_state_t;
 
 typedef enum {
     HA_MEM_FWD_OP_ADD = 1,
@@ -56,6 +121,23 @@ typedef struct {
 } __attribute__((packed)) ha_read_barrier_rec_t;
 
 int ha_fwd_send(uint32_t type, const void *payload, uint32_t size);
+int ha_fwd_send_checked(uint32_t type, const void *payload, uint32_t size,
+                        uint32_t timeout_ms, ha_fwd_write_rsp_t *response);
+int ha_fwd_store_response(const ha_fwd_write_rsp_t *response);
+int rf_persist_apply_record(uint32_t record_type, const void *data, uint32_t size,
+                            uint32_t timeout_ms, rf_write_receipt_t *receipt);
+void rf_last_write_receipt(rf_write_receipt_t *receipt);
+int rf_mutation_lock(uint64_t key);
+void rf_mutation_unlock(uint64_t key);
+int rf_kv_put_transaction(int32_t skey, int has_expected_cas,
+                          uint64_t expected_cas, uint64_t expires_us,
+                          const void *value, uint32_t value_len,
+                          uint32_t timeout_ms, uint64_t *new_cas,
+                          uint64_t *current_cas, rf_write_receipt_t *receipt);
+int rf_kv_delete_transaction(int32_t skey, int has_expected_cas,
+                             uint64_t expected_cas, uint32_t timeout_ms,
+                             uint64_t *new_cas, uint64_t *current_cas,
+                             rf_write_receipt_t *receipt);
 int rf_wait_ha_read_barrier(uint64_t req_id, uint32_t timeout_ms);
 
 #pragma pack(push,1)
@@ -148,7 +230,11 @@ typedef struct {
     uint64_t ttl_ms;            // 0 disables TTL
     uint64_t max_bytes;                  /* 0 = disabled (ADDED; optional on old replays) */
     char     topic[RF_MAX_TOPIC_LEN]; // "*" or empty => global
+    uint32_t present_flags;     /* RF_RETENTION_HAS_*; absent in legacy records */
 } __attribute__((packed)) aof_ttl_rec_t;
+
+#define RF_RETENTION_HAS_TTL       (1u << 0)
+#define RF_RETENTION_HAS_MAX_BYTES (1u << 1)
 
 typedef struct {
     uint32_t topic_id;
@@ -163,7 +249,16 @@ typedef struct {
     uint32_t         size;
     uint32_t         off;       /* offset into heap */
     uint64_t         seq;       /* global sequence (monotonic) */
+    uint64_t         data_end;  /* absolute heap cursor after this payload */
 } bus_desc_t;
+
+typedef struct {
+    _Atomic uint32_t ready;
+    uint32_t id;
+    uint16_t partitions;
+    uint16_t reserved;
+    char name[RF_MAX_TOPIC_LEN];
+} rf_shared_topic_t;
 
 typedef struct {
     /* ring of descriptors */
@@ -177,6 +272,23 @@ typedef struct {
     /* producers advance these monotonically (wrap logic on consumers) */
     _Atomic uint64_t data_head;
     _Atomic uint64_t desc_head;
+
+    /* A publisher may reuse storage only after every worker has advanced. */
+    uint32_t worker_count;
+    uint32_t reserved;
+    _Atomic uint64_t consumer_seq[RF_MAX_WORKERS];
+    _Atomic uint64_t consumer_data_tail[RF_MAX_WORKERS];
+    /* First failed application sequence plus one; zero means healthy. */
+    _Atomic uint64_t consumer_failed_seq[RF_MAX_WORKERS];
+
+    /* Process-shared locks serialize bus allocation, topic registration, and
+       same-idempotency-key transactions. */
+    pthread_mutex_t publish_lock;
+    pthread_mutex_t topic_lock;
+    pthread_mutex_t idemp_locks[RF_IDEMP_LOCKS];
+
+    _Atomic uint32_t topic_count;
+    rf_shared_topic_t topics[RF_MAX_TOPICS];
 
     /* (optional) stats */
     _Atomic uint64_t drops;
@@ -272,9 +384,18 @@ void rf_bus_start_promoter(void);
 
 /* Publish one record: rec_id is one of AOF_REC_*; payload is your existing packed blob. */
 int  rf_bus_publish(int rec_id, const void *payload, uint32_t size);
+int  rf_bus_publish_wait(int rec_id, const void *payload, uint32_t size,
+                         uint32_t timeout_ms, uint64_t *seq_out);
+int  rf_bus_publish_wait_except(int rec_id, const void *payload, uint32_t size,
+                                uint32_t timeout_ms, int except_worker,
+                                uint64_t *seq_out);
 
 int rf_delete_before(const char *topic, int partition, uint64_t before_offset,
                      uint64_t *deleted_count, uint64_t *freed_bytes);
+int rf_delete_before_checked(const char *topic, int partition,
+                             uint64_t before_offset, uint32_t timeout_ms,
+                             uint64_t *deleted_count, uint64_t *freed_bytes,
+                             rf_write_receipt_t *receipt);
 /* Topics */
 uint32_t rf_topic_id(const char *name);                // stable hash
 int      rf_topic_ensure(const char *name, int partitions); // idempotent
@@ -284,18 +405,37 @@ int rf_produce_sealed(const char *topic, int partition,
                       const void *key, size_t key_len,
                       const void *val, size_t val_len,
                       uint64_t *out_offset, uint64_t *batch_id);
+int rf_produce_sealed_checked(const char *topic, int partition,
+                              const void *key, size_t key_len,
+                              const void *val, size_t val_len,
+                              uint32_t timeout_ms, uint64_t *out_offset,
+                              uint64_t *batch_id);
 int rf_produce_sealed_idemp(const char *topic, int partition,
                             const void *key, size_t key_len,
                             const void *val, size_t val_len,
                             const void *idemp_key, size_t idemp_key_len,
                             uint64_t *out_offset, uint64_t *batch_id,
                             int *is_duplicate);
+int rf_produce_sealed_idemp_checked(const char *topic, int partition,
+                                    const void *key, size_t key_len,
+                                    const void *val, size_t val_len,
+                                    const void *idemp_key, size_t idemp_key_len,
+                                    uint32_t timeout_ms, uint64_t *out_offset,
+                                    uint64_t *batch_id, int *is_duplicate);
 
 int rf_produce_batch_sealed_idemp(const char *topic, int partition,
                                   const rf_msg_view_t *messages, size_t count,
                                   const void *idemp_key, size_t idemp_key_len,
                                   uint64_t *first_offset, uint64_t *batch_id,
                                   int *is_duplicate);
+int rf_produce_batch_sealed_idemp_checked(const char *topic, int partition,
+                                          const rf_msg_view_t *messages,
+                                          size_t count, const void *idemp_key,
+                                          size_t idemp_key_len,
+                                          uint32_t timeout_ms,
+                                          uint64_t *first_offset,
+                                          uint64_t *batch_id,
+                                          int *is_duplicate);
 
 /* Consume (pull) */
 size_t rf_consume(const char *topic, const char *group, int partition,
@@ -304,10 +444,20 @@ size_t rf_consume(const char *topic, const char *group, int partition,
                   uint64_t *next_offset);
 
 /* Commit offset (records to shared_storage + AOF) */
-int rf_commit(const char *topic, const char *group, int partition, uint64_t offset);
+int rf_commit(const char *topic, const char *group, int partition, uint64_t offset,
+              uint64_t *batch_id);
+int rf_commit_checked(const char *topic, const char *group, int partition,
+                      uint64_t offset, uint32_t timeout_ms, uint64_t *batch_id,
+                      rf_write_receipt_t *receipt);
 
 /* AOF replay hook */
 void rf_broker_replay_aof(uint32_t rec_id, const void *data, size_t sz);
+int rf_broker_apply_aof_checked(uint32_t rec_id, const void *data, size_t sz);
+int rf_idemp_restore_raft_state(uint32_t rec_id, const void *data, size_t size,
+                                uint64_t raft_index, int quorum_committed,
+                                int applied);
+void rf_idemp_abort_raft_state(uint32_t rec_id, const void *data, size_t size,
+                               uint64_t raft_index);
 
 /* Offset helpers (shared_storage) */
 int  rf_offset_load (const char *topic, const char *group, int partition, uint64_t *out);
@@ -316,9 +466,18 @@ int  rf_partition_snapshot(const char *topic, int partition, rf_partition_snapsh
 int rf_produce_batch_sealed(const char *topic, int partition,
                             const rf_msg_view_t *messages, size_t count,
                             uint64_t *first_offset, uint64_t *batch_id);
+int rf_produce_batch_sealed_checked(const char *topic, int partition,
+                                    const rf_msg_view_t *messages, size_t count,
+                                    uint32_t timeout_ms, uint64_t *first_offset,
+                                    uint64_t *batch_id);
 
 int rf_set_ttl_ms(const char *topic, int partition, uint64_t ttl_ms);
 /* apply TTL to ALL partitions of ALL topics */
 int rf_set_ttl_ms_all(uint64_t ttl_ms);
 int rf_set_max_bytes_all(uint64_t max_bytes);
 int rf_set_max_bytes(const char *topic, int part, uint64_t max_bytes);
+int rf_set_retention_checked(const char *topic, int partition,
+                             int has_ttl, uint64_t ttl_ms,
+                             int has_max_bytes, uint64_t max_bytes,
+                             uint32_t timeout_ms,
+                             rf_write_receipt_t *receipt);
