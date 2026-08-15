@@ -1,0 +1,115 @@
+services:
+  ayder:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    command: ["./ayder", "--workers", "1", "--aof", "always"]
+    environment:
+      RF_RESET_DATA: "1"
+      RF_ROCKET: "0"
+      RF_BEARER_TOKENS: "${BENCH_RF_BEARER_TOKENS:?benchmark runner must set BENCH_RF_BEARER_TOKENS}"
+    ports:
+      - "1109:1109"
+    mem_limit: ${AYDER_MEM_LIMIT:-512m}
+    cpus: ${AYDER_CPUS:-1.0}
+    volumes:
+      - ayder_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:1109/ready | grep -Eq '\"ready\"[[:space:]]*:[[:space:]]*true'"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  kafka:
+    image: bitnami/kafka:3.7
+    environment:
+      KAFKA_ENABLE_KRAFT: "yes"
+      KAFKA_CFG_NODE_ID: "1"
+      KAFKA_CFG_PROCESS_ROLES: "broker,controller"
+      KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
+      KAFKA_CFG_LISTENERS: "PLAINTEXT://:9092,CONTROLLER://:9093"
+      KAFKA_CFG_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:9092"
+      KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: "PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT"
+      KAFKA_CFG_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_CFG_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+      KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_CFG_NUM_PARTITIONS: "1"
+      KAFKA_CFG_DEFAULT_REPLICATION_FACTOR: "1"
+      KAFKA_CFG_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_CFG_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_CFG_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_CFG_MIN_INSYNC_REPLICAS: "1"
+      KAFKA_CFG_LOG_FLUSH_INTERVAL_MESSAGES: "1"
+      KAFKA_CFG_LOG_FLUSH_INTERVAL_MS: "1"
+      KAFKA_CFG_LOG_FLUSH_SCHEDULER_INTERVAL_MS: "1"
+      KAFKA_CFG_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+      KAFKA_HEAP_OPTS: "-Xms256m -Xmx512m"
+      ALLOW_PLAINTEXT_LISTENER: "yes"
+    ports:
+      - "9092:9092"
+    mem_limit: ${KAFKA_MEM_LIMIT:-1g}
+    cpus: ${KAFKA_CPUS:-1.0}
+    volumes:
+      - kafka_data:/bitnami/kafka
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics.sh --bootstrap-server 127.0.0.1:9092 --list >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 24
+
+  nats:
+    image: nats:2.10-alpine
+    command: ["-js", "-sd", "/data/jetstream", "-m", "8222"]
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    mem_limit: ${NATS_MEM_LIMIT:-512m}
+    cpus: ${NATS_CPUS:-1.0}
+    volumes:
+      - nats_data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8222/healthz?js-enabled-only=true"]
+      interval: 5s
+      timeout: 3s
+      retries: 24
+
+  bench-client:
+    build:
+      context: .
+      dockerfile: Dockerfile.bench-client
+    working_dir: /bench
+    volumes:
+      - .:/bench
+    environment:
+      AYDER_BASE: "http://ayder:1109"
+      AYDER_TOKEN: "${BENCH_AYDER_TOKEN:?benchmark runner must set BENCH_AYDER_TOKEN}"
+      KAFKA_BOOTSTRAP: "kafka:9092"
+      NATS_URL: "nats://nats:4222"
+    depends_on: []
+    mem_limit: ${CLIENT_MEM_LIMIT:-512m}
+
+  bench:
+    build:
+      context: ./client
+    profiles: ["tools"]
+    environment:
+      AYDER_URL: "http://ayder:1109"
+      AYDER_TOKEN: "${BENCH_AYDER_TOKEN:?benchmark runner must set BENCH_AYDER_TOKEN}"
+      KAFKA_BOOTSTRAP: "kafka:9092"
+      NATS_URL: "nats://nats:4222"
+      ARTIFACTS_DIR: "/artifacts"
+    volumes:
+      - ./artifacts:/artifacts
+    depends_on:
+      ayder:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    mem_limit: ${CLIENT_MEM_LIMIT:-512m}
+
+volumes:
+  ayder_data:
+  kafka_data:
+  nats_data:

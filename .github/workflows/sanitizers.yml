@@ -1,0 +1,58 @@
+name: Sanitizers
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  asan-ubsan:
+    name: Clang ASan and UBSan smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install compiler and dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            clang curl jq libcurl4-openssl-dev libevent-dev libssl-dev \
+            liburing-dev libuv1-dev pkg-config zlib1g-dev
+
+      - name: Build ASan and UBSan binary
+        run: |
+          clang -std=gnu11 -O1 -g -fno-omit-frame-pointer \
+            -fsanitize=address,undefined \
+            -I./include -Ideps/picohttpparser -DHTTP_SERVER_FAST \
+            src/*.c deps/picohttpparser/picohttpparser.c \
+            -o ayder-sanitize \
+            -fsanitize=address,undefined \
+            -luv -lz -luring -lm -lcurl -lssl -lcrypto -pthread
+
+      - name: Run API smoke under sanitizers
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1:strict_string_checks=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+          ROUTE_COVERAGE: "1"
+          START_SERVER: "1"
+          SERVER_BIN: ./ayder-sanitize
+          PORT: "1109"
+          TOKEN: dev
+        run: tests/smoke/api_smoke.sh
+
+      - name: Run live HTTP security checks under sanitizers
+        env:
+          ASAN_OPTIONS: detect_leaks=0:halt_on_error=1:abort_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: >-
+          python3 tests/security/http_live_security_test.py
+          --server ./ayder-sanitize
+          --label clang-asan-ubsan
+          --sanitized

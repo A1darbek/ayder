@@ -21,18 +21,9 @@ WORKDIR /app
 # Copy repo
 COPY . .
 
-# Ensure picohttpparser exists (in case repo doesn't include it)
-RUN mkdir -p deps/picohttpparser && \
-    if [ ! -f deps/picohttpparser/picohttpparser.c ]; then \
-      curl -fsSL https://raw.githubusercontent.com/h2o/picohttpparser/master/picohttpparser.c \
-        -o deps/picohttpparser/picohttpparser.c ; \
-    fi && \
-    if [ ! -f deps/picohttpparser/picohttpparser.h ]; then \
-      curl -fsSL https://raw.githubusercontent.com/h2o/picohttpparser/master/picohttpparser.h \
-        -o deps/picohttpparser/picohttpparser.h ; \
-    fi
-
-RUN make clean && make
+RUN test -f deps/picohttpparser/picohttpparser.c && \
+    test -f deps/picohttpparser/picohttpparser.h && \
+    make portable
 
 ############################
 # 2) RUNTIME (musl)
@@ -43,18 +34,23 @@ RUN apk add --no-cache \
     ca-certificates \
     libuv libevent \
     liburing \
-    curl openssl zlib
+    curl openssl zlib && \
+    addgroup -S -g 10001 ayder && \
+    adduser -S -D -H -u 10001 -G ayder ayder
 
 WORKDIR /app
-RUN mkdir -p /data
+RUN mkdir -p /data /app && chown -R ayder:ayder /data /app
 
 # Copy binary (+ optional entrypoint if you have it)
-COPY --from=build /app/ayder ./ayder
+COPY --chown=ayder:ayder --from=build /app/build/portable/ayder ./ayder
 # If your repo has entrypoint.sh, keep it; otherwise this is harmless to remove.
-COPY --from=build /app/entrypoint.sh ./entrypoint.sh
+COPY --chown=ayder:ayder --from=build /app/entrypoint.sh ./entrypoint.sh
 RUN if [ -f ./entrypoint.sh ]; then chmod +x ./entrypoint.sh; fi
 
 EXPOSE 1109
+USER 10001:10001
+HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
+  CMD curl -fsS http://127.0.0.1:1109/ready | grep -Eq '"ready"[[:space:]]*:[[:space:]]*true' || exit 1
 
 # If you have entrypoint.sh and want it:
 ENTRYPOINT ["./entrypoint.sh"]

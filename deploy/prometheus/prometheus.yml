@@ -1,0 +1,43 @@
+# Example Prometheus configuration for a single Ayder endpoint.
+#
+# Ayder requires a valid bearer token for /metrics and /metrics_ha by default.
+# Put only the raw token (not the token@rate:burst:daily policy string) in
+# /etc/prometheus/ayder.token, make it readable only by Prometheus, and rotate it
+# with RF_BEARER_TOKENS. Keep the scrape path private even when authenticated.
+# Change ha_cluster from "disabled" only when RF_HA_ENABLED=1 on the target.
+
+global:
+  scrape_interval: 15s
+  scrape_timeout: 5s
+  evaluation_interval: 15s
+
+rule_files:
+  - /etc/prometheus/ayder-alerts.yml
+
+scrape_configs:
+  - job_name: ayder
+    metrics_path: /metrics
+    scheme: http
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/ayder.token
+    sample_limit: 2000
+    static_configs:
+      - targets:
+          - ayder:1109
+        labels:
+          environment: example
+
+  - job_name: ayder-ha
+    metrics_path: /metrics_ha
+    scheme: http
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/ayder.token
+    sample_limit: 100
+    static_configs:
+      - targets:
+          - ayder:1109
+        labels:
+          environment: example
+          ha_cluster: disabled

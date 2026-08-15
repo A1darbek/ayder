@@ -1,0 +1,68 @@
+name: Build and smoke
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-smoke:
+    name: ${{ matrix.name }} build and API smoke
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Ubuntu x86-64
+            runner: ubuntu-24.04
+          - name: Ubuntu ARM64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install build and test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential cmake curl jq libcurl4-openssl-dev libevent-dev \
+            libssl-dev liburing-dev libuv1-dev pkg-config zlib1g-dev
+
+      - name: Warning-clean portable builds
+        run: |
+          cmake -S . -B build/cmake \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DAYDER_WARNINGS_AS_ERRORS=ON
+          cmake --build build/cmake --parallel "$(nproc)"
+          make -j"$(nproc)" portable
+
+      - name: Run durability, Raft, security, and worker regressions
+        env:
+          AYDER_BIN: ./build/cmake/ayder
+        run: |
+          bash tests/regression/run_p0_durability_tests.sh
+          make security-test fuzz-smoke
+          bash tests/regression/cross_worker_visibility.sh
+          bash tests/regression/cross_worker_apply_failure.sh
+          bash tests/regression/idempotency_atomic_visibility.sh
+
+      - name: Run API smoke and route-coverage check
+        env:
+          ROUTE_COVERAGE: "1"
+          START_SERVER: "1"
+          SERVER_BIN: ./build/cmake/ayder
+          PORT: "1109"
+          TOKEN: dev
+        run: tests/smoke/api_smoke.sh
+
+      - name: Run live HTTP security checks
+        run: >-
+          python3 tests/security/http_live_security_test.py
+          --server ./build/cmake/ayder
+          --label "${{ matrix.name }}"

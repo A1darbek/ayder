@@ -1,0 +1,111 @@
+name: Release provenance
+
+on:
+  push:
+    branches:
+      - main
+      - hardening/revenue-readiness-v1
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+  artifact-metadata: write
+
+jobs:
+  build-attest:
+    name: Build and attest ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential cmake libcurl4-openssl-dev libevent-dev libssl-dev \
+            liburing-dev libuv1-dev pkg-config zlib1g-dev
+
+      - name: Build portable warning-clean artifact
+        run: |
+          cmake -S . -B build/release \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DAYDER_WARNINGS_AS_ERRORS=ON
+          cmake --build build/release --parallel "$(nproc)"
+
+      - name: Package artifact and checksums
+        env:
+          TARGET_ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          mkdir -p "dist/stage/ayder-linux-${TARGET_ARCH}"
+          install -m 0755 build/release/ayder \
+            "dist/stage/ayder-linux-${TARGET_ARCH}/ayder"
+          install -m 0644 LICENSE README.md \
+            "dist/stage/ayder-linux-${TARGET_ARCH}/"
+          {
+            printf 'git_sha=%s\n' "$GITHUB_SHA"
+            printf 'architecture=%s\n' "$TARGET_ARCH"
+            printf 'runner=%s\n' "$RUNNER_NAME"
+            printf 'compiler=%s\n' "$(cc --version | head -n 1)"
+          } >"dist/stage/ayder-linux-${TARGET_ARCH}/BUILD-INFO"
+          archive="ayder-linux-${TARGET_ARCH}-${GITHUB_SHA}.tar.gz"
+          tar --sort=name --mtime="@$(git show -s --format=%ct HEAD)" \
+            --owner=0 --group=0 --numeric-owner \
+            -C dist/stage -czf "dist/${archive}" "ayder-linux-${TARGET_ARCH}"
+          (cd dist && sha256sum "${archive}" >SHA256SUMS)
+
+      - name: Generate binary SPDX SBOM
+        uses: anchore/sbom-action@43a17d6e7add2b5535efe4dcae9952337c479a93 # v0.20.11
+        with:
+          path: build/release/ayder
+          format: spdx-json
+          output-file: dist/ayder-${{ matrix.arch }}.spdx.json
+          upload-artifact: false
+
+      - name: Attest checksummed artifact provenance
+        id: provenance
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
+        with:
+          subject-checksums: dist/SHA256SUMS
+
+      - name: Attest artifact SBOM
+        id: sbom-attestation
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
+        with:
+          subject-path: dist/ayder-linux-${{ matrix.arch }}-${{ github.sha }}.tar.gz
+          sbom-path: dist/ayder-${{ matrix.arch }}.spdx.json
+
+      - name: Stage signed Sigstore bundles
+        env:
+          PROVENANCE_BUNDLE: ${{ steps.provenance.outputs.bundle-path }}
+          SBOM_BUNDLE: ${{ steps.sbom-attestation.outputs.bundle-path }}
+        run: |
+          install -m 0644 "$PROVENANCE_BUNDLE" dist/provenance.sigstore.json
+          install -m 0644 "$SBOM_BUNDLE" dist/sbom.sigstore.json
+
+      - name: Upload artifact, checksum, SBOM, and attestation bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ayder-linux-${{ matrix.arch }}-${{ github.sha }}
+          path: |
+            dist/ayder-linux-${{ matrix.arch }}-${{ github.sha }}.tar.gz
+            dist/SHA256SUMS
+            dist/ayder-${{ matrix.arch }}.spdx.json
+            dist/provenance.sigstore.json
+            dist/sbom.sigstore.json
+          if-no-files-found: error
+          retention-days: 30

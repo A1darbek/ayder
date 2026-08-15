@@ -4,14 +4,16 @@ services:
     container_name: ayder
     shm_size: 2g
     ports:
-      - "1109:1109"
+      - "127.0.0.1:1109:1109"
+    environment:
+      RF_BEARER_TOKENS: "${RF_BEARER_TOKENS:?set RF_BEARER_TOKENS to a unique token and rate/quota policy}"
     ipc: shareable
     ulimits:
       memlock:
         soft: -1
         hard: -1
     security_opt:
-      - seccomp:unconfined
+      - no-new-privileges:true
     volumes:
       - ayder_data:/data
     restart: unless-stopped

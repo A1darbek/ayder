@@ -1,0 +1,37 @@
+diff --git a/src/script.c b/src/script.c
+index 30ef4fd..8388353 100644
+--- a/src/script.c
++++ b/src/script.c
+@@ -48,7 +48,17 @@ static const struct luaL_Reg threadlib[] = {
+ lua_State *script_create(char *file, char *url, char **headers) {
+     lua_State *L = luaL_newstate();
+     luaL_openlibs(L);
+-    (void) luaL_dostring(L, "wrk = require \"wrk\"");
++    const char *wrk_lua = getenv("WRK2_LUA_MODULE");
++    if (wrk_lua != NULL && wrk_lua[0] != '\0') {
++        if (luaL_dofile(L, wrk_lua) != 0) {
++            fprintf(stderr, "failed to load WRK2_LUA_MODULE: %s\n", lua_tostring(L, -1));
++            lua_pop(L, 1);
++        } else {
++            lua_setglobal(L, "wrk");
++        }
++    } else {
++        (void) luaL_dostring(L, "wrk = require \"wrk\"");
++    }
+
+     luaL_newmetatable(L, "wrk.addr");
+     luaL_register(L, NULL, addrlib);
+diff --git a/src/wrk.c b/src/wrk.c
+index 28ed17e..d87d32e 100644
+--- a/src/wrk.c
++++ b/src/wrk.c
+@@ -743,7 +743,8 @@ static struct option longopts[] = {
+ };
+
+ static int parse_args(struct config *cfg, char **url, struct http_parser_url *parts, char **headers, int argc, char **argv) {
+-    signed char c, **header = headers;
++    int c;
++    char **header = headers;
+
+     memset(cfg, 0, sizeof(struct config));
+     cfg->threads     = 2;

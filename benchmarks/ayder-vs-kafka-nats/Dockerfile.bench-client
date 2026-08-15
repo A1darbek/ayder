@@ -1,0 +1,11 @@
+FROM python:3.12-slim
+
+COPY requirements-runner.txt /tmp/requirements-runner.txt
+RUN pip install --no-cache-dir -r /tmp/requirements-runner.txt && \
+    groupadd --system --gid 10001 benchmark && \
+    useradd --system --uid 10001 --gid 10001 --home-dir /bench \
+      --shell /usr/sbin/nologin benchmark
+
+WORKDIR /bench
+RUN chown benchmark:benchmark /bench
+USER 10001:10001

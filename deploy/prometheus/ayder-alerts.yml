@@ -1,0 +1,148 @@
+# These rules use only metrics exported by the current Ayder implementation.
+# Queue and traffic thresholds are examples; tune them from measured baselines.
+# See docs/OBSERVABILITY.md before enabling these rules. Persistence-duration
+# histograms and queue gauges still require a stable/single-worker scrape.
+
+groups:
+  - name: ayder.availability
+    rules:
+      - alert: AyderUnavailable
+        expr: up{job="ayder"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: Ayder metrics target is unavailable
+          description: Prometheus has failed to scrape {{ $labels.instance }} for at least two minutes.
+
+      - alert: AyderPersistenceUnavailable
+        expr: ayder_persistence_ready{job="ayder"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: Ayder persistence is not ready
+          description: '{{ $labels.instance }} has reported persistence_ready=0 for one minute; remove it from write traffic and inspect recovery/storage logs.'
+
+      - alert: AyderSustained5xx
+        expr: |
+          (
+            sum by (instance) (rate(ayder_http_responses_total{job="ayder",code="5xx"}[5m]))
+            /
+            clamp_min(sum by (instance) (rate(ayder_http_requests_total{job="ayder"}[5m])), 0.001)
+          ) > 0.05
+          and on (instance)
+          sum by (instance) (rate(ayder_http_requests_total{job="ayder"}[5m])) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Ayder is returning a sustained proportion of 5xx responses
+          description: More than 5% of responses from {{ $labels.instance }} have been 5xx while traffic exceeded 1 request/second. Tune from a measured baseline.
+
+      - alert: AyderSustainedBackpressure
+        expr: sum by (instance) (rate(ayder_backpressure_events_total{job="ayder"}[5m])) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Ayder is sustaining broker backpressure
+          description: '{{ $labels.instance }} has rejected more than 0.1 requests/second for ten minutes due to backpressure. Inspect queue depth, active connections, storage latency, and offered load.'
+
+      - alert: AyderHighHTTPP99
+        expr: histogram_quantile(0.99, sum by (instance, le) (rate(ayder_http_request_duration_seconds_bucket{job="ayder"}[5m]))) > 0.25
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Ayder server-side HTTP p99 is elevated
+          description: '{{ $labels.instance }} server-side HTTP p99 exceeded the example 250 ms threshold for ten minutes. This measures first request byte through handler completion; tune the threshold from an SLO and measured baseline.'
+
+      - alert: AyderRestartLoop
+        expr: changes(ayder_process_start_time_seconds{job="ayder"}[15m]) > 2
+        labels:
+          severity: critical
+        annotations:
+          summary: Ayder process group is restarting repeatedly
+          description: '{{ $labels.instance }} has changed process start time more than twice in 15 minutes.'
+
+  - name: ayder.persistence-pressure
+    rules:
+      - alert: AyderAOFQueueGrowth
+        expr: ayder_aof_pending_writes{job="ayder"} > 1000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Ayder AOF pending-write queue is elevated
+          description: '{{ $labels.instance }} has more than 1,000 pending AOF writes. This is an example threshold and must be tuned to the deployment.'
+
+      - alert: AyderSealedQueueGrowth
+        expr: ayder_sealed_queue_depth{job="ayder"} > 1000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Ayder sealed queue is elevated
+          description: '{{ $labels.instance }} has more than 1,000 sealed batches waiting for fsync. This is an example threshold and must be tuned to the deployment.'
+
+      - alert: AyderStorageWriteFailures
+        expr: increase(ayder_storage_writes_total{job="ayder",outcome="failure"}[5m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: Ayder has recorded storage write failures
+          description: '{{ $labels.instance }} recorded one or more storage write failures in five minutes. Preserve logs and inspect the volume before retrying or restarting.'
+
+      - alert: AyderHighFsyncP99
+        expr: histogram_quantile(0.99, sum by (instance, le) (rate(ayder_fsync_duration_seconds_bucket{job="ayder"}[5m]))) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Ayder fsync p99 is elevated
+          description: '{{ $labels.instance }} fsync p99 exceeded the example 100 ms threshold for ten minutes. This rule requires a stable/single-worker scrape and a threshold derived from deployment evidence.'
+
+      - alert: AyderHighSealedDurabilityP99
+        expr: histogram_quantile(0.99, sum by (instance, le) (rate(ayder_sealed_durable_latency_seconds_bucket{job="ayder"}[5m]))) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Ayder sealed durability p99 is elevated
+          description: '{{ $labels.instance }} sealed durable-latency p99 exceeded the example 100 ms threshold for ten minutes. This is not HTTP request latency and requires a stable/single-worker scrape.'
+
+  - name: ayder.ha
+    rules:
+      - alert: AyderHANoLeader
+        expr: |
+          max by (ha_cluster) (ramforge_ha_enabled{job="ayder-ha",ha_cluster!="disabled"}) == 1
+          and on (ha_cluster)
+          max by (ha_cluster) (ramforge_ha_leader_available{job="ayder-ha",ha_cluster!="disabled"}) == 0
+        for: 5s
+        labels:
+          severity: critical
+        annotations:
+          summary: Ayder HA cluster has no reported leader
+          description: HA cluster {{ $labels.ha_cluster }} is enabled but no scraped node reports a current leader. Target-down alerts cover a cluster with no scrapeable nodes.
+
+      - alert: AyderHAFreshQuorumLost
+        expr: |
+          ramforge_ha_fresh_quorum{job="ayder-ha",ha_cluster!="disabled"} == 0
+          and on (instance, ha_cluster)
+          ramforge_ha_role{job="ayder-ha",ha_cluster!="disabled"} == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: Ayder leader does not report a fresh HA quorum
+          description: 'Leader {{ $labels.instance }} in HA cluster {{ $labels.ha_cluster }} reports fresh_quorum=0. Followers export zero by design and are excluded by this rule.'
+
+      - alert: AyderHAStateFailed
+        expr: ramforge_ha_state{job="ayder-ha",ha_cluster!="disabled"} == 4
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: Ayder HA node reports failed state
+          description: '{{ $labels.instance }} in HA cluster {{ $labels.ha_cluster }} reports state 4 (failed).'

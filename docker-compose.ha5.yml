@@ -1,5 +1,9 @@
 x-ayder-common: &ayder-common
-  build: .
+  build:
+    context: .
+    args:
+      AYDER_UID: "${AYDER_UID:-1000}"
+      AYDER_GID: "${AYDER_GID:-1000}"
   image: ayder:ha
   shm_size: 2g
   ipc: shareable
@@ -8,18 +12,18 @@ x-ayder-common: &ayder-common
       soft: -1
       hard: -1
   security_opt:
-    - seccomp:unconfined
-  cap_add:
-    - NET_ADMIN
-    - NET_RAW
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
   restart: unless-stopped
   # IMPORTANT: do NOT override entrypoint; image entrypoint.sh must run
   environment: &ayder-env
     RF_HA_ENABLED: "1"
     RF_HA_NODES: "node1:10.77.0.11:7000:100,node2:10.77.0.12:8000:80,node3:10.77.0.13:9000:60,node4:10.77.0.14:10000:40,node5:10.77.0.15:11000:20"
     RF_HA_WRITE_CONCERN: "3"
-    RF_BEARER_TOKENS: "dev@55555555555555:11111111111111111:111111111111111111111"
-    RF_HA_TLS: "0"
+    RF_BEARER_TOKENS: "${RF_BEARER_TOKENS:?set RF_BEARER_TOKENS to a unique token and rate/quota policy}"
+    RF_HA_TLS: "1"
+    RF_HA_TLS_CA: "/certs/ca.crt"
     RF_HA_DEDICATED_WORKER: "0"
     # RF_RESET_DATA: "1"   # uncomment once if you want a fresh wipe on startup
   networks:
@@ -34,11 +38,14 @@ services:
       <<: *ayder-env
       RF_HA_NODE_ID: "node1"
       RF_HA_BOOTSTRAP_LEADER: "1"
+      RF_HA_TLS_CERT: "/certs/node1.crt"
+      RF_HA_TLS_KEY: "/certs/node1.key"
     command: ["./ayder", "--port", "7001", "--workers", "4"]
     volumes:
       - ./cluster/node1:/data
+      - ./cluster/certs:/certs:ro
     ports:
-      - "7001:7001"
+      - "127.0.0.1:7001:7001"
     networks:
       ayder_ha:
         ipv4_address: 10.77.0.11
@@ -49,11 +56,14 @@ services:
     environment:
       <<: *ayder-env
       RF_HA_NODE_ID: "node2"
+      RF_HA_TLS_CERT: "/certs/node2.crt"
+      RF_HA_TLS_KEY: "/certs/node2.key"
     command: ["./ayder", "--port", "8001", "--workers", "4"]
     volumes:
       - ./cluster/node2:/data
+      - ./cluster/certs:/certs:ro
     ports:
-      - "8001:8001"
+      - "127.0.0.1:8001:8001"
     networks:
       ayder_ha:
         ipv4_address: 10.77.0.12
@@ -64,11 +74,14 @@ services:
     environment:
       <<: *ayder-env
       RF_HA_NODE_ID: "node3"
+      RF_HA_TLS_CERT: "/certs/node3.crt"
+      RF_HA_TLS_KEY: "/certs/node3.key"
     command: ["./ayder", "--port", "9001", "--workers", "4"]
     volumes:
       - ./cluster/node3:/data
+      - ./cluster/certs:/certs:ro
     ports:
-      - "9001:9001"
+      - "127.0.0.1:9001:9001"
     networks:
       ayder_ha:
         ipv4_address: 10.77.0.13
@@ -79,11 +92,14 @@ services:
     environment:
       <<: *ayder-env
       RF_HA_NODE_ID: "node4"
+      RF_HA_TLS_CERT: "/certs/node4.crt"
+      RF_HA_TLS_KEY: "/certs/node4.key"
     command: ["./ayder", "--port", "10001", "--workers", "4"]
     volumes:
       - ./cluster/node4:/data
+      - ./cluster/certs:/certs:ro
     ports:
-      - "10001:10001"
+      - "127.0.0.1:10001:10001"
     networks:
       ayder_ha:
         ipv4_address: 10.77.0.14
@@ -94,11 +110,14 @@ services:
     environment:
       <<: *ayder-env
       RF_HA_NODE_ID: "node5"
+      RF_HA_TLS_CERT: "/certs/node5.crt"
+      RF_HA_TLS_KEY: "/certs/node5.key"
     command: ["./ayder", "--port", "11001", "--workers", "4"]
     volumes:
       - ./cluster/node5:/data
+      - ./cluster/certs:/certs:ro
     ports:
-      - "11001:11001"
+      - "127.0.0.1:11001:11001"
     networks:
       ayder_ha:
         ipv4_address: 10.77.0.15
