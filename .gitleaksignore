@@ -1,0 +1,12 @@
+# Public development-only HA fixtures committed in 38dcd556. They are removed
+# from the current tree, must be treated as compromised, and may never be used
+# for a deployed trust domain. Keep these exceptions fingerprint-specific so a
+# newly committed private key under the same paths still fails the scan.
+38dcd556a1ba6846d2edb353777dbf10c5bad6dd:cluster/certs/ca.key:private-key:1
+38dcd556a1ba6846d2edb353777dbf10c5bad6dd:cluster/certs/node1.key:private-key:1
+38dcd556a1ba6846d2edb353777dbf10c5bad6dd:cluster/certs/node2.key:private-key:1
+38dcd556a1ba6846d2edb353777dbf10c5bad6dd:cluster/certs/node3.key:private-key:1
+38dcd556a1ba6846d2edb353777dbf10c5bad6dd:cluster/certs/node4.key:private-key:1
+38dcd556a1ba6846d2edb353777dbf10c5bad6dd:cluster/certs/node5.key:private-key:1
+38dcd556a1ba6846d2edb353777dbf10c5bad6dd:cluster/certs/node6.key:private-key:1
+38dcd556a1ba6846d2edb353777dbf10c5bad6dd:cluster/certs/node7.key:private-key:1
