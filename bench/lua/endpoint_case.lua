@@ -10,7 +10,7 @@ local method = "GET"
 local path = "/health"
 local body = nil
 
-if workload == "accepted_produce" then
+if workload == "default_durable_produce" then
   method = "POST"
   path = string.format("/broker/topics/%s/produce?partition=%s", topic, partition)
   body = string.rep("x", payload_bytes)
@@ -57,10 +57,15 @@ local function body_valid(response_body)
   if not response_body then return false end
   if workload == "health" then
     return response_body:match('"ok"%s*:%s*1') ~= nil
-  elseif workload == "accepted_produce" then
+  elseif workload == "default_durable_produce" then
     return response_body:match('"ok"%s*:%s*true') ~= nil
-      and response_body:match('"durable"%s*:%s*false') ~= nil
-      and response_body:match('"synced"%s*:%s*null') ~= nil
+      and response_body:match('"durability_scope"%s*:%s*"local"') ~= nil
+      and response_body:match('"local_fsync"%s*:%s*true') ~= nil
+      and response_body:match('"applied_all_workers"%s*:%s*true') ~= nil
+      and response_body:match('"quorum_committed"%s*:%s*false') ~= nil
+      and response_body:match('"failover_safe"%s*:%s*false') ~= nil
+      and response_body:match('"durable"%s*:%s*true') ~= nil
+      and response_body:match('"synced"%s*:%s*true') ~= nil
   elseif workload == "consume" then
     return response_body:match('"count"%s*:%s*1') ~= nil
   elseif workload == "query" then

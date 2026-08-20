@@ -160,6 +160,13 @@ See [BENCHMARKS.md](BENCHMARKS.md). The strict 9-case matrix missed the target:
 valid explicit local-only receipts, but 3,432 client timeouts made every case
 non-clean.
 
+A separate standard-wrk closed-loop check was run instead of resuming wrk2. At
+one connection it produced 347.16 median RPS and 5.522 ms median p99 across
+three clean trials; per-trial p99 ranged from 4.812 to 15.755 ms. Because wrk is
+closed-loop and does not correct coordinated omission, this is useful
+low-concurrency latency evidence but does not replace the fixed-rate matrix or
+change the RED performance gate.
+
 The fixed single-node crash drill recovered 100/100 locally fsynced/all-worker
 acknowledgements after SIGKILL, with zero loss/duplicates and 74 ms
 fault-to-ready on ext4 WSL2. It met the exercise-specific target of zero records

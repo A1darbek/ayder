@@ -29,8 +29,8 @@ run_case() {
 }
 
 run_case http_overhead health unused 0 'HTTP 200 and body ok=1'
-run_case accepted_produce accepted_produce "${topic_prefix}_accepted" 1 \
-  'HTTP 200 and body ok=true,durable=false,synced=null'
+run_case default_durable_produce default_durable_produce "${topic_prefix}_default_durable" 1 \
+  'No timeout_ms: explicit local-fsync/all-worker receipt; no quorum/failover claim'
 
 read_topic="${topic_prefix}_read"
 curl -fsS -X POST "${BASE_URL}/broker/topics" "${auth[@]}" \

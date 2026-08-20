@@ -8,10 +8,12 @@ first-class.**
 ## Evidence
 
 At 1,000 offered RPS with 128 connections, the HTTP health path achieved 998.73
-RPS at 1.923 ms p99. An accepted, non-waiting produce achieved 998.72 RPS at
-1.932 ms p99. The same broker's locally fsync-confirmed produce achieved only
-458.35 RPS at 7.074 seconds p99 and recorded timeouts. At 10,000 offered RPS,
-the durable 128 B matrix case achieved 425.34 RPS at 19.022 seconds p99.
+RPS at 1.923 ms p99. That older revision also exposed an accepted/non-waiting
+produce path at 998.72 RPS and 1.932 ms p99. The current sealed path no longer
+uses omission of `timeout_ms` to select that contract. The older broker's
+locally fsync-confirmed produce achieved only 458.35 RPS at 7.074 seconds p99
+and recorded timeouts. At 10,000 offered RPS, the durable 128 B matrix case
+achieved 425.34 RPS at 19.022 seconds p99.
 
 The protocol/network and route baseline is therefore roughly 2 ms at the tested
 1k rate, while durable completion added seconds of queueing. Subtracting the two

@@ -17,6 +17,29 @@ Machine-readable evidence is
 Raw trial text/JSON/CSV/system samples are retained locally under the ignored
 `bench/results/rrv1-post-visibility-commitfix-wsl2-20260816/` directory.
 
+## Standard wrk closed-loop check
+
+At the user's request, wrk2 was not resumed. A separate standard `wrk` check
+used one thread and one connection to measure the durable path without building
+an offered-rate queue. Across three clean 20-second trials, median throughput
+was 347.16 RPS and median p99 was 5.522 ms. Per-trial p99 was 4.812, 15.755 and
+5.522 ms, so the honest result is a 5.522 ms median with one latency excursion,
+not a universal 3–9 ms bound. All 20,828 responses passed the strict receipt
+contract and there were no HTTP, socket, timeout or validation errors.
+
+This is a closed-loop, coordinated-omission-uncorrected latency check. It does
+not replace the fixed-rate matrix, demonstrate capacity at 50,000 RPS, or
+overturn the RED performance gate. An exploratory connection sweep plateaued
+near 360–370 RPS; p99 rose from 3.626 ms at one connection to 23.706 ms at four,
+133.069 ms at 16, 1.610 seconds at 64, and 3.825 seconds with timeouts at 128.
+That curve is consistent with queueing behind the durable completion path.
+
+Machine-readable evidence is
+[rrv1-wrk-durable-c1-ca9e210.json](evidence/benchmarks/rrv1-wrk-durable-c1-ca9e210.json).
+It records an exact clean Git archive, binary and wrk hashes, CPU placement,
+receipt contract, all trials, and the method boundary. Raw local output is under
+the ignored `bench/results/rrv1-wrk-durable-c1-ca9e210-20260820T164250Z/`.
+
 ## Exact response contract
 
 The workload accepts a response only when all of these are true:

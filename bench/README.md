@@ -48,11 +48,13 @@ SERVER_BIN="$PWD/ayder" RECORDS=100 OUTPUT_DIR=bench/results/crash \
   ./bench/crash_recovery_check.sh
 ```
 
-The endpoint suite separates HTTP overhead, accepted produce, durable produce,
-consume, and query inspection. The query latency case uses POST because the
-available wrk2 Lua adapter could not emit the custom `QUERY` method reliably;
-route smoke covers the actual method. The crash check is deliberately scoped to
-one node and one worker.
+The endpoint suite separates HTTP overhead, default sealed produce (without an
+explicit timeout), explicit-timeout sealed produce, consume, and query
+inspection. Both produce cases require explicit local-fsync/all-worker receipts;
+omitting `timeout_ms` does not select an asynchronous path. The query latency
+case uses POST because the available wrk2 Lua adapter could not emit the custom
+`QUERY` method reliably; route smoke covers the actual method. The crash check
+is deliberately scoped to one node and one worker.
 
 ## Output and publication rules
 

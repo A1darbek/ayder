@@ -12,6 +12,10 @@ SLAs. Every WSL2 result is labeled development/regression evidence.
 - [`rrv1-post-visibility-commitfix-wsl2.json`](rrv1-post-visibility-commitfix-wsl2.json)
   is the strict fixed-code matrix. Every counted success required explicit local
   fsync and all-worker application and explicitly denied quorum/failover safety.
+- [`rrv1-wrk-durable-c1-ca9e210.json`](rrv1-wrk-durable-c1-ca9e210.json)
+  is a standard-wrk, one-connection closed-loop check from an exact clean source
+  archive. Its 5.522 ms median p99 is low-concurrency latency evidence only and
+  is not comparable to the fixed-rate, coordinated-omission-corrected matrix.
 
 The raw per-trial output, environment capture, system samples, and perf data are
 under `bench/results/`. The measured working tree was dirty, so the summaries

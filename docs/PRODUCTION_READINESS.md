@@ -15,7 +15,7 @@ but required final-candidate and target-infrastructure evidence is incomplete.
 | Atomic idempotency | GREEN (focused) | Concurrent same-key, conflict, injected final-store failure, restart/no-duplicate regression | Longer HA/fault workload |
 | Raft implementation | YELLOW | Durable term/vote/log/commit/applied store and term/log/vote validation tests | Full strict 45-run plus power-loss/ack ledger |
 | Quorum receipts | YELLOW | Explicit checked local/quorum/failover/all-worker fields; Jepsen requires all quorum fields | Broader failover/commit workloads and complete campaign |
-| Performance | RED | Strict matrix 308–382 RPS, 19–20 s p99, timeouts | Correctness-preserving completion/batching design and target hardware |
+| Performance | RED | Fixed-rate: 308–382 RPS, 19–20 s p99, timeouts. Closed-loop c1: 347.16 RPS, 5.522 ms median p99 with one 15.755 ms trial | Correctness-preserving completion/batching design and target hardware |
 | Security | YELLOW | Focused framing/raw/live/analyzer/sanitizer gates pass | Independent review, long fuzzing, client TLS/key lifecycle |
 | Observability | GREEN for evaluation | Config, 14 rules, dashboard, live metric lint pass | Pilot threshold tuning and retention/integration |
 | Backup/restore | YELLOW | Checksummed cold backup/restore regression and real drill pass | No online/point-in-time backup or compatibility support window |

@@ -94,11 +94,13 @@ only when all of these are true:
 }
 ```
 
-The caller must provide a positive `timeout_ms` to request that proof. HTTP 2xx
-or `ok:true` alone means accepted, not durable. A timeout or persistence error
-is an ambiguous outcome that must be reconciled before retrying. `batch_id` and
-the sealed sync watermark are worker-local, not cluster-global transaction
-identifiers.
+Successful writes on the sealed path complete the local persistence and
+all-worker barriers even when `timeout_ms` is omitted; an explicit positive
+value bounds coordination/replication waits rather than selecting an async
+mode. HTTP 2xx or `ok:true` alone is still insufficient—check every receipt
+field. A timeout or persistence error is an ambiguous outcome that must be
+reconciled before retrying. `batch_id` and the sealed sync watermark are
+worker-local, not cluster-global transaction identifiers.
 
 In HA mode, local `durable:true` does not prove failover durability. Require
 `durability_scope:"quorum"`, `quorum_committed:true`,
@@ -118,6 +120,10 @@ blocker. See
   Every returned success carried a valid explicit local-only receipt. No 50k or
   production-performance claim is supported. See
   [Benchmarks](docs/BENCHMARKS.md).
+- A separate standard-wrk closed-loop check at one connection had 5.522 ms
+  median p99 at 347.16 responses/s across three clean trials. One trial reached
+  15.755 ms p99, and higher concurrency produced queueing; this does not replace
+  the fixed-rate result or change the RED performance gate.
 - A historical scoped `broker-log` Jepsen matrix recorded 45/45 passes on March
   13, 2026. Persistence and acknowledgement behavior changed in this hardening
   branch, so that historical result is context—not final-branch validation.

@@ -242,7 +242,7 @@ Query parameters:
 | `partition` | recommended | Target partition. If omitted, Ayder may choose default routing. |
 | `key` | no | Optional message key. URL-decoded. |
 | `idempotency_key` | no | Deduplicates repeated produce attempts. URL-decoded. |
-| `timeout_ms` | no | Wait up to this many milliseconds for sealed sync. Required when the caller needs `durable:true`. |
+| `timeout_ms` | no | Positive bound for coordination/replication waits. Omission does not select an asynchronous sealed write. |
 | `timing=1` | no | Include server timing fields for non-idempotent produce. |
 
 Request body is the raw message bytes. It can be JSON, text, or binary.
@@ -323,11 +323,12 @@ resolves to one offset; reuse with another payload returns
 record before another append. This deduplicates broker writes only; callers
 must still reconcile external side effects.
 
-`ok:true` without a positive sync wait means accepted, not fsync-confirmed, and
-returns `durable:false` with `synced:null`. `durable:true` is emitted only with
-`synced:true`. If an explicit wait expires, Ayder returns HTTP `503` with
-`error:"sync_timeout"`; the append may have been accepted and must be
-reconciled by its idempotency key or durable inspection before retrying.
+On the sealed path, a successful response is emitted only after local fsync and
+all-worker application, including when `timeout_ms` is omitted. The explicit
+receipt fields remain authoritative; `ok:true` alone is never durability proof.
+If an explicit wait expires, Ayder returns HTTP `503` with a typed durability or
+replication error; the append may have been accepted and must be reconciled by
+its idempotency key or durable inspection before retrying.
 
 ### `POST /broker/topics/:topic/produce-ndjson`
 
@@ -339,7 +340,7 @@ Query parameters:
 |---|---:|---|
 | `partition` | recommended | Target partition. |
 | `idempotency_key` | no | Deduplicates the whole batch. |
-| `timeout_ms` | no | Wait for sealed sync; required when the caller needs `durable:true`. |
+| `timeout_ms` | no | Positive bound for coordination/replication waits; omission remains synchronous on the sealed path. |
 
 Input rules:
 

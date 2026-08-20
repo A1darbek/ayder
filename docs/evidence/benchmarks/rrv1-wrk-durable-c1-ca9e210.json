@@ -1,0 +1,103 @@
+{
+  "schema_version": 1,
+  "status": "development_regression_evidence",
+  "timestamp_utc": "2026-08-20T16:44:00Z",
+  "git_sha": "ca9e210fa1e3b722af2c30bfc78fc328b86b419e",
+  "source": "clean git archive of git_sha",
+  "binary_sha256": "725d2a2717ecda41fee8ff7ef3f37d06881c7f88d1e06a0c251f4c2288bd8805",
+  "generator": "wrk debian/4.1.0-4+b1 closed-loop",
+  "wrk_sha256": "876abcb71f0a9fce5941eebf3c71a108aa9b4294c725df518b964b149ffad9a8",
+  "platform": "ARM64 WSL2 development benchmark",
+  "filesystem": "ext4 /dev/sdd",
+  "server": {
+    "workers": 4,
+    "cpuset": "0-3",
+    "aof": "always",
+    "ha_dedicated_worker": 0,
+    "rate_limit_disabled": true
+  },
+  "client": {
+    "threads": 1,
+    "connections": 1,
+    "cpuset": "4-7",
+    "warmup_seconds": 10,
+    "trial_seconds": 20,
+    "trials": 3,
+    "payload_bytes": 128
+  },
+  "receipt_contract": {
+    "durability_scope": "local",
+    "local_fsync": true,
+    "applied_all_workers": true,
+    "quorum_committed": false,
+    "failover_safe": false,
+    "durable": true,
+    "synced": true
+  },
+  "method_boundary": {
+    "fixed_rate_comparable": false,
+    "coordinated_omission_corrected": false,
+    "claim": "Closed-loop low-concurrency latency only; not fixed-rate capacity or an SLA."
+  },
+  "aggregate": {
+    "trial_count": 3,
+    "all_trials_clean": true,
+    "requests": 20828,
+    "valid_receipts": 20828,
+    "invalid_receipts": 0,
+    "http_4xx": 0,
+    "http_5xx": 0,
+    "socket_errors": 0,
+    "timeout_errors": 0,
+    "achieved_rps_median": 347.16,
+    "achieved_rps_min": 343.74,
+    "achieved_rps_max": 349.85,
+    "achieved_rps_pstdev": 2.5003244233943427,
+    "p50_ms_median": 2.747,
+    "p95_ms_median": 3.518,
+    "p99_ms_median": 5.522,
+    "p99_ms_min": 4.812,
+    "p99_ms_max": 15.755,
+    "p99_ms_pstdev": 4.999640409291675,
+    "p99_9_ms_median": 20.363,
+    "max_ms_median": 26.181
+  },
+  "trials": [
+    {
+      "trial": 1,
+      "achieved_rps": 349.85,
+      "p50_ms": 2.747,
+      "p95_ms": 3.453,
+      "p99_ms": 4.812,
+      "p99_9_ms": 9.636,
+      "max_ms": 16.615,
+      "requests": 7001,
+      "valid_receipts": 7001,
+      "errors": 0
+    },
+    {
+      "trial": 2,
+      "achieved_rps": 347.16,
+      "p50_ms": 2.736,
+      "p95_ms": 3.518,
+      "p99_ms": 15.755,
+      "p99_9_ms": 99.212,
+      "max_ms": 119.372,
+      "requests": 6949,
+      "valid_receipts": 6949,
+      "errors": 0
+    },
+    {
+      "trial": 3,
+      "achieved_rps": 343.74,
+      "p50_ms": 2.807,
+      "p95_ms": 3.548,
+      "p99_ms": 5.522,
+      "p99_9_ms": 20.363,
+      "max_ms": 26.181,
+      "requests": 6878,
+      "valid_receipts": 6878,
+      "errors": 0
+    }
+  ]
+}

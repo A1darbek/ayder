@@ -20,6 +20,9 @@ Focused correctness and short fault tests pass. A fixed-tree single-node
 SIGKILL drill recovered 100/100 acknowledged records. A distinct-binary cold-
 backup upgrade/rollback drill passed. The required performance matrix did not:
 it achieved only 308–382 RPS with roughly 19–20 second p99 and client timeouts.
+A standard-wrk one-connection check separately measured 5.522 ms median p99 at
+347.16 RPS, with one trial at 15.755 ms; it is closed-loop latency evidence and
+does not supersede the failed fixed-rate capacity test.
 
 ## Evidence index
 
@@ -27,7 +30,7 @@ it achieved only 308–382 RPS with roughly 19–20 second p99 and client timeou
 |---|---|---|
 | What is the architecture? | [Architecture](ARCHITECTURE.md) | HA is experimental pending final fault proof |
 | What does an acknowledgement mean? | [API reference](api-reference.md), [Production readiness](PRODUCTION_READINESS.md#durability-contract) | Local fsync and quorum/failover are separate fields |
-| What performance was measured? | [Benchmarks](BENCHMARKS.md), [machine JSON](evidence/benchmarks/rrv1-post-visibility-commitfix-wsl2.json) | ARM64 WSL2/ext4 development only; target missed |
+| What performance was measured? | [Benchmarks](BENCHMARKS.md), [fixed-rate JSON](evidence/benchmarks/rrv1-post-visibility-commitfix-wsl2.json), [closed-loop JSON](evidence/benchmarks/rrv1-wrk-durable-c1-ca9e210.json) | ARM64 WSL2/ext4 development only; fixed-rate target missed |
 | What correctness was tested? | [Revenue report](REVENUE_READINESS_V1.md#tests-and-analysis-run), [Jepsen suite](../tests/jepsen/README.md) | Short current-tree faults pass; full 45 pending |
 | What is the security model? | [Threat model](THREAT_MODEL.md), [Security policy](../SECURITY.md) | Internal hardening, not an independent audit |
 | What fuzz/sanitizer evidence exists? | [Revenue report](REVENUE_READINESS_V1.md#tests-and-analysis-run), [fuzz harness](../fuzz/) | 855 smoke executions; no long/AOF/HA campaign |
