@@ -47,7 +47,7 @@ jobs:
           AYDER_BIN: ./build/cmake/ayder
         run: |
           bash tests/regression/run_p0_durability_tests.sh
-          make security-test fuzz-smoke
+          make security-test fast-json-test fuzz-smoke
           bash tests/regression/cross_worker_visibility.sh
           bash tests/regression/cross_worker_apply_failure.sh
           bash tests/regression/idempotency_atomic_visibility.sh

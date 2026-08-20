@@ -6,6 +6,8 @@
 #include <string.h>
 #include <limits.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
 
 // Check for SIMD support and include appropriate headers
 #ifdef __AVX2__
@@ -200,6 +202,8 @@ typedef struct {
     size_t      error_pos;
 } json_parser_t;
 
+static inline void json_free(json_value_t* val);
+
 // Skip whitespace using SIMD
 static inline void skip_whitespace(json_parser_t* p) {
     while (p->ptr < p->end) {
@@ -244,6 +248,83 @@ static inline int parse_string(json_parser_t* p, string_view_t* out) {
 
 // Forward declaration
 static int parse_value(json_parser_t* p, json_value_t* out);
+
+static int parse_number(json_parser_t* p, json_value_t* out) {
+    const char *start = p->ptr;
+    const char *cur = start;
+    uint64_t magnitude = 0;
+    int negative = 0;
+    int is_double = 0;
+
+    if (cur < p->end && *cur == '-') {
+        negative = 1;
+        cur++;
+    }
+    if (cur >= p->end) return 0;
+
+    if (*cur == '0') {
+        cur++;
+        if (cur < p->end && *cur >= '0' && *cur <= '9') return 0;
+    } else if (*cur >= '1' && *cur <= '9') {
+        do {
+            cur++;
+        } while (cur < p->end && *cur >= '0' && *cur <= '9');
+    } else {
+        return 0;
+    }
+
+    if (cur < p->end && *cur == '.') {
+        is_double = 1;
+        cur++;
+        if (cur >= p->end || *cur < '0' || *cur > '9') return 0;
+        do {
+            cur++;
+        } while (cur < p->end && *cur >= '0' && *cur <= '9');
+    }
+
+    if (cur < p->end && (*cur == 'e' || *cur == 'E')) {
+        is_double = 1;
+        cur++;
+        if (cur < p->end && (*cur == '+' || *cur == '-')) cur++;
+        if (cur >= p->end || *cur < '0' || *cur > '9') return 0;
+        do {
+            cur++;
+        } while (cur < p->end && *cur >= '0' && *cur <= '9');
+    }
+
+    if (is_double) {
+        char number[128];
+        char *endptr = NULL;
+        size_t len = (size_t)(cur - start);
+        double value;
+
+        if (len >= sizeof(number)) return 0;
+        memcpy(number, start, len);
+        number[len] = '\0';
+        value = strtod(number, &endptr);
+        if (endptr != number + len || !isfinite(value)) return 0;
+        out->type = JSON_DOUBLE;
+        out->as.d = value;
+    } else {
+        const char *digits = start + negative;
+        uint64_t limit = negative ? (uint64_t)INT64_MAX + 1u : (uint64_t)INT64_MAX;
+
+        while (digits < cur) {
+            unsigned digit = (unsigned)(*digits++ - '0');
+            if (magnitude > (limit - digit) / 10u) return 0;
+            magnitude = magnitude * 10u + digit;
+        }
+        out->type = JSON_INT;
+        if (negative && magnitude == (uint64_t)INT64_MAX + 1u) {
+            out->as.i = INT64_MIN;
+        } else {
+            out->as.i = negative ? -(int64_t)magnitude : (int64_t)magnitude;
+        }
+    }
+
+    p->ptr = cur;
+    return 1;
+}
 
 static int parse_array(json_parser_t* p, json_value_t* out) {
     if (p->ptr >= p->end || *p->ptr != '[') return 0;
@@ -408,46 +489,18 @@ static int parse_value(json_parser_t* p, json_value_t* out) {
         // Array
         return parse_array(p, out);
     } else if ((c >= '0' && c <= '9') || c == '-') {
-        // Number - find end of number
-        const char* start = p->ptr;
-        if (c == '-') p->ptr++;
-
-        // Check if it's a floating-point number
-        char* dot_pos = strchr(p->ptr, '.');
-        while (p->ptr < p->end &&
-               (((*p->ptr >= '0') && (*p->ptr <= '9')) ||
-                (*p->ptr == '.') || (*p->ptr == 'e') || (*p->ptr == 'E') ||
-                (*p->ptr == '+') || (*p->ptr == '-'))) {
-            p->ptr++;
-        }
-
-        string_view_t num_str = {start, p->ptr - start};
-        if (dot_pos) {
-            double value;
-            if (sscanf(num_str.ptr, "%lf", &value) == 1) {
-                out->type = JSON_DOUBLE;
-                out->as.d = value;
-                return 1;
-            }
-        } else {
-            int value;
-            if (fast_parse_int(num_str, &value)) {
-                out->type = JSON_INT;
-                out->as.i = value;
-                return 1;
-            }
-        }
-    } else if (strncmp(p->ptr, "true", 4) == 0) {
+        return parse_number(p, out);
+    } else if ((size_t)(p->end - p->ptr) >= 4 && memcmp(p->ptr, "true", 4) == 0) {
         p->ptr += 4;
         out->type = JSON_BOOL;
         out->as.b = 1;
         return 1;
-    } else if (strncmp(p->ptr, "false", 5) == 0) {
+    } else if ((size_t)(p->end - p->ptr) >= 5 && memcmp(p->ptr, "false", 5) == 0) {
         p->ptr += 5;
         out->type = JSON_BOOL;
         out->as.b = 0;
         return 1;
-    } else if (strncmp(p->ptr, "null", 4) == 0) {
+    } else if ((size_t)(p->end - p->ptr) >= 4 && memcmp(p->ptr, "null", 4) == 0) {
         p->ptr += 4;
         out->type = JSON_NULL;
         return 1;
@@ -462,6 +515,7 @@ static int parse_value(json_parser_t* p, json_value_t* out) {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 static inline json_value_t* json_parse(const char* input, size_t len) {
+    if (!input) return NULL;
     json_parser_t parser = {
             .input = input,
             .ptr = input,
@@ -472,6 +526,12 @@ static inline json_value_t* json_parse(const char* input, size_t len) {
     json_value_t* result = slab_alloc(sizeof(json_value_t));
     if (!parse_value(&parser, result)) {
         slab_free(result);
+        return NULL;
+    }
+
+    skip_whitespace(&parser);
+    if (parser.ptr != parser.end) {
+        json_free(result);
         return NULL;
     }
 

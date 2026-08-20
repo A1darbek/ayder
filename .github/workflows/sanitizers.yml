@@ -36,6 +36,16 @@ jobs:
             -fsanitize=address,undefined \
             -luv -lz -luring -lm -lcurl -lssl -lcrypto -pthread
 
+      - name: Run bounded JSON regression under sanitizers
+        run: |
+          clang -std=gnu11 -O1 -g -fno-omit-frame-pointer \
+            -fsanitize=address,undefined -Wall -Wextra -Wshadow -Wpedantic -Werror \
+            -I./src tests/security/fast_json_bounds_test.c src/slab_alloc.c \
+            -o fast-json-sanitize -lm
+          ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 \
+            UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+            ./fast-json-sanitize
+
       - name: Run API smoke under sanitizers
         env:
           ASAN_OPTIONS: detect_leaks=1:halt_on_error=1:strict_string_checks=1

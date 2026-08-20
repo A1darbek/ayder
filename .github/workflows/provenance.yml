@@ -71,7 +71,7 @@ jobs:
       - name: Generate binary SPDX SBOM
         uses: anchore/sbom-action@43a17d6e7add2b5535efe4dcae9952337c479a93 # v0.20.11
         with:
-          path: build/release/ayder
+          path: dist/stage/ayder-linux-${{ matrix.arch }}
           format: spdx-json
           output-file: dist/ayder-${{ matrix.arch }}.spdx.json
           upload-artifact: false

@@ -13,6 +13,8 @@ BUILD_DIR?=build
 ANALYSIS_CPPFLAGS=-I./include -I./src -Ideps/picohttpparser -DHTTP_SERVER_FAST
 SECURITY_TEST_SRCS=tests/security/http_framing_test.c src/http_framing.c deps/picohttpparser/picohttpparser.c
 SECURITY_TEST_BIN=$(BUILD_DIR)/security/http_framing_test
+FAST_JSON_TEST_SRCS=tests/security/fast_json_bounds_test.c src/slab_alloc.c
+FAST_JSON_TEST_BIN=$(BUILD_DIR)/security/fast_json_bounds_test
 SANITIZE_FLAGS=-fsanitize=address,undefined -fno-omit-frame-pointer
 SANITIZE_CFLAGS=-std=gnu11 -O1 -g -Wall -Wextra -Wshadow $(SANITIZE_FLAGS)
 SANITIZE_TEST_BIN=$(BUILD_DIR)/sanitize/http_framing_test
@@ -43,7 +45,14 @@ $(SECURITY_TEST_BIN): $(SECURITY_TEST_SRCS) src/http_framing.h
 	$(CC) $(ANALYSIS_CPPFLAGS) -std=c11 -O2 -g -Wall -Wextra -Wpedantic -Werror $(SECURITY_TEST_SRCS) -o $@
 
 security-test: $(SECURITY_TEST_BIN)
-	./$(SECURITY_TEST_BIN)
+	$(SECURITY_TEST_BIN)
+
+$(FAST_JSON_TEST_BIN): $(FAST_JSON_TEST_SRCS) src/fast_json.h src/slab_alloc.h
+	mkdir -p $(dir $@)
+	$(CC) $(ANALYSIS_CPPFLAGS) -std=gnu11 -O2 -g -Wall -Wextra -Wshadow -Wpedantic -Werror $(FAST_JSON_TEST_SRCS) -o $@ -lm
+
+fast-json-test: $(FAST_JSON_TEST_BIN)
+	$(FAST_JSON_TEST_BIN)
 
 $(SANITIZE_TEST_BIN): $(SECURITY_TEST_SRCS) src/http_framing.h
 	mkdir -p $(dir $@)
@@ -54,7 +63,7 @@ $(SANITIZE_BIN): $(SRC) src/http_framing.h
 	$(CC) $(ANALYSIS_CPPFLAGS) $(SANITIZE_CFLAGS) $(SRC) -o $@ $(SANITIZE_FLAGS) $(LDLIBS)
 
 sanitize: $(SANITIZE_BIN) $(SANITIZE_TEST_BIN)
-	ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 ./$(SANITIZE_TEST_BIN)
+	ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 $(SANITIZE_TEST_BIN)
 
 static-analysis:
 	mkdir -p $(BUILD_DIR)/static
@@ -79,7 +88,7 @@ $(FUZZ_SMOKE_BIN): $(FUZZ_SRCS) fuzz/http_framing_standalone.c src/http_framing.
 	$(CC) $(ANALYSIS_CPPFLAGS) -std=c11 -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -Wall -Wextra -Wpedantic -Werror $(FUZZ_SRCS) fuzz/http_framing_standalone.c -o $@
 
 fuzz-smoke: $(FUZZ_SMOKE_BIN)
-	ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 ./$(FUZZ_SMOKE_BIN) fuzz/corpus/http_framing/*.req
+	ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 $(FUZZ_SMOKE_BIN) fuzz/corpus/http_framing/*.req
 
 $(HARDENED_BIN): $(SRC) src/http_framing.h
 	mkdir -p $(dir $@)
@@ -112,4 +121,4 @@ cold-backup-test: $(EXEC)
 clean:
 	rm -f $(OBJ) $(EXEC)
 
-.PHONY: debug clean security-test sanitize static static-analysis fuzz fuzz-smoke hardened portable security-raw-test cross-worker-test raft-safety-test idempotency-test cold-backup-test
+.PHONY: debug clean security-test fast-json-test sanitize static static-analysis fuzz fuzz-smoke hardened portable security-raw-test cross-worker-test raft-safety-test idempotency-test cold-backup-test

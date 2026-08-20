@@ -23,7 +23,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-for tool in curl jq; do
+for tool in curl jq realpath; do
   command -v "${tool}" >/dev/null 2>&1 || {
     printf 'missing required tool: %s\n' "${tool}" >&2
     exit 2
@@ -33,6 +33,7 @@ done
   printf 'Ayder binary not found: %s (run make first)\n' "${AYDER_BIN}" >&2
   exit 2
 }
+AYDER_BIN="$(realpath -e -- "${AYDER_BIN}")"
 
 (
   cd "${RUN_DIR}"

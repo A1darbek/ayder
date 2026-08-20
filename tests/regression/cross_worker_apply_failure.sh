@@ -31,7 +31,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-for tool in curl jq setsid; do
+for tool in curl jq realpath setsid; do
   command -v "${tool}" >/dev/null 2>&1 || {
     printf 'missing required tool: %s\n' "${tool}" >&2
     exit 2
@@ -41,6 +41,7 @@ done
   printf 'Ayder binary not found: %s\n' "${AYDER_BIN}" >&2
   exit 2
 }
+AYDER_BIN="$(realpath -e -- "${AYDER_BIN}")"
 
 start_server() {
   local inject_failure="${1:-0}"

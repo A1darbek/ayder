@@ -44,7 +44,8 @@ int rf_broker_apply_aof_checked(uint32_t rec_id, const void *data,
 static void alarm_failed(int sig) {
     (void)sig;
     static const char message[] = "FAIL sealed replay did not terminate\n";
-    (void)write(STDERR_FILENO, message, sizeof(message) - 1);
+    ssize_t written = write(STDERR_FILENO, message, sizeof(message) - 1);
+    (void)written;
     _exit(124);
 }
 
