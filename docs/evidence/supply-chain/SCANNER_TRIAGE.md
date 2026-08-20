@@ -1,6 +1,7 @@
 # Scanner triage — 2026-08-16
 
-This is an internal dirty-tree scan, not a clean-release attestation. Scanner
+The all-severity detail below is an internal dirty-tree scan, not a clean-
+release attestation. Scanner
 release archives were downloaded from their official GitHub releases and
 matched against the published SHA-256 checksum files before use.
 
@@ -53,12 +54,21 @@ The main glibc and musl server images have readiness healthchecks. The two
 remaining LOW benchmark-client findings are accepted as non-runtime tooling
 image behavior; they do not justify a broad scanner ignore.
 
+## Clean-candidate rerun
+
+The hosted supply-chain workflow passed on clean commit `2e334d1` on
+2026-08-20. Its enforced HIGH/CRITICAL Trivy scan reported zero vulnerabilities
+and zero misconfigurations for all scanned targets; complete-history Gitleaks
+reported no leaks; and the source SPDX artifact/checksum uploaded successfully.
+See [clean-commit evidence](CLEAN_COMMIT_2e334d1.md). The local scan above
+remains the source for accepted MEDIUM/LOW findings because the hosted release
+gate intentionally enforces HIGH/CRITICAL severity.
+
 ## Evidence and release boundary
 
 Raw redacted JSON and checksums are retained locally under
-`bench/results/rrv1-supply-chain-20260816/`. Because HEAD does not describe the
-dirty working tree, these results do not satisfy the clean-candidate release
-gate. The pinned CI workflows must rerun Gitleaks, Trivy, CodeQL, SBOM, build,
-sanitizers, and tests on the final clean commit. Release provenance and signed
-Sigstore bundles are produced only by the GitHub OIDC workflow; this local run
-has neither an identity-bearing signature nor provenance.
+`bench/results/rrv1-supply-chain-20260816/`. Those local outputs remain unsigned
+and do not describe a clean source commit. The separate clean-candidate run and
+verified Sigstore bundles satisfy the repository gate for exact commit
+`2e334d1`; neither evidence set extends to later source, built container/runtime
+packages, or a signed release tag.

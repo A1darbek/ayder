@@ -96,6 +96,13 @@ requests GitHub/Sigstore provenance and SBOM attestations. Definitions alone are
 not evidence that a specific commit passed or was attested: use the immutable
 GitHub Actions run and verify its bundles for the exact artifact digest.
 
+Clean candidate `2e334d1` passed native ARM64/amd64 build/security, CodeQL,
+Trivy, Gitleaks and SPDX gates. Both checksummed package archives have verified
+SLSA provenance and SPDX SBOM Sigstore bundles. Exact immutable runs, archive
+digests and offline verification commands are in
+[`CLEAN_COMMIT_2e334d1.md`](docs/evidence/supply-chain/CLEAN_COMMIT_2e334d1.md).
+This is exact-candidate evidence, not a third-party audit or release policy.
+
 For local evidence generation, [`scripts/supply-chain/generate_local_evidence.sh`](scripts/supply-chain/generate_local_evidence.sh)
 uses an installed Syft CLI to create an SPDX JSON source-tree SBOM and records
 SHA-256 checksums plus dirty-tree/tool metadata. That output is unsigned and is

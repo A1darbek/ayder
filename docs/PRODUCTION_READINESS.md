@@ -1,6 +1,6 @@
 # Production readiness
 
-Evidence date: 2026-08-16. This is a technical gate, not an SLA or
+Evidence updated: 2026-08-20. This is a technical gate, not an SLA or
 certification. The fixed implementation has materially stronger correctness,
 but required final-candidate and target-infrastructure evidence is incomplete.
 
@@ -20,7 +20,7 @@ but required final-candidate and target-infrastructure evidence is incomplete.
 | Observability | GREEN for evaluation | Config, 14 rules, dashboard, live metric lint pass | Pilot threshold tuning and retention/integration |
 | Backup/restore | YELLOW | Checksummed cold backup/restore regression and real drill pass | No online/point-in-time backup or compatibility support window |
 | Upgrade/rollback | YELLOW | Distinct old/fixed binary cold-backup rollback drill pass | No rolling or mixed-version HA contract |
-| Supply chain | RED | Local Trivy/Gitleaks/Syft triage and SHA-pinned workflow definitions | Clean pushed candidate, CodeQL/CI, issued signatures/provenance |
+| Supply chain | GREEN for candidate | Clean pushed candidate passed native ARM64/amd64 CI, CodeQL, sanitizers, Trivy/Gitleaks/SPDX and verified SLSA/SBOM attestations | Release-tag policy, image/runtime inventory and staffed patch process |
 
 ## Durability contract
 
@@ -96,11 +96,14 @@ downgrades are not supported claims.
   fingerprints for removed, public development-only keys;
 - Syft source/binary SPDX documents validate and are checksummed;
 - third-party Actions are pinned to reviewed commit SHAs;
-- ARM64/amd64 provenance workflow requests GitHub OIDC-backed provenance and
-  SBOM attestations.
+- clean commit `2e334d1` passed native ARM64/amd64 CI, CodeQL, sanitizers,
+  Trivy/Gitleaks/source SPDX, and issued GitHub OIDC-backed SLSA and SBOM
+  attestations. Checksums and offline verification are recorded in
+  [clean-commit evidence](evidence/supply-chain/CLEAN_COMMIT_2e334d1.md).
 
-These are dirty-tree local results and validated definitions. Clean-commit
-CodeQL, CI, SBOM, signatures and provenance must exist before release.
+The local triage remains useful all-severity detail. The clean-candidate hosted
+gates and identity-bearing bundles now exist for the exact documented commit;
+they do not cover later commits, container/runtime packages or release policy.
 
 ## Pilot checklist
 
@@ -121,7 +124,7 @@ All checked items require candidate-specific evidence, not only documentation.
 - [ ] Unique bearer tokens are provisioned, rotated and redacted.
 - [ ] HA nodes use pilot-owned unique mTLS identities and CA.
 - [ ] Metrics/admin ingress is authenticated and network-restricted.
-- [ ] Final CodeQL/Trivy/Gitleaks/SBOM jobs pass and findings are signed off.
+- [x] Candidate CodeQL/Trivy/Gitleaks/SBOM jobs pass and findings are triaged.
 - [ ] Security owner and patch/incident process are assigned.
 
 ### Operations
@@ -137,7 +140,7 @@ All checked items require candidate-specific evidence, not only documentation.
 ### Evidence and claims
 
 - [ ] Native target-like ARM64 or amd64 benchmark/crash suite completed.
-- [ ] Release checksum/SBOM/provenance bundles issued and retained.
+- [x] Candidate checksum/SBOM/provenance bundles issued, downloaded and verified.
 - [ ] Buyer documentation references the same candidate and configuration.
 - [ ] No unsupported SLA, certification, zero-loss, exactly-once, 50k RPS, or
   universal Raft-safety claim appears in release material.

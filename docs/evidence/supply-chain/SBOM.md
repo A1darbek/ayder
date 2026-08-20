@@ -31,5 +31,8 @@ For a clean commit, the
 generates and uploads an SPDX artifact and checksum. The
 [`Release provenance`](../../../.github/workflows/provenance.yml) workflow
 builds ARM64 and amd64 artifacts and requests GitHub OIDC-backed provenance and
-SBOM attestations. Workflow definitions and this dirty-tree local run are not
-proof that a candidate has passed or that an attestation has been issued.
+SBOM attestations. On 2026-08-20 those workflows passed for clean commit
+`2e334d1`; source SPDX and checksums were retained, and both native packages had
+verified SLSA provenance and SPDX SBOM attestations. See
+[clean-commit evidence](CLEAN_COMMIT_2e334d1.md). The earlier dirty-tree local
+catalogs remain unsigned and must not be substituted for those exact artifacts.

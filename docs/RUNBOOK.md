@@ -24,9 +24,10 @@ Install the dependencies and build as described in
 6. create a dedicated unprivileged account and a private writable data directory.
 
 The repository defines a repeatable checksummed ARM64/amd64 build and GitHub
-OIDC/Sigstore attestation workflow, but no final candidate bundle has yet been
-issued and verified. Do not substitute an unverified binary merely because its
-filename matches.
+OIDC/Sigstore attestation workflow. Candidate `2e334d1` has issued and verified
+native bundles; use the exact digests and verification policy in
+[clean-commit evidence](evidence/supply-chain/CLEAN_COMMIT_2e334d1.md). Do not
+substitute an unverified binary merely because its filename matches.
 When Syft is installed, the local evidence helper can record a source SPDX SBOM,
 artifact checksum, tool version, and dirty-tree state without committing its
 outputs:

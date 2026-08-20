@@ -5,8 +5,8 @@ marketing page, certification, penetration-test report, SLA, or production
 approval.
 
 **Current gate: RED. Paid real-data production pilot: blocked. READY TO MERGE:
-NO.** The full post-change 45-run Jepsen campaign, native target-storage tests,
-and final clean-commit CI/provenance are pending.
+NO.** The full post-change 45-run Jepsen campaign and native target-storage
+tests are pending. Clean-candidate CI and provenance pass for `2e334d1`.
 
 ## Executive summary
 
@@ -36,7 +36,7 @@ does not supersede the failed fixed-rate capacity test.
 | What fuzz/sanitizer evidence exists? | [Revenue report](REVENUE_READINESS_V1.md#tests-and-analysis-run), [fuzz harness](../fuzz/) | 855 smoke executions; no long/AOF/HA campaign |
 | What can operators observe? | [Observability](OBSERVABILITY.md), [Prometheus](../deploy/prometheus/), [Grafana](../deploy/grafana/) | 14 example rules validate; tune thresholds per pilot |
 | How are incidents/recovery handled? | [Runbook](RUNBOOK.md) | Online backup/GC and rolling upgrades unsupported |
-| What supply-chain evidence exists? | [Scanner triage](evidence/supply-chain/SCANNER_TRIAGE.md), [SBOM status](evidence/supply-chain/SBOM.md), [workflows](../.github/workflows/) | Local dirty-tree pass; final issued attestations pending |
+| What supply-chain evidence exists? | [Clean candidate](evidence/supply-chain/CLEAN_COMMIT_2e334d1.md), [scanner triage](evidence/supply-chain/SCANNER_TRIAGE.md), [SBOM status](evidence/supply-chain/SBOM.md) | Exact-commit artifacts verified; not a release tag or runtime-image inventory |
 | What enterprise gaps remain? | [Enterprise matrix](ENTERPRISE_READINESS.md) | No cloud/certification/compliance claim |
 
 ## Exact evidence highlights
@@ -59,7 +59,8 @@ does not supersede the failed fixed-rate capacity test.
   upgrade and restored rollback behavior passed.
 - Supply chain: zero final Trivy vulnerabilities, zero HIGH/CRITICAL
   misconfigurations, and zero unsuppressed Gitleaks history findings; source
-  and binary SPDX documents validate.
+  and binary SPDX documents validate. Native archives have checked SHA-256,
+  verified SLSA provenance and verified SPDX SBOM attestations.
 
 ## Buyer evaluation checklist
 
@@ -70,7 +71,7 @@ does not supersede the failed fixed-rate capacity test.
 - [ ] Pilot explicitly chooses local versus quorum acknowledgement semantics.
 - [ ] Pilot-owned TLS/PKI, bearer rotation and metrics/admin network policy are
   configured.
-- [ ] Clean CodeQL/build/sanitizer/scanner/SBOM CI passes; checksum and Sigstore
+- [x] Clean CodeQL/build/sanitizer/scanner/SBOM CI passes; checksum and Sigstore
   provenance bundles are issued and retained.
 - [ ] Backup cadence, restore validation, upgrade/rollback window and incident
   owner are accepted.

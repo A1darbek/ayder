@@ -194,7 +194,9 @@ Material open items include:
 - cold backup/restore, distinct-binary rollback and one narrow crash RPO/RTO
   drill pass, but online backup, rolling upgrade and target-scale DR remain
   unsupported; and
-- final native Linux ARM64/amd64 performance and workflow evidence is pending.
+- final native target-storage ARM64/amd64 performance remains pending; hosted
+  native ARM64/amd64 build, security, scanner and provenance evidence passes
+  for the documented clean candidate.
 
 The complete gate and gap matrix are in
 [Revenue Readiness v1](docs/REVENUE_READINESS_V1.md) and

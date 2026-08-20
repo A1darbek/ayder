@@ -1,6 +1,6 @@
 # Enterprise readiness gap matrix
 
-Assessment date: 2026-08-16. Scope: repository-level technical readiness for a
+Assessment date: 2026-08-20. Scope: repository-level technical readiness for a
 bounded pilot evaluation. This is not AWS or Microsoft approval, a third-party
 audit, penetration test, SOC 2/ISO/NIST certification, legal advice, or a claim
 of production use.
@@ -22,7 +22,8 @@ may accept more gaps with written risk acceptance.
 Current technical gate: **RED; READY TO MERGE: NO**. The identified cross-worker,
 durable-state/protocol, receipt and idempotency defects have focused passing
 regressions, but the mandatory full post-change Jepsen campaign, native target
-storage evidence and final clean-commit CI/provenance remain blockers.
+storage evidence and pilot operational controls remain blockers. Clean-candidate
+CI/provenance now passes for exact commit `2e334d1`.
 
 ## Security
 
@@ -41,7 +42,7 @@ storage evidence and final clean-commit CI/provenance remain blockers.
 | CORS | IMPLEMENTED | Default emits no origin; exact configured origin and suffix rejection pass live tests | Browser clients still need reviewed TLS/token/CSRF policy | Retain exact-origin regressions and document browser deployment | NO if browser access is disabled |
 | Secrets handling | PARTIAL | Container requires injected token; benchmark capture redacts sensitive names; tracked fixtures are removed; Gitleaks reports zero unsuppressed findings after exact historical fingerprints | Removed development keys remain public/compromised in history; no dedicated security mailbox | Never reuse fixtures; provision pilot PKI; retain fingerprint-specific triage and assign monitored security owner | YES |
 | Audit logging | GAP | Human logs can be externally collected | No complete structured, immutable security/admin audit trail | Define events/schema/redaction/retention and protected sink | Depends on pilot, usually YES |
-| Request validation | PARTIAL | 237 pure framing checks, 27 raw cases, 31 live smoke checks on normal/hardened/sanitized binaries, route validation, and fuzz-smoke pass | Long fuzzing plus AOF/HA decoder coverage and immutable final-run evidence absent | Run long/decoder campaigns and final CI; triage every finding | YES |
+| Request validation | PARTIAL | 237 pure framing checks, 27 raw cases, 32-route API smoke and 25 live security checks pass; clean-candidate native/sanitizer CI passes | Long fuzzing plus AOF/HA decoder coverage absent | Run long/decoder campaigns; triage every finding | YES |
 | DoS/resource controls | PARTIAL | Header/body/idle/absolute deadlines, active connection cap, limits, rate control, and backpressure pass focused live tests | Distributed saturation/fail-open policy and target-topology capacity evidence absent | Define overload policy and run topology-specific exhaustion tests | YES |
 | Dependency security | PARTIAL | SBOM/CVE workflow and checksummed libuv download in main Dockerfile | System dependencies and musl fallback/mutable downloads are not fully locked/scanned | Pin all sources/checksums; scan built images and runtime packages | YES |
 | Vulnerability disclosure | PARTIAL | [`SECURITY.md`](../SECURITY.md) defines a private GitHub path and disclosure expectations | No dedicated monitored security mailbox or response SLA | Enable/test private reporting; assign owners/on-call | YES for paid pilot |
@@ -52,18 +53,18 @@ storage evidence and final clean-commit CI/provenance remain blockers.
 | CONTROL / EXPECTATION | CURRENT STATUS | EVIDENCE | GAP | ACTION | BLOCKS PILOT? YES/NO |
 | --- | --- | --- | --- | --- | --- |
 | Dependency inventory | PARTIAL | Makefile/Dockerfiles name direct system libraries; source SBOM workflow exists | No reviewed transitive/runtime inventory for a final artifact | Archive source and image SBOMs per release | YES |
-| SPDX/CycloneDX SBOM | PARTIAL | Syft 1.51.0 generated/validated 143-package source and one-package binary dirty-tree SPDX catalogs; workflow emits clean-commit artifacts | Local output is unsigned and not a final image/runtime inventory | Run, review, sign, and retain clean source/image SBOMs | YES |
-| CVE scanning | PARTIAL | Trivy 0.74.0 final local scan reports zero vulnerabilities and zero HIGH/CRITICAL misconfigurations after remediation | Dirty-tree filesystem scan has limited compiled-system-library visibility; no final image scan | Run clean candidate and built-image/package scans under triage policy | YES |
-| Secret scanning | PARTIAL | Gitleaks 8.30.1 scanned all 131 commits with zero unsuppressed findings; eight removed public fixture keys have exact fingerprint exceptions | Final clean candidate CI and staffed rotation/response process pending | Enforce scan and never broaden the historical exceptions | YES |
-| CodeQL C/C++ | PENDING EVIDENCE | `codeql.yml` initializes `c-cpp` and performs a manual build | No passing result or finding triage for final commit | Run on PR/default branch and retain results | YES |
-| Static analysis | PARTIAL | GCC `-fanalyzer` passes framing, tests, HTTP, storage and AOF; warning-as-error build passes; CodeQL defined | Clang-tidy unavailable and no final CodeQL triage | Run CodeQL/other analyzers on candidate | YES for high-impact findings |
-| ASan/UBSan | PARTIAL | GCC ASan+UBSan parser, fuzz-smoke, route, and live security paths pass without diagnostics | Forked live leak detection disabled; TSan and immutable candidate run absent | Run final candidate; add focused TSan where feasible | YES |
-| Reproducible/repeatable release | PARTIAL | Portable warning-clean ARM64/amd64 build and deterministic packaging/provenance workflow defined | Mutable OS packages and no completed final workflow run | Pin/record build image and retain final manifest/artifacts | YES |
+| SPDX/CycloneDX SBOM | IMPLEMENTED/PARTIAL | Clean source SPDX plus native binary SPDX documents were retained; both binary SBOM attestations verify | No built-image/runtime package inventory or signed release-tag policy | Add and retain image/runtime SBOMs per release | YES |
+| CVE scanning | PARTIAL | Clean-candidate Trivy HIGH/CRITICAL gate reports zero vulnerabilities/misconfigurations; all-severity local triage is retained | Filesystem scan has limited compiled-system-library visibility; no final image scan | Add built-image/package scans under triage policy | YES |
+| Secret scanning | IMPLEMENTED/PARTIAL | Clean-candidate complete-history Gitleaks passes; eight removed public fixture keys have exact fingerprint exceptions | Staffed rotation/response process pending | Enforce scan and never broaden historical exceptions | YES |
+| CodeQL C/C++ | IMPLEMENTED for candidate | Clean commit `2e334d1` CodeQL C/C++ run passes | No organizational triage SLA or protected-branch requirement documented | Require the gate and retain results per release | YES for high-impact findings |
+| Static analysis | IMPLEMENTED/PARTIAL | GCC `-fanalyzer`, warning-as-error native builds and clean-candidate CodeQL pass | Clang-tidy unavailable and analyzer coverage is not exhaustive | Expand analyzers on high-risk code | YES for high-impact findings |
+| ASan/UBSan | IMPLEMENTED/PARTIAL | Clean-candidate Clang ASan/UBSan bounded JSON, API and live HTTP gates pass; GCC paths also pass locally | Forked live leak detection disabled; TSan absent | Add focused TSan and long sanitizer campaigns | YES |
+| Reproducible/repeatable release | IMPLEMENTED/PARTIAL | Native ARM64/amd64 deterministic packages, checksums, build info and attestations issued for `2e334d1` | Mutable OS packages and no protected release/tag lifecycle | Pin/record build image and define artifact retention/release policy | YES |
 | Source-to-binary traceability | GAP | Operators can record commit and SHA manually | Binary does not provide embedded version/build metadata; no automated manifest | Embed/version safely and publish commit/toolchain/hash manifest | YES |
-| SHA-256 checksums | PARTIAL | Dockerfile verifies libuv; release workflow creates artifact checksums | No published final-candidate checksum bundle | Complete workflow and retain signed bundle | YES |
-| Signed release artifacts | PENDING EVIDENCE | GitHub OIDC/Sigstore attestation bundles are defined | No final workflow-issued bundle exists | Run protected candidate workflow and publish verification instructions | Usually YES |
-| Provenance | PENDING EVIDENCE | ARM64/amd64 workflow requests provenance and SBOM attestations | Definition is not an issued attestation | Complete and verify controlled final run | Usually YES |
-| Immutable CI dependencies | IMPLEMENTED/PARTIAL | Third-party Actions are pinned to commit SHAs and actionlint passes | Review/update ownership and final run pending | Automate reviewed updates | YES |
+| SHA-256 checksums | IMPLEMENTED for candidate | Both native archive manifests verify; exact digests are documented | No signed release-tag/channel policy | Retain per release and expose through the approved channel | YES |
+| Signed release artifacts | IMPLEMENTED for candidate | GitHub OIDC/Sigstore SLSA and SPDX bundles verify offline for both archives | Candidate branch artifact, not a protected signed release tag | Define protected release process and retention | Usually YES |
+| Provenance | IMPLEMENTED for candidate | Verified statements bind archive digest, source commit, repository and signer workflow | Builder OS packages remain mutable | Pin builders/dependencies further and repeat per release | Usually YES |
+| Immutable CI dependencies | IMPLEMENTED/PARTIAL | Third-party Actions are pinned to commit SHAs and clean-candidate runs pass | Review/update ownership pending | Automate reviewed updates | YES |
 | Patch/vulnerability cadence | EXTERNAL/GAP | Scheduled CodeQL/scanner jobs are declared | No staffed triage cadence, SLAs, or release channel | Assign security owner and documented severity deadlines | YES |
 
 Workflow presence does not make the supply chain secure. A reviewer needs the
@@ -74,13 +75,13 @@ and provenance for the candidate artifact.
 
 | CONTROL / EXPECTATION | CURRENT STATUS | EVIDENCE | GAP | ACTION | BLOCKS PILOT? YES/NO |
 | --- | --- | --- | --- | --- | --- |
-| HTTP framing harness | IMPLEMENTED | `fuzz/http_framing_fuzz.c`, corpus/dictionary; ASan+UBSan standalone smoke ran 855 executions | No long coverage-guided campaign; result is a dirty-tree snapshot | Run/retain a long final campaign with exact duration/findings | YES until final clean campaign |
+| HTTP framing harness | IMPLEMENTED | `fuzz/http_framing_fuzz.c`, corpus/dictionary; clean-candidate native CI ran the 855-execution ASan+UBSan smoke | No long coverage-guided campaign | Run/retain a long campaign with exact duration/findings | YES until long campaign |
 | TE/CL, duplicate/malformed CL, chunk overflow/malformed chunks | IMPLEMENTED | 237 pure checks and 27 hardened raw-socket cases pass | Future parser changes require the same adversarial suite | Enforce in CI and retain final logs | NO for isolated evaluation |
-| Header/body/count/fragmentation/auth/CORS/metrics/slow-client tests | IMPLEMENTED/PARTIAL | 31-check smoke passes normal, hardened and sanitized binaries, including shutdown; focused raw security has 27/27 | Target-topology distributed exhaustion and long campaigns remain | Retain final run and add topology load tests | YES for production pilot |
+| Header/body/count/fragmentation/auth/CORS/metrics/slow-client tests | IMPLEMENTED/PARTIAL | 32-route API and 25-case live security smoke pass normal/sanitized paths, including shutdown; raw security is 27/27 | Target-topology distributed exhaustion and long campaigns remain | Add topology load tests | YES for production pilot |
 | Persistence/AOF decode fuzzing | GAP | Defensive checks exist in persistence code | No isolated committed harness/corpus evidence identified in this review | Extract pure decoder boundary and fuzz under sanitizers | YES |
 | HA network frame fuzzing | GAP | HA bounds/TLS checks exist | No committed HA frame fuzz harness/corpus evidence identified | Fuzz pre-auth and post-auth frame decoder boundaries | YES for HA |
 | HA TLS identity rejection | PARTIAL | Node-ID/connection-binding source contract and negative identity test pass | Wrong-CA/expiry/rotation/fault campaign absent | Execute complete certificate lifecycle/fault matrix | YES for HA |
-| CI fuzz smoke and overnight commands | PARTIAL | Smoke/coverage targets and long command documented; 855-execution smoke passed locally | No final CI artifact or overnight result | Record exact final duration and findings | YES for final smoke; long campaign risk-based |
+| CI fuzz smoke and overnight commands | PARTIAL | Smoke/coverage targets and long command documented; clean-candidate ARM64/amd64 CI passed 855 executions | No overnight result | Record long-run duration and findings | Long campaign risk-based |
 
 ## Operability and SRE
 
@@ -118,8 +119,8 @@ and provenance for the candidate artifact.
 | Generic Linux VM | PARTIAL | systemd/least-privilege example in runbook | No packaged install, automated validation, or support matrix | Test supported distro/kernel/filesystem matrix | YES |
 | AWS EC2 | GAP/PARTIAL | Generic private-VM guidance applies | No AMI/CloudFormation/image pipeline or AWS validation | Build hardened AMI path and validate official checklist | YES for AWS offer |
 | Azure VM | GAP/PARTIAL | Generic private-VM guidance applies | No managed image/VHD/ARM template/Azure Agent/certification | Build Azure image path and validate Partner Center requirements | YES for Azure offer |
-| linux/arm64 | PARTIAL | Normal/hardened/portable/sanitized builds and normal/sanitize/portable route smoke pass locally; public-preview hosted workflow exists | WSL2 is not native target-cloud evidence; no clean release artifact | Retain green native/cloud runs and release artifact | YES for ARM offer |
-| linux/amd64 | PENDING EVIDENCE | Ubuntu x86-64 CI workflow defined | No passing final run is asserted | Run and retain build/smoke/security evidence | YES |
+| linux/arm64 | PARTIAL | Native hosted ARM64 warning-clean build, regressions, API smoke and attested package pass | Hosted runner is not native target-storage performance/crash evidence | Run identical target-storage benchmark/crash/DR suite | YES for ARM offer |
+| linux/amd64 | PARTIAL | Native hosted amd64 warning-clean build, regressions, API smoke and attested package pass | No target-storage performance/crash evidence | Run identical target-storage benchmark/crash/DR suite | YES |
 | Repository quality | PARTIAL | README/quickstart/API plus architecture, security, threat, observability, runbook, readiness, and contribution docs | Cross-linking, issue templates, release notes/changelog, ownership metadata remain | Final technical edit and buyer walkthrough | NO for evaluation; YES for mature support |
 
 ## Official AWS Marketplace research
@@ -152,7 +153,8 @@ These are helpful inputs, not proof of AMI compliance:
 - private-network/TLS/least-privilege VM guidance;
 - native x86-64/public-preview ARM64 build workflow and architecture-aware
   benchmark methodology; and
-- security, sanitizer, CodeQL, SBOM, CVE, and secret workflows awaiting runs.
+- clean-candidate native build, sanitizer, CodeQL, SBOM, CVE, secret and
+  provenance workflows pass; target AMI validation remains absent.
 
 ### AWS category B — implementable technical gaps
 
@@ -255,9 +257,9 @@ completed controls or certifications.
 1. **Complete correctness evidence:** run the full strict 45-run Jepsen campaign,
    longer acknowledged-ledger/idempotency/commit faults, and power/storage-error
    recovery against the fixed candidate.
-2. **Make evidence immutable:** run build/CodeQL/SBOM/CVE/secret jobs on a clean
-   commit; retain scanner triage and publish the issued checksum/SBOM/provenance
-   bundle.
+2. **Operationalize immutable evidence:** protect release/tag workflows, define
+   retention and triage ownership, and repeat checksum/SBOM/provenance
+   verification for every released artifact digest.
 3. **Prove target operations:** repeat backup/restore, distinct-binary rollback,
    shutdown and pilot-specific RPO/RTO drills at target data scale/topology.
 4. **Close telemetry gaps:** validate/baseline HTTP latency; add disk/error

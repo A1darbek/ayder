@@ -85,7 +85,7 @@ They still require deployment controls and incident response.
 | Cross-worker state divergence | Pending/ready topic publication and worker-bus mutation application are acknowledged only after all workers apply; failure/replay regressions pass. | Longer multiworker saturation/restart campaigns remain required. |
 | Replayed/forged consensus messages | Peer mTLS identity is connection-bound; header bounds/CRC, stale-term/log-recency/previous-term validation and per-peer vote deduplication are tested. | Full post-change Jepsen and power/storage-fault evidence are pending; no broad Raft safety claim yet. |
 | Idempotency-key collision or reuse | SHA-256 payload-bound, process-shared serialized durable `PENDING`/`COMMITTED` state rejects another payload and resolves uncertain durable records. | Longer HA/concurrent-fault coverage and external-effect reconciliation remain application responsibilities. |
-| Supply-chain compromise | CI build/security workflows, pinned inputs where feasible, SBOM and scanner jobs. | A generated SBOM or scan is evidence only for its exact commit; signed provenance and organizational patch process remain gaps. |
+| Supply-chain compromise | Pinned CI build/security/scanner jobs; clean-candidate native packages include checked digests plus verified SLSA and SPDX SBOM attestations. | Evidence applies only to exact artifact digests; image/runtime inventory and an organizational patch/release process remain gaps. |
 
 ## Deployment assumptions
 

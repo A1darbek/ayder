@@ -1,13 +1,15 @@
 # Ayder Revenue Readiness v1
 
-Evidence date: 2026-08-16. Development platform: aarch64 WSL2 on ext4.
+Evidence updated: 2026-08-20. Development platform: aarch64 WSL2 on ext4.
 Measured fixed binary SHA-256:
 `de14a5e1f46785785434d059dde9c4fc3b1b152eeafe36dd101151103c298008`.
 
 This sprint removed several correctness and security blockers and produced
-reproducible evidence. It did not establish production readiness. The measured
-tree was dirty, the mandatory full post-change 45-run Jepsen campaign has not
-run, and native target-storage benchmarks are unavailable.
+reproducible evidence. It did not establish production readiness. Performance
+evidence includes a dirty-tree fixed-rate run and an exact-archive standard-wrk
+run; clean-candidate CI/provenance passes separately. The mandatory full post-
+change 45-run Jepsen campaign has not run, and native target-storage benchmarks
+are unavailable.
 
 **Overall: RED. READY TO MERGE: NO.**
 
@@ -24,7 +26,7 @@ run, and native target-storage benchmarks are unavailable.
 | Observability | GREEN for evaluation | Prometheus config and 14 source-backed rules validate; dashboard JSON validates. Thresholds still require pilot tuning. |
 | Operations | YELLOW | Cold backup/restore, distinct-binary upgrade/rollback, bounded shutdown, and a scoped RPO/RTO drill pass; online backup/GC and rolling upgrade are unsupported. |
 | Documentation | GREEN for evaluation | Architecture, threat model, benchmarks, observability, runbook, API, enterprise matrix, and buyer index exist and state limitations. |
-| Supply chain | RED | Local Trivy/Gitleaks/Syft triage passes its defined gates and Actions are SHA-pinned; clean-commit CodeQL/CI and issued Sigstore provenance are pending. |
+| Supply chain | GREEN for candidate | Clean `2e334d1` passed native ARM64/amd64 CI, CodeQL, sanitizers, Trivy/Gitleaks/SPDX and verified SLSA/SBOM attestations. |
 | Enterprise technical evaluation | YELLOW | Evidence is sufficient to inspect the system; paid real-data production approval remains blocked. |
 
 ## Correctness changes
@@ -205,9 +207,12 @@ historical public test keys are suppressed only by exact immutable Gitleaks
 fingerprint after removal; new keys remain detectable.
 
 SHA-pinned workflows cover ARM64/amd64 build, sanitizers, CodeQL, scanners,
-SBOM and GitHub OIDC/Sigstore provenance. Definitions validate locally. They
-have not run on a final clean pushed commit, so signed checksums/provenance are
-not claimed as issued evidence.
+SBOM and GitHub OIDC/Sigstore provenance. Clean commit `2e334d1` passed all five
+push workflows. Both architecture archives passed their SHA-256 manifests, and
+offline verification found one SLSA provenance and one SPDX SBOM attestation
+per archive, bound to the repository, signer workflow and source digest. Exact
+runs, digests and verification commands are retained in
+[clean-commit evidence](evidence/supply-chain/CLEAN_COMMIT_2e334d1.md).
 
 ## Safe public claims
 
@@ -227,7 +232,7 @@ Do not claim production readiness, zero data loss, crash-safe/linearizable Raft,
 universal exactly-once effects, 50k durable RPS, p99 at or below 3 ms, current
 45/45 Jepsen, native ARM64/amd64 performance, power-loss durability, online
 backup/GC, rolling upgrades, an SLA/default RPO/RTO, penetration testing, SOC 2,
-ISO, AWS approval, Azure approval, or issued release provenance.
+ISO, AWS approval, Azure approval, or a signed release tag.
 
 ## Ayder Wire decision
 
@@ -245,8 +250,8 @@ protocol.
 2. Run power-loss/storage-error and longer idempotency/commit/HA campaigns.
 3. Run the identical benchmark/crash suite on native target-like ARM64 and
    amd64 storage.
-4. Commit an owned scope, push it, and require all build/security/CodeQL/SBOM
-   jobs to pass on that immutable commit; retain the issued attestation bundle.
+4. Define protected release/tag policy and retain candidate attestations for
+   the required support lifetime; repeat verification for every release digest.
 5. Obtain founder/pilot sign-off on exact topology, capacity, backup cadence,
    RPO/RTO, TLS/PKI, upgrade window, monitoring and incident ownership.
 
@@ -258,13 +263,13 @@ FILES CHANGED: broker/worker visibility, persistence, Raft, idempotency,
 TESTS RUN: focused/unit/regression/live gates pass; full 45-run Jepsen pending
 SANITIZERS: ASan+UBSan tested paths pass
 FUZZERS: HTTP framing smoke 855 executions; long/AOF/HA campaigns pending
-STATIC ANALYSIS: GCC analyzer pass; CodeQL final-commit run pending
+STATIC ANALYSIS: GCC analyzer and clean-candidate CodeQL pass
 BENCHMARKS: strict local matrix 308-382 RPS, 19-20 s p99, all cases non-clean
 JEPSEN: short kill/partition/mixed pass with exact convergence; full 45 pending
 SECURITY FINDINGS FIXED: framing ambiguity, bounds/deadlines, HA peer binding,
   tracked test keys, stale aiohttp, root runtime users
 RESIDUAL RISKS: full HA/power campaign, poor durable performance, client TLS,
-  online GC/backup, rolling upgrade, audit logging, final signed release proof
+  online GC/backup, rolling upgrade, audit logging, signed release-tag policy
 PERFORMANCE BEFORE: older result invalid for current durability comparison
 PERFORMANCE AFTER: target missed; correctness barriers retained
 CUSTOM TCP DECISION: not justified by current profile
