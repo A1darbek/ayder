@@ -9,75 +9,15 @@
 #include <stdlib.h>
 #include <math.h>
 
-// Check for SIMD support and include appropriate headers
-#ifdef __AVX2__
-#include <immintrin.h>
-    #define SIMD_SUPPORTED 1
-#elif defined(__SSE2__)
-#include <emmintrin.h>
-    #define SIMD_SUPPORTED 1
-#else
-#define SIMD_SUPPORTED 0
-#endif
-
 #include "slab_alloc.h"
 
-// Add missing function declarations for C99 compatibility
-#ifndef __has_builtin
-#define __has_builtin(x) 0
-#endif
-
-#if !__has_builtin(__builtin_ctz) && !defined(__GNUC__)
-// Fallback implementation of count trailing zeros
-static inline int builtin_ctz_fallback(uint32_t x) {
-    if (x == 0) return 32;
-    int n = 0;
-    if ((x & 0x0000FFFF) == 0) { n += 16; x >>= 16; }
-    if ((x & 0x000000FF) == 0) { n += 8;  x >>= 8;  }
-    if ((x & 0x0000000F) == 0) { n += 4;  x >>= 4;  }
-    if ((x & 0x00000003) == 0) { n += 2;  x >>= 2;  }
-    if ((x & 0x00000001) == 0) { n += 1;  }
-    return n;
-}
-#define __builtin_ctz(x) builtin_ctz_fallback(x)
-#endif
-
 // ═══════════════════════════════════════════════════════════════════════════════
-// SIMD-Optimized String Operations
+// Bounded String Operations (libc may use architecture-specific SIMD)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // Find character using AVX2 (32 bytes at a time) if supported
 static inline const char* simd_find_char(const char* str, char target, size_t len) {
-    if (len < 32 || !SIMD_SUPPORTED) {
-        // Fallback for small strings or no SIMD support
-        for (size_t i = 0; i < len; i++) {
-            if (str[i] == target) return &str[i];
-        }
-        return NULL;
-    }
-
-#ifdef __AVX2__
-    __m256i target_vec = _mm256_set1_epi8(target);
-    const char* ptr = str;
-    const char* end = str + (len & ~31);  // align to 32-byte boundary
-
-    while (ptr < end) {
-        __m256i chunk = _mm256_loadu_si256((const __m256i*)ptr);
-        __m256i cmp_result = _mm256_cmpeq_epi8(chunk, target_vec);
-        uint32_t mask = (uint32_t)_mm256_movemask_epi8(cmp_result);
-
-        if (mask) {
-            return ptr + __builtin_ctz(mask);
-        }
-        ptr += 32;
-    }
-
-    // Handle remaining bytes
-    for (const char* rem = ptr; rem < str + len; rem++) {
-        if (*rem == target) return rem;
-    }
-#endif
-    return NULL;
+    return (const char*)memchr(str, (unsigned char)target, len);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -204,7 +144,7 @@ typedef struct {
 
 static inline void json_free(json_value_t* val);
 
-// Skip whitespace using SIMD
+// Skip JSON whitespace within the caller-provided boundary
 static inline void skip_whitespace(json_parser_t* p) {
     while (p->ptr < p->end) {
         char c = *p->ptr;

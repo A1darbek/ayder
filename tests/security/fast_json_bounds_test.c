@@ -56,6 +56,20 @@ static void check_number_forms(void) {
     json_free(root);
 }
 
+static void check_long_object_scan(void) {
+    static const char object[] =
+        "{\"first\":1,\"padding\":\"abcdefghijklmnopqrstuvwxyz0123456789\",\"last\":2}";
+    json_value_t *root = json_parse(object, sizeof(object) - 1);
+    json_value_t *last;
+
+    CHECK(root != NULL, "long object string scan parses");
+    if (!root) return;
+    last = json_get_field(root, "last");
+    CHECK(last && last->type == JSON_INT && last->as.i == 2,
+          "long object preserves trailing field");
+    json_free(root);
+}
+
 static void check_invalid_scalars(void) {
     static const char *const invalid[] = {
         "-", "01", "1.", "1e", "1e+", "9223372036854775808",
@@ -73,6 +87,7 @@ int main(void) {
     slab_init();
     check_integer_with_byte_after_boundary();
     check_number_forms();
+    check_long_object_scan();
     check_invalid_scalars();
     slab_destroy();
 
